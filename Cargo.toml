@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Native, trusted components. Drivers and Wasm test modules are built
+# separately for wasm32-unknown-unknown.
+[workspace]
+resolver = "2"
+members = ["shim"]

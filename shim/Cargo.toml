@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "grind-shim"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Native bus shim over VFIO: register window with deny list, DMA buffers"
+publish = false
+
+# No dependencies: std plus declarations of ioctl(2).
+[dependencies]
