@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "vfio-hello"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Phase 0 milestone 2: open the e1000e through VFIO and read one register"
+publish = false
+
+# No dependencies: std plus a declaration of ioctl(2).
+[dependencies]
