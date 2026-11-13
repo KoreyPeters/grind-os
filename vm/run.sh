@@ -71,7 +71,7 @@ APPEND="console=ttyS0 intel_iommu=on loglevel=4 panic=-1 grind.mode=$MODE"
 
 QEMU_ARGS=(
 	-machine q35,accel=kvm,kernel-irqchip=split
-	-cpu host -smp 2 -m 512
+	-cpu host -smp 2 -m 1024
 	-nodefaults -no-user-config -display none -no-reboot
 	# The IOMMU must be created before the devices it translates for.
 	-device intel-iommu,intremap=on

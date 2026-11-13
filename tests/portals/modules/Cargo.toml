@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Trusted test modules for the portals, built for wasm32-unknown-unknown.
+# Each exercises one portal behaviour; see tests/portals/README.md.
+[workspace]
+resolver = "2"
+members = ["read-status", "bounds", "dma", "wasi-import", "spin", "trap"]
+
+[workspace.dependencies]
+wit-bindgen = "=0.63.0"
+
+[profile.release]
+opt-level = "s"
