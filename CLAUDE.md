@@ -12,7 +12,7 @@ Phase 0 runs on Linux using VFIO (userspace device access with IOMMU-protected D
 
 1. **Test VM.** QEMU guest (q35 machine, emulated Intel IOMMU, emulated e1000e) boots; inside it, the e1000e device is unbound from Linux's driver and bound to `vfio-pci`.
 2. **Hello hardware.** A tiny native Rust program in the guest opens the device through VFIO and reads one register.
-3. **Shim and host.** A native bus shim over VFIO, and a Wasmtime host that exposes it to drivers as portals.
+3. **Shim and host.** A native bus shim over VFIO, and a Wasmtime host that exposes it to drivers as portals. The shim includes a per-device register deny list (rule 10).
 4. **First grind.** A Wasm e1000e driver passes the first conformance test: bring the link up and answer a ping.
 
 Work on one milestone at a time, in order.
@@ -42,6 +42,7 @@ Create directories as milestones need them.
 7. **Record provenance.** Each driver has `drivers/<name>/PROVENANCE.md` listing the sources consulted and how they were used.
 8. **License every file.** All source files start with an SPDX header: `SPDX-License-Identifier: AGPL-3.0-or-later`.
 9. **Humans sign off.** Mark AI-assisted commits with an `Assisted-by:` trailer naming the model. The human reviews and signs off.
+10. **Hardware safety lives in the shim.** The IOMMU stops stray memory access but not deliberate register writes. The shim keeps a per-device deny list of registers that could permanently damage hardware, such as those that write flash, NVM or firmware, identified from the device’s datasheet. Drivers never write non-volatile memory; the shim refuses and logs any attempt, and it counts as a test failure. No driver runs on real hardware until its device’s deny list exists and has been reviewed by the human.
 
 ## Environment
 
