@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "grind-host"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Wasmtime host that runs one driver against one device through portals"
+publish = false
+
+[dependencies]
+grind-shim = { path = "../shim" }
+# Exact versions: these define what a driver can and cannot do.
+wasmtime = { version = "=50.0.1", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "component-model",
+    "std",
+    "anyhow",
+    "backtrace",
+    "demangle",
+] }
+wasmparser = "=0.261.0"
+wit-component = "=0.261.0"
