@@ -49,4 +49,4 @@ Create directories as milestones need them.
 - Host: Windows 11 (AMD), WSL2 Ubuntu. The repository lives in the Linux home folder (`~/grind-os`), not under `/mnt/c`.
 - KVM is available in WSL through nested virtualization; the `kvm_amd` module is loaded at boot.
 - Toolchain: Rust (rustup), QEMU (`qemu-system-x86_64`), git, gh.
-- Starting point for the VM, to be verified while building milestone 1: `-machine q35,accel=kvm,kernel-irqchip=split -device intel-iommu,intremap=on -device e1000e`, with `intel_iommu=on` on the guest kernel command line.
+- Starting point for the VM, confirmed while building milestone 1: `-machine q35,accel=kvm,kernel-irqchip=split -device intel-iommu,intremap=on -device e1000e`, with `intel_iommu=on` on the guest kernel command line.
