@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Pinned inputs for the test VM. One entry per line:
+#   <name> <sha256> <url>
+#
+# URLs point at snapshot.debian.org's content-addressed /file/<sha1> store,
+# which keeps old packages available after they leave the live archive.
+# The sha256 values match Debian's bookworm Packages index.
+#
+# kernel:  linux-image-6.1.0-50-amd64-unsigned 6.1.176-1 (Debian 12 bookworm)
+# busybox: busybox-static 1:1.35.0-4+deb12u1+b1 (Debian 12 bookworm)
+
+kernel  439422e41d2dbb840b60b81e3bf5e5955bfa56b7a8c268aec83c9ff882d421e6  https://snapshot.debian.org/file/deeacc5af624650aab763ec7cb65f51639704842
+busybox 3d3fdbe91d4660c873e14b092c213fe81c1da6362daa236eb25d0171eb108744  https://snapshot.debian.org/file/388095e72f44cefd025b869d917e45108d124655
