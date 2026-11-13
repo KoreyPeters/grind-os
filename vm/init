@@ -15,6 +15,8 @@
 # Kernel command line:
 #   grind.mode=check   power off after the checks (used by run.sh --check)
 #   grind.mode=shell   drop to a shell after the checks (default)
+#   grind.run=PATH     after the checks pass, run "PATH <pci-address>" and
+#                      report its exit status as step "run"
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 
@@ -25,8 +27,12 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 
 MODE=shell
+RUN=""
 for arg in $(cat /proc/cmdline); do
-	case "$arg" in grind.mode=*) MODE="${arg#grind.mode=}" ;; esac
+	case "$arg" in
+	grind.mode=*) MODE="${arg#grind.mode=}" ;;
+	grind.run=*) RUN="${arg#grind.run=}" ;;
+	esac
 done
 
 E1000E_VENDOR=0x8086
@@ -145,5 +151,14 @@ nodes="$(ls /dev/vfio 2>/dev/null | tr '\n' ' ')"
 [ -c /dev/vfio/vfio ] && [ -c "/dev/vfio/$GROUP" ] ||
 	fail vfio-dev "character devices /dev/vfio/vfio and /dev/vfio/$GROUP" "/dev/vfio: ${nodes:-empty}"
 pass vfio-dev "character devices /dev/vfio/vfio and /dev/vfio/$GROUP" "/dev/vfio: $nodes"
+
+# 10. Optional program under test. It prints its own result lines.
+if [ -n "$RUN" ]; then
+	[ -x "$RUN" ] || fail run "$RUN is an executable in the initramfs" "missing or not executable"
+	"$RUN" "$BDF"
+	rc=$?
+	[ "$rc" -eq 0 ] || fail run "$RUN $BDF exits 0" "exit $rc"
+	pass run "$RUN $BDF exits 0" "exit 0"
+fi
 
 finish pass

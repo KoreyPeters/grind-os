@@ -10,10 +10,13 @@
 # Options:
 #   --timeout SECONDS         check mode: give up after this long (default 90)
 #   --log FILE                check mode: serial log (default vm/build/serial.log)
+#   --run GUEST_PATH          after the VM checks, run this initramfs program
+#                             with the e1000e's PCI address (see build-initramfs.sh --add)
 #
 # Host-side failures print one line of the form
 #   VMRUN step=<step> expected="..." got="..."
-# Guest-side results are the VMCHECK lines written by vm/init.
+# Guest-side results are the VMCHECK lines written by vm/init, plus any
+# "<PREFIX> step=... result=..." lines printed by the --run program.
 
 set -euo pipefail
 
@@ -23,9 +26,10 @@ BUILD="$VM_DIR/build"
 MODE=shell
 TIMEOUT=90
 LOG="$BUILD/serial.log"
+RUN=""
 
 usage() {
-	sed -n '4,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+	sed -n '4,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 	exit 2
 }
 
@@ -34,6 +38,7 @@ while [ $# -gt 0 ]; do
 	--check) MODE=check ;;
 	--timeout) TIMEOUT="${2:?--timeout needs a value}"; shift ;;
 	--log) LOG="${2:?--log needs a value}"; shift ;;
+	--run) RUN="${2:?--run needs a value}"; shift ;;
 	-h | --help) usage ;;
 	*) echo "run.sh: unknown argument: $1" >&2; usage ;;
 	esac
@@ -54,6 +59,15 @@ command -v "$QEMU" >/dev/null || fail qemu "$QEMU on PATH" "not found"
 for f in vmlinuz initramfs.gz; do
 	[ -f "$BUILD/$f" ] || fail inputs "$BUILD/$f (run vm/fetch.sh && vm/build-initramfs.sh)" "missing"
 done
+case "$RUN" in
+"") ;;
+*[[:space:]]*) fail args "--run path without whitespace" "$RUN" ;;
+/*) ;;
+*) fail args "--run takes an absolute guest path" "$RUN" ;;
+esac
+
+APPEND="console=ttyS0 intel_iommu=on loglevel=4 panic=-1 grind.mode=$MODE"
+[ -z "$RUN" ] || APPEND="$APPEND grind.run=$RUN"
 
 QEMU_ARGS=(
 	-machine q35,accel=kvm,kernel-irqchip=split
@@ -65,7 +79,7 @@ QEMU_ARGS=(
 	-device e1000e,netdev=net0
 	-kernel "$BUILD/vmlinuz"
 	-initrd "$BUILD/initramfs.gz"
-	-append "console=ttyS0 intel_iommu=on loglevel=4 panic=-1 grind.mode=$MODE"
+	-append "$APPEND"
 )
 
 if [ "$MODE" = shell ]; then
@@ -79,7 +93,7 @@ timeout "$TIMEOUT" "$QEMU" "${QEMU_ARGS[@]}" -serial stdio </dev/null | tee "$LO
 status="${PIPESTATUS[0]}"
 set -e
 
-lines="$(tr -d '\r' <"$LOG" | grep -a '^VMCHECK ' || true)"
+lines="$(tr -d '\r' <"$LOG" | grep -aE '^[A-Z]+ (step|result)=' || true)"
 result="$(grep '^VMCHECK result=' <<<"$lines" | tail -n 1 || true)"
 
 echo

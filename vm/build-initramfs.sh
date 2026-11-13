@@ -5,6 +5,10 @@
 #   vm/build/vmlinuz        the Debian kernel
 #   vm/build/initramfs.gz   busybox, the kernel modules the VM needs, and vm/init
 #
+# Options:
+#   --add HOST=GUEST   also copy host file HOST to absolute path GUEST in the
+#                      initramfs (repeatable), e.g. a program for run.sh --run
+#
 # Any failure prints one line of the form
 #   BUILD step=<step> expected="..." got="..."
 # and exits non-zero.
@@ -22,6 +26,24 @@ fail() { # step expected got
 	printf 'BUILD step=%s expected="%s" got="%s"\n' "$1" "$2" "$3" >&2
 	exit 1
 }
+
+ADDS=()
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--add)
+		spec="${2:-}"
+		host="${spec%%=*}"
+		guest="${spec#*=}"
+		[ -n "$host" ] && [ "$spec" != "$host" ] && [ "${guest#/}" != "$guest" ] ||
+			fail args "--add HOST=/absolute/guest/path" "--add $spec"
+		[ -f "$host" ] || fail add "$host is a file" "missing"
+		ADDS+=("$host=$guest")
+		shift
+		;;
+	*) fail args "--add HOST=GUEST" "$1" ;;
+	esac
+	shift
+done
 
 for tool in depmod modprobe cpio gzip; do
 	command -v "$tool" >/dev/null || fail tool "$tool on PATH" "not found"
@@ -77,6 +99,15 @@ while read -r applet; do
 done < <("$ROOT/bin/busybox" --list-full)
 
 install -m 0755 "$VM_DIR/init" "$ROOT/init"
+
+for add in "${ADDS[@]}"; do
+	host="${add%%=*}"
+	guest="${add#*=}"
+	[ ! -e "$ROOT$guest" ] || fail add "$guest not already in the initramfs" "exists"
+	mkdir -p "$ROOT$(dirname "$guest")"
+	cp "$host" "$ROOT$guest"
+	echo "build: added $host as $guest"
+done
 
 # Pack. Fixed timestamps, ownership and order keep the archive reproducible.
 find "$ROOT" -exec touch -h -d @0 {} +

@@ -16,6 +16,18 @@ vm/run.sh              # boot with a shell on this terminal (Ctrl-A x quits QEMU
 
 A check boot takes about two seconds.
 
+To run a program in the guest against the e1000e after the checks pass:
+
+```sh
+vm/build-initramfs.sh --add path/to/static-binary=/bin/prog
+vm/run.sh --check --run /bin/prog    # init runs "/bin/prog <pci-address>"
+```
+
+The program must be statically linked, because the guest has no shared
+libraries. Its exit status is reported as step `run`, and any
+`<PREFIX> step=... result=fail ...` lines it prints are shown in
+`run.sh`'s failure summary. `hello/check.sh` uses this mechanism.
+
 ## Prerequisites
 
 - `qemu-system-x86_64`, `curl`, `dpkg-deb`, `depmod`/`modprobe` (kmod), `cpio`, `gzip`.
@@ -78,6 +90,7 @@ VMCHECK result=fail failed_step=<step>
 | `unbind` | it is unbound from `e1000e` |
 | `bind-vfio` | `driver_override` plus `drivers_probe` binds it to `vfio-pci` |
 | `vfio-dev` | `/dev/vfio/vfio` and `/dev/vfio/<group>` exist |
+| `run` | only with `--run`: the program exits 0 |
 
 Host-side problems (missing KVM access, missing build files, timeout, no
 result line) are reported by `run.sh` as `VMRUN step=... expected=... got=...`.
