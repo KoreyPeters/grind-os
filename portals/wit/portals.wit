@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+/// Portals: the only things a Grind OS driver can import.
+///
+/// A driver is instantiated against exactly one device. Portals are bound to
+/// that device by the host, so there is no way to name another device, and
+/// no host pointers, file descriptors or PCI config space ever reach the
+/// driver.
+package grind:portals@0.1.0;
+
+/// The device's register window (BAR0 for a PCI device). Other BARs, I/O
+/// port windows, the MSI-X table and config space are never exposed: some
+/// of them reach registers indirectly and would bypass the deny list.
+interface mmio {
+    enum error {
+        /// The access does not fit inside the window.
+        out-of-range,
+        /// The offset is not a multiple of 4.
+        misaligned,
+        /// The register is on the device's deny list (rule 10). The attempt
+        /// is logged and the run counts as a failure even if the driver
+        /// handles this error.
+        denied,
+    }
+
+    /// Size of the window in bytes.
+    size: func() -> u32;
+    read32: func(offset: u32) -> result<u32, error>;
+    write32: func(offset: u32, value: u32) -> result<_, error>;
+}
+
+/// Memory the device can reach by DMA. The host pins it and maps it into the
+/// device's IOMMU domain; the device cannot reach any other memory.
+interface dma {
+    enum error {
+        /// Size is zero or larger than one allocation may be.
+        bad-size,
+        /// The driver's total DMA allowance is used up.
+        out-of-memory,
+        /// The access does not fit inside the buffer.
+        out-of-range,
+    }
+
+    resource buffer {
+        /// The address the device uses for this buffer. Put this in
+        /// descriptors; it is not a host address.
+        iova: func() -> u64;
+        /// Size in bytes (the requested size rounded up to 4096).
+        size: func() -> u32;
+        read: func(offset: u32, len: u32) -> result<list<u8>, error>;
+        write: func(offset: u32, data: list<u8>) -> result<_, error>;
+    }
+
+    /// Allocate a zeroed, 4096-byte-aligned buffer.
+    allocate: func(size: u32) -> result<buffer, error>;
+}
+
+interface clock {
+    /// Monotonic time in nanoseconds since an arbitrary start.
+    now-ns: func() -> u64;
+    /// Sleep for at least this many microseconds (capped at one second per
+    /// call). Time spent sleeping counts toward the driver's time limit.
+    sleep-us: func(us: u32);
+}
+
+interface log {
+    enum level { debug, info, warn, error }
+
+    /// One structured log entry: what was attempted, what was expected and
+    /// what happened belong in `fields`.
+    emit: func(level: level, message: string, fields: list<tuple<string, string>>);
+}
+
+/// A driver: imports only portals.
+world driver {
+    import mmio;
+    import dma;
+    import clock;
+    import log;
+
+    /// Bring the device up. An error string says what went wrong.
+    export start: func() -> result<_, string>;
+}
