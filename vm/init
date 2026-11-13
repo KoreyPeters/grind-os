@@ -1,0 +1,149 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# PID 1 of the test VM. Checks that the emulated Intel IOMMU is active, then
+# takes the emulated e1000e away from Linux's e1000e driver and binds it to
+# vfio-pci.
+#
+# Every step prints one line to the serial console:
+#   VMCHECK step=<step> result=pass|fail expected="..." got="..."
+# followed by a final summary line:
+#   VMCHECK result=pass
+#   VMCHECK result=fail failed_step=<step>
+# Steps stop at the first failure, since each depends on the one before.
+#
+# Kernel command line:
+#   grind.mode=check   power off after the checks (used by run.sh --check)
+#   grind.mode=shell   drop to a shell after the checks (default)
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+# The initramfs has no /dev/console node, so attach stdio once devtmpfs is up.
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+MODE=shell
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in grind.mode=*) MODE="${arg#grind.mode=}" ;; esac
+done
+
+E1000E_VENDOR=0x8086
+E1000E_DEVICE=0x10d3 # 82574L, the model QEMU's e1000e emulates
+MODULES="e1000e vfio-pci vfio_iommu_type1"
+
+# Keep values on one line and free of double quotes so lines stay parseable.
+clean() { printf '%s' "$*" | tr '\n"' "  "; }
+
+report() { # step result expected got
+	printf 'VMCHECK step=%s result=%s expected="%s" got="%s"\n' \
+		"$1" "$2" "$(clean "$3")" "$(clean "$4")"
+}
+
+finish() { # pass | fail <step>
+	if [ "$1" = pass ]; then
+		echo "VMCHECK result=pass"
+	else
+		echo "VMCHECK result=fail failed_step=$2"
+	fi
+	if [ "$MODE" = check ]; then
+		sync
+		poweroff -f
+	fi
+	echo
+	echo "grind-os test VM shell. 'poweroff -f' to exit."
+	[ -n "${BDF:-}" ] && echo "e1000e: /sys/bus/pci/devices/$BDF  group: /dev/vfio/${GROUP:-?}"
+	setsid cttyhack sh
+	poweroff -f
+}
+
+pass() { report "$1" pass "$2" "$3"; }
+fail() { report "$1" fail "$2" "$3"; finish fail "$1"; }
+
+driver_of() { # bdf -> driver name, or "none"
+	if [ -e "/sys/bus/pci/devices/$1/driver" ]; then
+		basename "$(readlink "/sys/bus/pci/devices/$1/driver")"
+	else
+		echo none
+	fi
+}
+
+wait_driver() { # bdf want: poll up to 5s for the device's driver to become <want>
+	i=0
+	while [ "$(driver_of "$1")" != "$2" ] && [ "$i" -lt 50 ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+}
+
+# 1. The kernel found and enabled a DMAR (Intel IOMMU) unit.
+units="$(ls /sys/class/iommu 2>/dev/null)"
+[ -n "$units" ] || fail iommu "an IOMMU unit in /sys/class/iommu" "none; dmesg: $(dmesg | grep -iE 'DMAR|IOMMU' | tail -n 3)"
+pass iommu "an IOMMU unit in /sys/class/iommu" "$units"
+
+# 2. Interrupt remapping is on (needs intremap=on and kernel-irqchip=split).
+irq="$(dmesg | grep -i 'Enabled IRQ remapping' | tail -n 1)"
+[ -n "$irq" ] || fail irq-remap "'Enabled IRQ remapping' in dmesg" "$(dmesg | grep -iE 'DMAR-IR|remapping' | tail -n 3)"
+pass irq-remap "'Enabled IRQ remapping' in dmesg" "${irq#*] }"
+
+# 3. Load the drivers. e1000e is loaded first on purpose, so the device starts
+#    bound to Linux's driver and the unbind path is exercised.
+for m in $MODULES; do
+	out="$(modprobe "$m" 2>&1)" || fail modules "modprobe $m succeeds" "$out"
+done
+pass modules "loaded: $MODULES" "$(cut -d' ' -f1 /proc/modules | tr '\n' ' ')"
+
+# 4. Exactly one e1000e on the PCI bus.
+BDF=""
+count=0
+for d in /sys/bus/pci/devices/*; do
+	if [ "$(cat "$d/vendor")" = "$E1000E_VENDOR" ] && [ "$(cat "$d/device")" = "$E1000E_DEVICE" ]; then
+		BDF="${d##*/}"
+		count=$((count + 1))
+	fi
+done
+[ "$count" -eq 1 ] || fail device "exactly one PCI device $E1000E_VENDOR:$E1000E_DEVICE" "$count found"
+pass device "exactly one PCI device $E1000E_VENDOR:$E1000E_DEVICE" "$BDF"
+DEV="/sys/bus/pci/devices/$BDF"
+
+# 5. The device sits alone in its IOMMU group (VFIO needs the whole group).
+[ -e "$DEV/iommu_group" ] || fail iommu-group "$BDF has an IOMMU group" "no $DEV/iommu_group"
+GROUP="$(basename "$(readlink "$DEV/iommu_group")")"
+members="$(ls "$DEV/iommu_group/devices" | tr '\n' ' ')"
+[ "$members" = "$BDF " ] || fail iommu-group "group $GROUP contains only $BDF" "$members"
+pass iommu-group "group $GROUP contains only $BDF" "group $GROUP: $members"
+
+# 6. Linux's e1000e driver claimed the device.
+wait_driver "$BDF" e1000e
+drv="$(driver_of "$BDF")"
+[ "$drv" = e1000e ] || fail bound-e1000e "driver e1000e" "$drv"
+pass bound-e1000e "driver e1000e" "$drv"
+
+# 7. Unbind it from e1000e.
+out="$( { echo "$BDF" >"$DEV/driver/unbind"; } 2>&1)" || fail unbind "write $BDF to $DEV/driver/unbind" "$out"
+wait_driver "$BDF" none
+drv="$(driver_of "$BDF")"
+[ "$drv" = none ] || fail unbind "no driver" "$drv"
+pass unbind "no driver" "$drv"
+
+# 8. Bind it to vfio-pci.
+out="$( { echo vfio-pci >"$DEV/driver_override"; } 2>&1)" || fail bind-vfio "write vfio-pci to driver_override" "$out"
+out="$( { echo "$BDF" >/sys/bus/pci/drivers_probe; } 2>&1)" || fail bind-vfio "write $BDF to drivers_probe" "$out"
+wait_driver "$BDF" vfio-pci
+drv="$(driver_of "$BDF")"
+[ "$drv" = vfio-pci ] || fail bind-vfio "driver vfio-pci" "$drv; dmesg: $(dmesg | grep -i vfio | tail -n 3)"
+pass bind-vfio "driver vfio-pci" "$drv"
+
+# 9. The VFIO device nodes exist.
+i=0
+while [ ! -c "/dev/vfio/$GROUP" ] && [ "$i" -lt 50 ]; do
+	sleep 0.1
+	i=$((i + 1))
+done
+nodes="$(ls /dev/vfio 2>/dev/null | tr '\n' ' ')"
+[ -c /dev/vfio/vfio ] && [ -c "/dev/vfio/$GROUP" ] ||
+	fail vfio-dev "character devices /dev/vfio/vfio and /dev/vfio/$GROUP" "/dev/vfio: ${nodes:-empty}"
+pass vfio-dev "character devices /dev/vfio/vfio and /dev/vfio/$GROUP" "/dev/vfio: $nodes"
+
+finish pass
