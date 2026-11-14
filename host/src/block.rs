@@ -281,10 +281,114 @@ pub fn exercise(
     read(store, DATA, "first after the errors", 0, 1)?;
     recovery(store, blk, block_size, "baseline")?;
 
+    // Nonsense in what the device returns, then the device gone and back
+    // (host/src/faults.rs: only what the driver sees changes).
+    faulty_reads(
+        store,
+        blk,
+        block_size,
+        "completion-nonsense",
+        crate::faults::KIND_COMPLETIONS,
+        150,
+    )?;
+    recovery(store, blk, block_size, "completion-nonsense")?;
+    faulty_reads(
+        store,
+        blk,
+        block_size,
+        "device-gone",
+        crate::faults::KIND_REGISTERS | crate::faults::KIND_GONE,
+        1000,
+    )?;
+    recovery(store, blk, block_size, "device-gone")?;
+
     if expect.device_errors {
         device_errors(store, blk, block_size)?;
         recovery(store, blk, block_size, "device-errors")?;
     }
+    Ok(())
+}
+
+/// Blocks the faulty-read phases read: never written, so they hold the seed.
+const FAULTY_LBA: u64 = 5000;
+const FAULTY_SPAN: u64 = 64;
+/// How long a fault window lasts.
+const FAULT_WINDOW_MS: u32 = 1500;
+
+/// Phase: open a fault window and keep reading known blocks while it lasts.
+/// A read may fail (with a readable error) but must never return wrong
+/// data; every call must return within the limit.
+fn faulty_reads(
+    store: &mut Store<State>,
+    blk: &Block,
+    block_size: u32,
+    phase: &'static str,
+    kinds: u8,
+    per_mille: u16,
+) -> Result<(), &'static str> {
+    let limit = CALL_LIMIT;
+    emit("block-phase", &[("phase", Value::Str(phase))]);
+    store
+        .data_mut()
+        .faults
+        .open(FAULT_WINDOW_MS, kinds, per_mille);
+    let end = std::time::Instant::now() + Duration::from_millis(FAULT_WINDOW_MS.into());
+    let (mut ok, mut errors, mut i) = (0u64, 0u64, 0u64);
+    while std::time::Instant::now() < end {
+        let lba = FAULTY_LBA + (i * 7) % FAULTY_SPAN;
+        let count = 1 + (i % 8) as u32;
+        i += 1;
+        set_deadline(store, limit);
+        match blk.call_read(&mut *store, lba, count) {
+            Err(e) => return Err(call_failed("read", limit, e)),
+            Ok(Err(msg)) => {
+                if msg.trim().is_empty() {
+                    emit(
+                        "block-error-unreadable",
+                        &[
+                            ("check", Value::Str(phase)),
+                            ("call", Value::Str(&format!("read({lba}, {count})"))),
+                            (
+                                "expected",
+                                Value::Str(
+                                    "an error saying what was attempted, expected and got (rule 3)",
+                                ),
+                            ),
+                            ("got", Value::Str("an empty error")),
+                        ],
+                    );
+                    return Err("block-error-unreadable");
+                }
+                errors += 1;
+            }
+            Ok(Ok(got)) => {
+                // Errors are allowed here; wrong answers are not. Only a
+                // wrong answer is logged (in full, by compare).
+                let want = pattern(SEED, lba, count, block_size);
+                if got != want {
+                    let _ = compare(
+                        &format!("read during {phase}"),
+                        lba,
+                        count,
+                        block_size,
+                        &want,
+                        &got,
+                    );
+                    return Err("block-wrong-answer");
+                }
+                ok += 1;
+            }
+        }
+    }
+    store.data_mut().faults.close();
+    emit(
+        "block-phase-end",
+        &[
+            ("phase", Value::Str(phase)),
+            ("reads_ok", Value::U64(ok)),
+            ("reads_failed", Value::U64(errors)),
+        ],
+    );
     Ok(())
 }
 

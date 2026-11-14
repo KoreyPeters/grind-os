@@ -7,7 +7,7 @@
 //!            [--timeout-ms N] [--dma-limit-mib N] [--trace]
 //!            [--allow-unreviewed-deny-list]
 //!            [--serve-ping <ipv4> [--serve-ms N] [--expect-link-flaps N]]
-//!            [--fault-seed N] [--fail-allocation N]
+//!            [--fault-seed N] [--fail-allocation N] [--fault-identify]
 //!            [--exercise-block --expect-block-size N --expect-blocks N]
 //! ```
 //!
@@ -151,6 +151,7 @@ struct Args {
     expect_link_flaps: u64,
     fault_seed: u64,
     fail_allocation: Option<u32>,
+    fault_identify: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -165,6 +166,7 @@ fn parse_args() -> Result<Args, String> {
     let mut expect_link_flaps = 0;
     let mut fault_seed = 1;
     let mut fail_allocation = None;
+    let mut fault_identify = false;
     let mut exercise = false;
     let mut device_errors = false;
     let mut block_size = None;
@@ -220,6 +222,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("--fault-seed {v}: not a number"))?;
             }
+            "--fault-identify" => fault_identify = true,
             "--fail-allocation" => {
                 let v = value("--fail-allocation")?;
                 fail_allocation = Some(
@@ -255,6 +258,7 @@ fn parse_args() -> Result<Args, String> {
         expect_link_flaps,
         fault_seed,
         fail_allocation,
+        fault_identify,
         exercise_block: match (exercise, block_size, blocks) {
             (false, None, None) => None,
             (true, Some(block_size), Some(blocks)) => Some(block::Expect {
@@ -500,6 +504,7 @@ impl dma::HostBuffer for State {
         match b.read(offset, len) {
             Ok(mut v) => {
                 self.faults.device_data(iova, offset, &mut v);
+                self.faults.identify_data(iova, offset, &mut v);
                 Ok(Ok(v))
             }
             Err(e) => Ok(Err(dma_error("read", e)?)),
@@ -570,6 +575,10 @@ impl log::Host for State {
 
 impl nvme::Host for State {
     fn admin(&mut self, command: Vec<u8>) -> wasmtime::Result<Result<Vec<u8>, nvme::Error>> {
+        if self.faults.gone("admin") {
+            return Ok(Err(nvme::Error::Failed));
+        }
+        self.faults.admin_command(&command);
         let r = self.device.nvme_admin(&command).ok_or_else(|| {
             wasmtime::Error::msg("nvme portal used on a device that takes no commands")
         })?;
@@ -586,10 +595,18 @@ impl nvme::Host for State {
                 ],
             );
         }
-        Ok(r.map(|c| c.to_vec()).map_err(nvme_error))
+        Ok(r.map(|c| {
+            let mut c = c.to_vec();
+            self.faults.completion("admin", &mut c);
+            c
+        })
+        .map_err(nvme_error))
     }
 
     fn submit(&mut self, sqid: u16, command: Vec<u8>) -> wasmtime::Result<Result<(), nvme::Error>> {
+        if self.faults.gone("submit") {
+            return Ok(Err(nvme::Error::Failed));
+        }
         let r = self.device.nvme_submit(sqid, &command).ok_or_else(|| {
             wasmtime::Error::msg("nvme portal used on a device that takes no commands")
         })?;
@@ -611,6 +628,9 @@ impl nvme::Host for State {
     }
 
     fn complete(&mut self, cqid: u16) -> wasmtime::Result<Result<Vec<Vec<u8>>, nvme::Error>> {
+        if self.faults.gone("complete") {
+            return Ok(Err(nvme::Error::Failed));
+        }
         let r = self.device.nvme_complete(cqid).ok_or_else(|| {
             wasmtime::Error::msg("nvme portal used on a device that takes no commands")
         })?;
@@ -628,8 +648,16 @@ impl nvme::Host for State {
                 }
             }
         }
-        Ok(r.map(|c| c.iter().map(|e| e.to_vec()).collect())
-            .map_err(nvme_error))
+        Ok(r.map(|c| {
+            c.iter()
+                .map(|e| {
+                    let mut e = e.to_vec();
+                    self.faults.completion("complete", &mut e);
+                    e
+                })
+                .collect()
+        })
+        .map_err(nvme_error))
     }
 }
 
@@ -832,7 +860,12 @@ fn main() -> ExitCode {
         limits: StoreLimitsBuilder::new().memory_size(MAX_MEMORY).build(),
         trace: args.trace,
         started,
-        faults: faults::Faults::new(args.fault_seed, args.fail_allocation, started),
+        faults: faults::Faults::new(
+            args.fault_seed,
+            args.fail_allocation,
+            args.fault_identify,
+            started,
+        ),
     };
     let mut store = Store::new(&engine, state);
     store.limiter(|s| &mut s.limits);

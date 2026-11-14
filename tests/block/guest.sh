@@ -52,6 +52,24 @@ else
 fi
 printf 'BLOCK step=alloc-fail result=%s expected="%s" got="%s"\n' "$alloc" "$alloc_expected" "$(clean "$alloc_got")"
 
+# Nonsense in Identify (robustness contract): the namespace data reports a
+# format index beyond the formats there are. `start` must refuse it with a
+# readable error, not run with a nonsense block size.
+id_expected="with impossible Identify Namespace data, start returns a readable error (exit 1, driver-error)"
+out1="$(/bin/grind-host --device "$BDF" --module "$MODULE" --timeout-ms 15000 \
+	--exercise-block --expect-block-size "$BLOCK_SIZE" --expect-blocks "$BLOCKS" --fault-identify 2>&1)"
+rc1=$?
+printf '%s\n' "$out1" | sed 's/^/    /'
+last1="$(printf '%s\n' "$out1" | tail -n 1)"
+if ! printf '%s' "$out1" | grep -qF '"kind":"identify-nonsense"'; then
+	ident=fail ident_got="the nonsense was never read: no Identify Namespace data read from its buffer; exit $rc1"
+elif [ "$rc1" -eq 1 ] && printf '%s' "$last1" | grep -qF '"reason":"driver-error"'; then
+	ident=pass ident_got="exit 1; $(printf '%s\n' "$out1" | grep -F '"call":"start"' | head -n 1)"
+else
+	ident=fail ident_got="exit $rc1; last line: $last1"
+fi
+printf 'BLOCK step=identify-nonsense result=%s expected="%s" got="%s"\n' "$ident" "$id_expected" "$(clean "$ident_got")"
+
 # No --allow-unreviewed-deny-list: the device's register and command lists
 # are human-reviewed (rule 10), the same path real hardware takes.
 out="$(/bin/grind-host --device "$BDF" --module "$MODULE" --timeout-ms 15000 \
@@ -62,5 +80,5 @@ printf '%s\n' "$out" | sed 's/^/    /'
 last="$(printf '%s\n' "$out" | tail -n 1)"
 [ "$rc" -eq 0 ] && result=pass || result=fail
 printf 'BLOCK step=host result=%s expected="%s" got="%s"\n' "$result" "$expected" "$(clean "exit $rc; last line: $last")"
-[ "$alloc" = pass ] || exit 1
+[ "$alloc" = pass ] && [ "$ident" = pass ] || exit 1
 exit "$rc"

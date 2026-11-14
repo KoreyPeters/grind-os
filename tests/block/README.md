@@ -49,6 +49,15 @@ off, as `nic-peer` is for the NIC test.
      (`block-recovery`). A driver error during a hostile phase is
      logged, not fatal; a failed recovery check fails the run. The
      phases are being added one at a time:
+     - **completion nonsense**: for 1.5 s the host changes one byte of
+       15% of the completion entries the driver receives (result, SQ
+       head, command ID or status; `host/src/faults.rs`) while it reads
+       known seed blocks (5000-5063). Reads may fail readably, never
+       return wrong data (`block-wrong-answer`).
+     - **device gone**: for 1.5 s register reads return all-ones and
+       every `nvme` portal call fails; reads must fail readably within
+       the limit, and the recovery check afterwards must pass without
+       `start` being called again.
      - **device errors**: QEMU's `blkdebug` layer under the disk
        (`vm/run.sh --nvme-errors`, config written by `check.sh`) fails
        reads of block 3000 and writes to block 3100 with real I/O
@@ -59,7 +68,13 @@ off, as `nic-peer` is for the NIC test.
        after a bounded retry (`block-transient-not-retried` otherwise);
        the neighbouring blocks must keep working.
 
-   Before this run, `guest.sh` runs the driver once with its second DMA
+   Before this run, `guest.sh` also runs the driver with impossible
+   Identify Namespace data (`--fault-identify`: a format index beyond the
+   formats there are): `start` must refuse it readably
+   (`identify-nonsense`). A copy of the NVMe driver with its format
+   checks removed accepted it and failed with `block-geometry` instead.
+
+   Also before this run, `guest.sh` runs the driver once with its second DMA
    allocation failing (`--fail-allocation 2`): `start` must return a
    readable error, not trap or hang (`alloc-fail`). The run's fault seed
    is random, printed as `BLOCK fault-seed=N (replay with
@@ -112,8 +127,10 @@ tests/block/check.sh tests/block/modules/target/wasm32-unknown-unknown/release/b
 device-errors phase cannot catch it either: it stays the control that
 only the image check can catch.
 
-**Status (2026-11-14):** the NVMe driver gives readable errors for the
-bad blocks but does not retry the transient one
+**Status (2026-11-14):** the NVMe driver refuses impossible Identify
+data, survives completion nonsense (937 corrupted completions, no wrong
+answers) and the device going away, and gives readable errors for the
+bad blocks, but does not retry the transient one
 (`block-transient-not-retried`). It will be reground against the full
 test (docs/design/robust-block.md, step 6).
 
