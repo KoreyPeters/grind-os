@@ -37,7 +37,23 @@ harness/grind.sh e1000e                    # builds the driver and runs this
    9 times), so wrap-around is tested, not just the first few slots. The
    step stops at the first failure and names the ping, its size, and how
    much traffic had already passed.
-6. **Link flaps** (robustness contract, `docs/design/robust-nic.md`).
+6. **Flood and hostile frames** (robustness contract). The peer sends
+   2000 frames back to back (pings of varying size, ARP for other
+   addresses, an unknown EtherType), then 20 rounds of hostile frames: 1
+   and 13 bytes, a bare header, a 59-byte runt, 1515, 1600, 4000 and
+   9000 bytes, IPv4 and ICMP with bad checksums, a truncated IPv4 packet,
+   and ARP with a bad address length. A recovery check follows each. The
+   host fails the run if the driver hands it a frame outside 14-1514
+   bytes (`frame-invalid`).
+
+   What QEMU lets through: it applies backpressure when a card's receive
+   ring is full and drops what the UDP socket cannot hold, so of the
+   2000 flood frames the e1000e received about 350 and the RTL8139 about
+   100, and a true hardware receive overflow cannot be forced. Its card
+   models also drop the short and oversized frames themselves; only the
+   checksum and truncation cases reach the drivers. The size rule is
+   still enforced by the host, and real hardware will exercise it more.
+7. **Link flaps** (robustness contract, `docs/design/robust-nic.md`).
    Through QEMU's monitor (`vm/run.sh --qmp`, QMP `set_link`), the peer
    drops the link three times for 2 s. While it is down, 3 pings must go
    unanswered (otherwise the test is not really dropping it). After each,
@@ -47,7 +63,10 @@ harness/grind.sh e1000e                    # builds the driver and runs this
    `link-up` every 100 ms, must see the link go down at least 3 times
    (`--expect-link-flaps 3`, else `link-flaps-unseen`) and up at the end
    (else `link-stuck-down`).
-7. The peer sends the host a "done" control frame, which ends serving.
+8. The peer sends the host a "done" control frame, which ends serving.
+   It says whether the timeline completed; if the peer stopped at a
+   failed step, the host reports `peer-ended-early` (the failing step is
+   in the peer's log) rather than judging steps that never ran.
 
 **Pass** requires all of:
 
@@ -71,9 +90,10 @@ receives (`rx:` lines). Logs: `vm/build/serial.log`,
 `modules/silent` claims the link is up but never receives anything. The
 test must fail on it, which shows it cannot pass without a working driver.
 `modules/mute-error` returns an empty error from `receive`, and
-`modules/leaky` allocates a DMA buffer on every `receive`: grind-host
-must fail them with `driver-error-unreadable` and `dma-growth`, the
-host's side of the robustness contract (`docs/design/robust-nic.md`):
+`modules/leaky` allocates a DMA buffer on every `receive`, and
+`modules/oversized` hands up a 1515-byte frame: grind-host must fail
+them with `driver-error-unreadable`, `dma-growth` and `frame-invalid`,
+the host's side of the robustness contract (`docs/design/robust-nic.md`):
 
 ```sh
 cargo build --release --manifest-path tests/nic/modules/Cargo.toml --target wasm32-unknown-unknown

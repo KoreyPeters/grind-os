@@ -49,7 +49,10 @@ grind-host --device <pci-address> --module <driver.wasm>
    timeout, an empty error (`driver-error-unreadable`), a frame outside
    14-1514 bytes (`frame-invalid`), DMA memory growing after `start`
    (`dma-growth`), or fewer link drops reported than
-   `--expect-link-flaps` (`link-flaps-unseen`). Whether frames were
+   `--expect-link-flaps` (`link-flaps-unseen`) or the link not up at the
+   end (`link-stuck-down`). If the peer's "done" says it stopped early at
+   a failed step, the host reports `peer-ended-early` instead of judging
+   steps that never ran. Whether frames were
    answered, and whether the driver recovered after each hostile phase,
    is for the test's peer to judge (`tests/nic`).
 5. **Exercise** (only with `--exercise-block`). The device must take NVMe

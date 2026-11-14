@@ -15,12 +15,17 @@
 //!    use many times over, so ring wrap-around is tested, not just the first
 //!    few slots.
 //!
-//! 3. With `--qmp SOCKET` (QEMU's monitor), drops the link three times
+//! 3. Floods the driver with 2000 frames back to back, then sends 20
+//!    rounds of hostile frames (shorter than a header, runts, oversized up
+//!    to 9000 bytes, bad checksums, truncated packets); a recovery check
+//!    follows each. The host fails the run if the driver hands it a frame
+//!    outside 14-1514 bytes.
+//! 4. With `--qmp SOCKET` (QEMU's monitor), drops the link three times
 //!    (`set_link`): while it is down, pings must go unanswered; after it
 //!    comes back, a recovery check (20 pings, the first answered within
 //!    5 s, the rest within 2 s each) must pass. This forces the NIC
 //!    robustness contract's link-loss items (docs/design/robust-nic.md).
-//! 4. Sends the host a "done" control frame.
+//! 5. Sends the host a "done" control frame.
 //!
 //! ```text
 //! nic-peer --ports-file FILE [--stop-file FILE] [--deadline-s N] [--pings N] [--bulk N]
@@ -478,8 +483,16 @@ fn run(args: &Args) -> Result<(), ()> {
             );
         }
     }
-    // 4. Link flaps, through QEMU's monitor.
+    // 3. A flood, then hostile frames.
     let mut seq = args.pings + args.bulk;
+    if ok {
+        ok = flood(&mut wire, &mut seq);
+    }
+    if ok {
+        ok = hostile(&mut wire, &mut seq);
+    }
+
+    // 4. Link flaps, through QEMU's monitor.
     if ok {
         if let Some(path) = &args.qmp {
             ok = link_flaps(&mut wire, path, &mut seq);
@@ -487,7 +500,7 @@ fn run(args: &Args) -> Result<(), ()> {
     }
 
     // The timeline is over: tell the host to stop serving.
-    wire.send(&control_frame(CONTROL_DONE, &[]));
+    wire.send(&control_frame(CONTROL_DONE, &[ok as u8]));
     if wire.seen > wire.printed {
         println!("    ({} more frames not shown)", wire.seen - wire.printed);
     }
@@ -601,6 +614,119 @@ fn recovery(wire: &mut Wire, after: &str, seq: &mut u16) -> bool {
     }
     step(&name, true, &expected, &format!("first reply after {} ms ({tries} tries), then {} more", first.as_millis(), RECOVER_PINGS - 1));
     true
+}
+
+/// Frames in the flood phase.
+const FLOOD_FRAMES: u32 = 2000;
+/// Rounds of the hostile-frame set.
+const HOSTILE_ROUNDS: u32 = 20;
+/// After sending a phase's frames, how long to drain replies before the
+/// recovery check.
+const DRAIN: Duration = Duration::from_millis(500);
+
+/// Receive and discard whatever arrives for `d`.
+fn drain(wire: &mut Wire, d: Duration) -> u32 {
+    let until = Instant::now() + d;
+    let mut n = 0;
+    while let Some(_f) = wire.recv(until.saturating_duration_since(Instant::now())) {
+        n += 1;
+        if Instant::now() >= until {
+            break;
+        }
+    }
+    n
+}
+
+/// A frame from us to the driver's MAC with this EtherType and payload.
+fn raw_frame(ethertype: u16, payload: &[u8]) -> Vec<u8> {
+    let mut f = DUT_MAC.to_vec();
+    f.extend_from_slice(&PEER_MAC);
+    f.extend_from_slice(&ethertype.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Flood: FLOOD_FRAMES frames back to back, without waiting: pings of
+/// varying size (answered), ARP for other addresses and an unknown
+/// EtherType (ignored). Then the recovery check.
+fn flood(wire: &mut Wire, seq: &mut u16) -> bool {
+    let begun = Instant::now();
+    for i in 0..FLOOD_FRAMES {
+        let f = match i % 4 {
+            0 | 1 => {
+                *seq += 1;
+                let len = 18 + (i as usize * 97) % 1455;
+                echo_request(*seq, &bulk_data(*seq, len))
+            }
+            2 => {
+                let mut a = arp_request();
+                a[41] = (i % 250) as u8 + 1; // who-has 10.0.2.x, not us
+                a
+            }
+            _ => raw_frame(0x88B6, &vec![i as u8; 46 + (i as usize % 200)]),
+        };
+        wire.send(&f);
+    }
+    let sent_ms = begun.elapsed().as_millis();
+    let back = drain(wire, DRAIN);
+    step(
+        "flood",
+        true,
+        &format!("{FLOOD_FRAMES} frames sent back to back"),
+        &format!("sent in {sent_ms} ms; {back} frames came back while draining"),
+    );
+    recovery(wire, "flood", seq)
+}
+
+/// One round of hostile frames: what a driver must neither hand up (outside
+/// 14-1514 bytes) nor be broken by.
+fn hostile_frames(seq: u16) -> Vec<(&'static str, Vec<u8>)> {
+    let mut bad_ip = echo_request(seq, &[1; 32]);
+    bad_ip[24] ^= 0xff; // IPv4 header checksum
+    let mut bad_icmp = echo_request(seq, &[2; 32]);
+    bad_icmp[36] ^= 0xff; // ICMP checksum
+    let mut truncated = echo_request(seq, &[3; 32]);
+    truncated[16..18].copy_from_slice(&1400u16.to_be_bytes()); // total length past the end
+    let mut bad_arp = arp_request();
+    bad_arp[18] = 9; // hardware address length
+    vec![
+        ("1 byte", vec![0x42]),
+        ("13 bytes, shorter than a header", DUT_MAC.iter().chain(&PEER_MAC).chain(&[0x08]).copied().collect()),
+        ("a bare header", raw_frame(0x88B6, &[])),
+        ("a 59-byte runt", raw_frame(0x88B6, &[7; 45])),
+        ("1515 bytes, one over", raw_frame(0x88B6, &[8; 1501])),
+        ("a 1600-byte ping", echo_request(seq, &[9; 1558])),
+        ("4000 bytes", raw_frame(0x88B6, &[10; 3986])),
+        ("9000 bytes, jumbo", raw_frame(0x88B6, &[11; 8986])),
+        ("IPv4 with a bad header checksum", bad_ip),
+        ("ICMP with a bad checksum", bad_icmp),
+        ("IPv4 truncated", truncated),
+        ("ARP with a bad address length", bad_arp),
+    ]
+}
+
+/// HOSTILE_ROUNDS rounds of hostile frames, then the recovery check.
+fn hostile(wire: &mut Wire, seq: &mut u16) -> bool {
+    let mut names = Vec::new();
+    let mut sent = 0;
+    for _ in 0..HOSTILE_ROUNDS {
+        *seq += 1;
+        for (name, f) in hostile_frames(*seq) {
+            wire.send(&f);
+            sent += 1;
+            if names.len() < 12 {
+                names.push(name);
+            }
+        }
+    }
+    let back = drain(wire, DRAIN);
+    step(
+        "hostile",
+        true,
+        &format!("{sent} hostile frames sent: {}", names.join(", ")),
+        &format!("sent; {back} frames came back while draining"),
+    );
+    recovery(wire, "hostile", seq)
 }
 
 /// Drop the link FLAPS times; while it is down, pings must go unanswered;
@@ -725,6 +851,23 @@ mod tests {
         // A full-size reply checks out like a small one.
         let data = bulk_data(9, 1472);
         assert_eq!(check_echo_reply(&good_echo_reply(9, &data), 9, &data), Some(Ok(())));
+    }
+
+    #[test]
+    fn hostile_frames_are_what_they_say() {
+        let set = hostile_frames(7);
+        let len = |n: &str| set.iter().find(|(name, _)| *name == n).unwrap().1.len();
+        assert_eq!(len("1 byte"), 1);
+        assert_eq!(len("13 bytes, shorter than a header"), 13);
+        assert_eq!(len("a bare header"), 14);
+        assert_eq!(len("a 59-byte runt"), 59);
+        assert_eq!(len("1515 bytes, one over"), 1515);
+        assert_eq!(len("a 1600-byte ping"), 1600);
+        assert_eq!(len("9000 bytes, jumbo"), 9000);
+        for n in ["IPv4 with a bad header checksum", "ICMP with a bad checksum", "IPv4 truncated"] {
+            let f = &set.iter().find(|(name, _)| *name == n).unwrap().1;
+            assert_eq!(check_echo_reply(f, 7, &[]).map(|r| r.is_ok()), None, "{n} is not a reply");
+        }
     }
 
     #[test]

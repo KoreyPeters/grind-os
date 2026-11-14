@@ -109,6 +109,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nic-test-oversized"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "nic-test-silent"
 version = "0.1.0"
 dependencies = [

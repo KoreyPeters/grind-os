@@ -30,20 +30,23 @@ pub const CONTROL_MAGIC: &[u8; 8] = b"GRINDCTL";
 /// never handed to the responder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
-    /// The peer's timeline is over: stop serving.
-    Done,
+    /// The peer's timeline is over: stop serving. `complete` is false if
+    /// the peer stopped early because a step failed.
+    Done { complete: bool },
 }
 
 impl Control {
     pub fn name(self) -> &'static str {
         match self {
-            Control::Done => "done",
+            Control::Done { complete: true } => "done",
+            Control::Done { complete: false } => "done-early",
         }
     }
 }
 
 /// The control message in `frame`, if it is one: EtherType 0x88B5, then
-/// `CONTROL_MAGIC`, then one op byte (1 = done).
+/// `CONTROL_MAGIC`, then one op byte (1 = done, then 1 byte: 1 if the
+/// timeline completed, 0 if it stopped early).
 pub fn control(frame: &[u8]) -> Option<Control> {
     if frame.len() < ETH_HEADER + CONTROL_MAGIC.len() + 1
         || u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_CONTROL
@@ -52,7 +55,9 @@ pub fn control(frame: &[u8]) -> Option<Control> {
         return None;
     }
     match frame[ETH_HEADER + CONTROL_MAGIC.len()] {
-        1 => Some(Control::Done),
+        1 => Some(Control::Done {
+            complete: frame.get(ETH_HEADER + CONTROL_MAGIC.len() + 1) == Some(&1),
+        }),
         _ => None,
     }
 }
@@ -257,9 +262,13 @@ mod tests {
         f.extend_from_slice(&ETHERTYPE_CONTROL.to_be_bytes());
         f.extend_from_slice(CONTROL_MAGIC);
         f.push(1);
-        assert_eq!(control(&f), Some(Control::Done));
+        f.push(1);
+        assert_eq!(control(&f), Some(Control::Done { complete: true }));
+        let mut early = f.clone();
+        *early.last_mut().unwrap() = 0;
+        assert_eq!(control(&early), Some(Control::Done { complete: false }));
         let mut unknown = f.clone();
-        *unknown.last_mut().unwrap() = 9;
+        unknown[22] = 9;
         assert_eq!(control(&unknown), None);
         let mut no_magic = f.clone();
         no_magic[14] = b'X';

@@ -1062,7 +1062,7 @@ fn serve(store: &mut Store<State>, nic: &Nic, opts: &ServeOptions) -> Result<(),
 
     let responder = net::Responder { mac, ip };
     let mut tally = Tally::default();
-    let (mut link_drops, mut done) = (0u64, false);
+    let (mut link_drops, mut done, mut peer_complete) = (0u64, false, false);
     let begun = Instant::now();
     let end = begun + opts.duration;
     let mut next_link_poll = Instant::now() + LINK_POLL;
@@ -1126,7 +1126,10 @@ fn serve(store: &mut Store<State>, nic: &Nic, opts: &ServeOptions) -> Result<(),
                 ],
             );
             match control {
-                net::Control::Done => done = true,
+                net::Control::Done { complete } => {
+                    done = true;
+                    peer_complete = complete;
+                }
             }
             continue;
         }
@@ -1205,6 +1208,24 @@ fn serve(store: &mut Store<State>, nic: &Nic, opts: &ServeOptions) -> Result<(),
             ],
         );
         return Err("dma-growth");
+    }
+    // The peer stopped its timeline at a failed step: its log says which.
+    // The checks below assume the whole timeline ran, so they would only
+    // point at the wrong thing.
+    if done && !peer_complete {
+        emit(
+            "peer-ended-early",
+            &[
+                ("expected", Value::Str("the peer runs its whole timeline")),
+                (
+                    "got",
+                    Value::Str(
+                        "the peer stopped early at a failed step; see its log (peer.log) for which",
+                    ),
+                ),
+            ],
+        );
+        return Err("peer-ended-early");
     }
     if !link_up {
         emit(
