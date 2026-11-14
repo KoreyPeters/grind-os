@@ -34,6 +34,8 @@ grind-host --device <pci-address> --module <driver.wasm>
    Serving ends in a pass if nothing failed. Whether the pings were
    actually answered on the wire is for the test's peer to judge
    (`tests/nic`).
+5. **Teardown.** The host calls `Device::quiesce` to turn bus mastering
+   off, and only then drops the driver's DMA buffers (unmapping them).
 
 Output is JSON lines on stdout. The last line is always
 `{"event":"result","status":"pass"|"fail","reason":...}`. Traps include a
@@ -42,7 +44,7 @@ Wasm backtrace with function names.
 | Exit | Meaning |
 | --- | --- |
 | 0 | `start` returned ok and no denied write was attempted |
-| 1 | the driver failed: `driver-error`, `trap`, `timeout`, `link-down` or `deny-list-violation` |
+| 1 | the driver failed (`driver-error`, `trap`, `timeout`, `link-down`, `deny-list-violation`), or bus mastering could not be cleared at the end (`quiesce`) |
 | 2 | the run could not start: arguments, module rejected, device not opened |
 
 Dependencies are pinned exactly: `wasmtime` 50.0.1 (no WASI, no default

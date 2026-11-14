@@ -80,4 +80,21 @@ printf 'PORTALS step=deny-list-gate result=%s expected="%s" got="%s"\n' "$result
 run_case emulator-detected 0 '"dmi_sys_vendor":"QEMU"' read-status $EMU
 run_case denied-write 1 '"event":"mmio-denied","attempted":"write32","offset":"0x102c"' denied-write $EMU
 
+# The shim resets the device at open and clears bus mastering before the
+# driver's DMA buffers are unmapped (review finding #2).
+run_case reset-at-open 0 '"reset":"VFIO_DEVICE_RESET ok"' read-status $EMU
+run_case quiesce-at-close 0 '"event":"device-quiesce","bdf":"'"$BDF"'","command_before":"0x' dma $EMU
+
+# After every case above: the IOMMU logged no DMA faults (teardown included).
+expected="no DMAR fault lines in dmesg after all cases"
+faults="$(dmesg | grep -E 'DMAR: \[DMA (Read|Write)|DMAR: DRHD: handling fault' || true)"
+if [ -z "$faults" ]; then
+	result=pass got="none"
+else
+	result=fail got="$(printf '%s\n' "$faults" | head -n 5)"
+	failed=1
+	printf '%s\n' "$faults" | sed 's/^/    /'
+fi
+printf 'PORTALS step=no-dma-faults result=%s expected="%s" got="%s"\n' "$result" "$expected" "$(clean "$got")"
+
 exit "$failed"

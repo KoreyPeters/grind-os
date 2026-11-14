@@ -24,9 +24,12 @@ host's JSON log indented underneath.
 | `deny-list-gate` | `read-status` without `--allow-unreviewed-deny-list` | follows the list's `reviewed` flag: exit 2 at `device-deny-list` while unreviewed, exit 0 with `deny_reviewed: true` once reviewed (the gate is unit-tested in `shim/src/deny.rs` for both states) |
 | `emulator-detected` | `read-status` with the allow flag | exit 0, `device-open` reports `dmi_sys_vendor: QEMU` (the value the rule 10 gate checks) |
 | `denied-write` | writes NVM word 0 through EEWR (0x102C), then "handles" the `denied` error | exit 1, `mmio-denied` logged, `deny-list-violation` |
+| `reset-at-open` | `read-status` | exit 0, `device-open` reports `reset: VFIO_DEVICE_RESET ok` |
+| `quiesce-at-close` | `dma` (allocates buffers) | exit 0, `device-quiesce` logged with bus mastering off before the buffers are unmapped |
+| `no-dma-faults` | (after all cases) | `dmesg` has no Intel IOMMU DMA fault lines |
 
 The modules in `modules/` are trusted test fixtures, not drivers. Two of
 them use `unsafe` on purpose: `wasi-import` declares a foreign import, and
 none of them are subject to the driver rules.
 
-**Status:** all nine cases pass on QEMU 4.2.1 and 6.2.0. The e1000e deny list is human reviewed (see `shim/README.md`); the cases pass in either state.
+**Status:** all twelve cases pass on QEMU 4.2.1 and 6.2.0. The e1000e deny list is human reviewed (see `shim/README.md`); the cases pass in either state.

@@ -4,10 +4,16 @@
 
 The only code that touches a device on a driver's behalf. Trusted.
 
-- `Device::open` opens a PCI device through VFIO (Type1 v2 IOMMU), confirms
-  its identity through config space, enables memory decode and bus
-  mastering, and finds BAR0. Each failure says which step failed, what was
-  expected and what happened.
+- `Device::open` opens a PCI device through VFIO (Type1 v2 IOMMU), resets
+  it (`VFIO_DEVICE_RESET`, so nothing carries over from a previous user; a
+  device VFIO cannot reset is refused), confirms its identity through config
+  space, enables memory decode and bus mastering, and finds BAR0. Each
+  failure says which step failed, what was expected and what happened.
+- `Device::quiesce` clears bus mastering and checks it reads back clear, so
+  the device can no longer issue DMA. The host calls it before the
+  driver's DMA buffers are unmapped; dropping a `Device` calls it as a
+  backstop. Logged as `device-quiesce` (command register before and after)
+  or `device-quiesce-error`.
 - `Window` gives checked 32-bit access to BAR0. Writes that touch a
   deny-list entry are refused, logged (`mmio-denied`) and counted. Any count
   above zero fails the run.

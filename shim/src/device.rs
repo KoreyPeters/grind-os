@@ -12,6 +12,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Why a device could not be opened: which step, what was expected, what happened.
@@ -78,6 +79,17 @@ pub struct Device {
     deny: &'static DenyList,
     window: Window<File>,
     dma: DmaAllocator,
+    /// A second handle on the VFIO device fd, for config space.
+    config: File,
+    config_offset: u64,
+    /// Set once bus mastering has been cleared.
+    quiesced: AtomicBool,
+}
+
+fn read_command(config: &File, config_offset: u64) -> std::io::Result<u16> {
+    let mut cmd = [0u8; 2];
+    config.read_exact_at(&mut cmd, config_offset + PCI_COMMAND)?;
+    Ok(u16::from_le_bytes(cmd))
 }
 
 impl Device {
@@ -169,6 +181,19 @@ impl Device {
             ));
         }
 
+        // Reset, so no state (rings, DMA addresses, enabled engines) carries
+        // over from whoever used the device before. A device VFIO cannot
+        // reset is refused rather than run in an unknown state.
+        if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
+            return Err(fail(
+                "reset",
+                "a device VFIO can reset (VFIO_DEVICE_FLAGS_RESET)",
+                format!("device info flags 0x{:x}", info.flags),
+            ));
+        }
+        ioctl_val(&dev, VFIO_DEVICE_RESET, 0)
+            .map_err(fails("reset", "VFIO_DEVICE_RESET succeeds"))?;
+
         // Config space: confirm identity, then enable memory decode and bus
         // mastering (DMA). Drivers never see config space.
         let cfg = region_info(&dev, VFIO_PCI_CONFIG_REGION_INDEX, "config")?;
@@ -184,12 +209,15 @@ impl Device {
                 format!("0x{id:08x}"),
             ));
         }
-        let mut cmd = [0u8; 2];
-        dev.read_exact_at(&mut cmd, cfg.offset + PCI_COMMAND)
-            .map_err(fails("config", "read PCI command register"))?;
-        let cmd = u16::from_le_bytes(cmd) | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
+        let cmd = read_command(&dev, cfg.offset)
+            .map_err(fails("config", "read PCI command register"))?
+            | PCI_COMMAND_MEMORY
+            | PCI_COMMAND_MASTER;
         dev.write_all_at(&cmd.to_le_bytes(), cfg.offset + PCI_COMMAND)
             .map_err(fails("config", "write PCI command register"))?;
+        let config = dev
+            .try_clone()
+            .map_err(fails("config", "duplicate the device fd for config space"))?;
 
         // BAR0: the register window.
         let bar0 = region_info(&dev, VFIO_PCI_BAR0_REGION_INDEX, "bar0")?;
@@ -218,6 +246,7 @@ impl Device {
                     Value::Str(sys_vendor.as_deref().unwrap_or("unreadable")),
                 ),
                 ("dma_limit", Value::Hex(dma_limit)),
+                ("reset", Value::Str("VFIO_DEVICE_RESET ok")),
             ],
         );
 
@@ -236,7 +265,63 @@ impl Device {
             deny,
             window,
             dma,
+            config,
+            config_offset: cfg.offset,
+            quiesced: AtomicBool::new(false),
         })
+    }
+
+    /// Stop the device from issuing DMA: clear bus mastering in the PCI
+    /// command register and check that it reads back clear. Call this
+    /// before DMA buffers are unmapped. Runs once; later calls return Ok.
+    /// Dropping the device calls it too, as a backstop.
+    ///
+    /// The outcome is logged (`device-quiesce` or `device-quiesce-error`).
+    pub fn quiesce(&self) -> Result<(), String> {
+        if self.quiesced.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let result = (|| {
+            let before = read_command(&self.config, self.config_offset)
+                .map_err(|e| format!("read PCI command register: {e}"))?;
+            let cleared = before & !PCI_COMMAND_MASTER;
+            self.config
+                .write_all_at(&cleared.to_le_bytes(), self.config_offset + PCI_COMMAND)
+                .map_err(|e| format!("write PCI command register: {e}"))?;
+            let after = read_command(&self.config, self.config_offset)
+                .map_err(|e| format!("read back PCI command register: {e}"))?;
+            if after & PCI_COMMAND_MASTER != 0 {
+                return Err(format!(
+                    "PCI command register still has bus mastering set: 0x{before:04x} -> 0x{after:04x}"
+                ));
+            }
+            Ok((before, after))
+        })();
+        match result {
+            Ok((before, after)) => {
+                emit(
+                    "device-quiesce",
+                    &[
+                        ("bdf", Value::Str(&self.bdf)),
+                        ("command_before", Value::Hex(before.into())),
+                        ("command_after", Value::Hex(after.into())),
+                        ("bus_master", Value::Str("off")),
+                    ],
+                );
+                Ok(())
+            }
+            Err(e) => {
+                emit(
+                    "device-quiesce-error",
+                    &[
+                        ("bdf", Value::Str(&self.bdf)),
+                        ("expected", Value::Str("bus mastering cleared")),
+                        ("got", Value::Str(&e)),
+                    ],
+                );
+                Err(e)
+            }
+        }
     }
 
     pub fn bdf(&self) -> &str {
@@ -257,5 +342,13 @@ impl Device {
 
     pub fn dma(&self) -> &DmaAllocator {
         &self.dma
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        // Backstop for callers that never quiesced. A failure is already
+        // logged by quiesce; there is no one left to return it to.
+        let _ = self.quiesce();
     }
 }

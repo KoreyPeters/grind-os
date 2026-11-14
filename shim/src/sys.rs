@@ -22,12 +22,14 @@ pub const VFIO_GROUP_SET_CONTAINER: c_ulong = 0x3b68;
 pub const VFIO_GROUP_GET_DEVICE_FD: c_ulong = 0x3b6a;
 pub const VFIO_DEVICE_GET_INFO: c_ulong = 0x3b6b;
 pub const VFIO_DEVICE_GET_REGION_INFO: c_ulong = 0x3b6c;
+pub const VFIO_DEVICE_RESET: c_ulong = 0x3b6f;
 pub const VFIO_IOMMU_MAP_DMA: c_ulong = 0x3b71;
 pub const VFIO_IOMMU_UNMAP_DMA: c_ulong = 0x3b72;
 
 pub const VFIO_API_VERSION: c_int = 0;
 pub const VFIO_TYPE1V2_IOMMU: c_ulong = 3;
 pub const VFIO_GROUP_FLAGS_VIABLE: u32 = 1 << 0;
+pub const VFIO_DEVICE_FLAGS_RESET: u32 = 1 << 0;
 pub const VFIO_DEVICE_FLAGS_PCI: u32 = 1 << 1;
 pub const VFIO_REGION_INFO_FLAG_READ: u32 = 1 << 0;
 pub const VFIO_REGION_INFO_FLAG_WRITE: u32 = 1 << 1;

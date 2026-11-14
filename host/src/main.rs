@@ -160,6 +160,10 @@ fn parse_args() -> Result<Args, String> {
 }
 
 /// Per-run host state: the device and the driver's resources.
+///
+/// Teardown order matters: bus mastering must be off before DMA buffers
+/// (in `table`) are unmapped. `main` calls `Device::quiesce` explicitly
+/// before dropping the store; `Device`'s own drop is only a backstop.
 struct State {
     device: Device,
     table: ResourceTable,
@@ -561,6 +565,8 @@ fn main() -> ExitCode {
     let elapsed_ms = store.data().started.elapsed().as_millis() as u64;
     let violations = store.data().device.window().violations();
     let dma_used = store.data().device.dma().used();
+    // Stop DMA before the driver's buffers are unmapped (logged either way).
+    let quiesced = store.data().device.quiesce();
     // Release the driver's resources (DMA buffers are unmapped, then freed)
     // before reporting.
     drop(instance);
@@ -573,6 +579,7 @@ fn main() -> ExitCode {
     ];
     match failure {
         Some(reason) => finish("fail", reason, &extra, 1),
+        None if quiesced.is_err() => finish("fail", "quiesce", &extra, 1),
         None if violations > 0 => finish("fail", "deny-list-violation", &extra, 1),
         None => finish("pass", "ok", &extra, 0),
     }
