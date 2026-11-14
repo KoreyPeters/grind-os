@@ -84,6 +84,10 @@ fn admin(what: &str, cmd: Vec<u8>) -> Result<Vec<u8>, String> {
     if cpl.len() != 16 {
         return Err(format!("{what}: expected a 16-byte completion, got {} bytes", cpl.len()));
     }
+    let (sent, got) = (le16(&cmd, 2), le16(&cpl, 12));
+    if got != sent {
+        return Err(format!("{what}: expected the completion for command {sent}, got command {got}"));
+    }
     match status(&cpl) {
         (0, 0) => Ok(cpl),
         (sct, sc) => Err(format!("{what}: expected success, got status SCT 0x{sct:x} SC 0x{sc:02x}")),

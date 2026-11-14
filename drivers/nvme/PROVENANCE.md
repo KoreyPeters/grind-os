@@ -53,3 +53,26 @@ was copied, adapted or translated.
   Set Features (Number of Queues) asked for one SQ and one CQ and reported
   64 of each granted (QEMU's `max_ioqpairs`); the driver uses one. The
   first grind passed `tests/block` (harness run `20261114T151952Z`).
+
+## Independent rewrite (2026-11-14)
+
+To check that `SPEC.md` is enough on its own, a fresh Claude session with
+none of this session's context wrote a second driver in a separate
+worktree. It was given only `CLAUDE.md`, this directory's `SPEC.md` and
+`PROVENANCE.md`, the portal WIT, the trusted code and READMEs, the
+FreeBSD/SPDK sources and `drivers/e1000e`. It was barred from the
+existing driver source (including git history), session transcripts, the
+NVMe specification, Linux and the web, and reported keeping to that. Its
+508-line driver passed `harness/grind.sh nvme`, including the block error
+contract, on the first harness run, without changing `SPEC.md`. It was
+not kept: it is equivalent to this one.
+
+It found four gaps in `SPEC.md`, none of which caused a failure, and
+they are now filled: checking admin completions' CID and status, not
+only I/O ones; failing at start on a block size outside 512–4096 bytes;
+doing every argument check before the first command, so a refused write
+writes nothing; and what happens to the Identify buffer. This driver
+already did all four except the admin CID check, which it now does.
+
+Neither driver ever failed a harness run, so this exercised the spec,
+not the grind loop of fixing a driver from readable failures.

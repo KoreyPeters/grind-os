@@ -71,8 +71,10 @@ DNR bit 15. Success is SC = 0 and SCT = 0 (`nvme.h:957, 967`).
 
 Admin completions come back from `admin`. I/O completions come from
 `complete(1)`; the shim has already consumed them from its queue, so the
-driver needs no phase tracking. The driver matches each completion's CID
-and SQID to the command it sent.
+driver needs no phase tracking. The driver checks every completion, admin
+and I/O alike: its CID (and, for I/O, its SQID) must match the command it
+sent, and its status must be success. Admin commands use CID 0; I/O
+commands count up from 1.
 
 ### Identify data
 
@@ -91,9 +93,12 @@ and SQID to the command it sent.
 
 1. Read CAP and CSTS; require RDY = 1, CFS = 0.
 2. Allocate a 4 KiB DMA buffer. Identify Controller; record MDTS; require
-   NN >= 1.
-3. Identify Namespace 1; record NSZE and the block size; require NSZE > 0
-   and MS = 0.
+   NN >= 1. The same buffer serves both Identify commands and is freed
+   when `start` returns.
+3. Identify Namespace 1; record NSZE and the block size; require NSZE > 0,
+   MS = 0 and a block size of 512 to 4096 bytes (LBADS 9 to 12, the range
+   the shim checks transfers for; anything else would only be refused
+   later).
 4. Set Features (Number of Queues) for one SQ and one CQ. The result
    (DW0: bits 15:0 SQs, 31:16 CQs, zero-based) always grants at least one
    of each; the driver logs it.
@@ -109,8 +114,11 @@ and SQID to the command it sent.
   buffer IOVA; PRP2 = IOVA + 4096 if the command moves more than 4096
   bytes, else 0.
 - `read(lba, count)` and `write(lba, data)` check `count > 0`, that the data
-  is a whole number of blocks, and that `lba + count <= NSZE`, and return
-  an error otherwise. They split the range into commands, issue them one at
+  is a whole number of blocks, and that `lba + count <= NSZE` (without
+  overflowing), and return an error otherwise. **Every check happens
+  before the first command is sent**, so a refused write writes nothing,
+  not even the blocks that fit (the block error contract in
+  `portals/wit`). They split the range into commands, issue them one at
   a time, wait for each completion (up to 500 ms), and fail on any non-zero
   status, naming SCT, SC and the LBA.
 - `flush` issues Flush for namespace 1 and waits for it.
