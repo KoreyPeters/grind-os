@@ -29,6 +29,14 @@ harness/grind.sh e1000e                    # builds the driver and runs this
    host polls the driver for frames for 15 s and answers through it.
 4. Once ARP is answered, the peer sends three ICMP echo requests (56 data
    bytes each) and waits up to 2 s for each reply.
+5. Then the **bulk** step: 300 more echo requests, one at a time, with
+   1000 to 1472 data bytes (frames of 1042 to 1514 bytes, sizes varying
+   so packets land at shifting offsets), about 371 KB each way. That wraps
+   every receive and transmit ring a driver is likely to use many times
+   (an 8 KiB receive ring about 45 times, a 32-entry descriptor ring about
+   9 times), so wrap-around is tested, not just the first few slots. The
+   step stops at the first failure and names the ping, its size, and how
+   much traffic had already passed.
 
 **Pass** requires all of:
 
@@ -38,10 +46,11 @@ harness/grind.sh e1000e                    # builds the driver and runs this
 - the ARP reply says 10.0.2.15 is-at 52:54:00:12:34:56, with the correct
   Ethernet and ARP fields;
 - each echo reply has the right MACs, addresses, id and sequence number,
-  valid IPv4 and ICMP checksums, and exactly the data that was sent.
+  valid IPv4 and ICMP checksums, and exactly the data that was sent, for
+  the three small pings and all 300 bulk ones.
 
 Output: the host's JSON log (indented), `NIC step=<step> result=pass|fail
-expected="..." got="..."` for `host`, `arp`, `ping-1`…`ping-3` and `peer`,
+expected="..." got="..."` for `host`, `arp`, `ping-1`…`ping-3`, `bulk` and `peer`,
 and a final `NIC result=pass|fail`. The peer prints every frame it
 receives (`rx:` lines). Logs: `vm/build/serial.log`,
 `target/nic-test/peer.log`.
@@ -58,3 +67,11 @@ tests/nic/check.sh tests/nic/modules/target/wasm32-unknown-unknown/release/nic_t
 ```
 
 Verified on QEMU 6.2.0.
+
+The bulk step was checked against a mutant: the C-mode RTL8139 driver
+from the grind experiment with only its receive-ring wrap changed to
+8192 + 16 bytes. ARP and the three small pings passed, as they would
+have under the old test; `bulk` failed at ping 8, after 8,813 bytes,
+where the ring first wraps (`no reply`; the driver's own log named a bad
+receive header at ring offset 1356). The e1000e driver and both RTL8139
+drivers (C+ and C mode) pass the bulk step.

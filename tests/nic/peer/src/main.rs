@@ -8,10 +8,15 @@
 //! 1. sends ARP who-has for the driver's address every 500 ms until a valid
 //!    reply arrives (the VM boots meanwhile), then
 //! 2. sends ICMP echo requests one at a time and checks every reply field
-//!    by field.
+//!    by field: first `--pings` small ones (56 data bytes), then `--bulk`
+//!    large ones (1000 to 1472 data bytes, varying, so frames of 1042 to
+//!    1514 bytes land at shifting offsets). The bulk step moves enough
+//!    traffic to wrap every receive and transmit ring a driver is likely to
+//!    use many times over, so ring wrap-around is tested, not just the first
+//!    few slots.
 //!
 //! ```text
-//! nic-peer --ports-file FILE [--stop-file FILE] [--deadline-s N] [--pings N]
+//! nic-peer --ports-file FILE [--stop-file FILE] [--deadline-s N] [--pings N] [--bulk N]
 //! ```
 //!
 //! When the stop file appears (the VM has powered off), the peer stops
@@ -45,6 +50,10 @@ const ARP_INTERVAL: Duration = Duration::from_millis(500);
 const PING_WAIT: Duration = Duration::from_secs(2);
 const ICMP_ID: u16 = 0x6772; // "gr"
 const PING_DATA: usize = 56;
+/// Bulk pings carry BULK_MIN to BULK_MIN + BULK_SPAN - 1 data bytes; the
+/// largest makes a 1514-byte frame (14 + 20 + 8 + 1472).
+const BULK_MIN: usize = 1000;
+const BULK_SPAN: usize = 473;
 /// Frames printed before the rest are only counted.
 const MAX_PRINTED: usize = 60;
 
@@ -274,12 +283,13 @@ struct Args {
     stop_file: Option<String>,
     deadline: Duration,
     pings: u16,
+    bulk: u16,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
-    let (mut ports_file, mut stop_file, mut deadline, mut pings) =
-        (None, None, Duration::from_secs(120), 3u16);
+    let (mut ports_file, mut stop_file, mut deadline, mut pings, mut bulk) =
+        (None, None, Duration::from_secs(120), 3u16, 300u16);
     while let Some(a) = args.next() {
         let mut value = |n: &str| args.next().ok_or_else(|| format!("{n} needs a value"));
         match a.as_str() {
@@ -293,10 +303,17 @@ fn parse_args() -> Result<Args, String> {
                 let v = value("--pings")?;
                 pings = v.parse().map_err(|_| format!("--pings {v}: not a number"))?;
             }
+            "--bulk" => {
+                let v = value("--bulk")?;
+                bulk = v.parse().map_err(|_| format!("--bulk {v}: not a number"))?;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    Ok(Args { ports_file: ports_file.ok_or("--ports-file is required")?, stop_file, deadline, pings })
+    if u32::from(pings) + u32::from(bulk) > u32::from(u16::MAX) {
+        return Err(format!("--pings {pings} plus --bulk {bulk}: more than 65535 sequence numbers"));
+    }
+    Ok(Args { ports_file: ports_file.ok_or("--ports-file is required")?, stop_file, deadline, pings, bulk })
 }
 
 fn run(args: &Args) -> Result<(), ()> {
@@ -377,17 +394,83 @@ fn run(args: &Args) -> Result<(), ()> {
             }
         }
     }
+    // 3. Bulk: large pings, one at a time, until the first failure.
+    if ok && args.bulk > 0 {
+        let expected = format!(
+            "{} echo replies, each with the same {BULK_MIN}-{} data bytes as its request, within {} ms each",
+            args.bulk,
+            BULK_MIN + BULK_SPAN - 1,
+            PING_WAIT.as_millis()
+        );
+        let begun = Instant::now();
+        let mut bytes = 0usize;
+        for i in 0..args.bulk {
+            let seq = args.pings + 1 + i;
+            let len = bulk_len(seq);
+            let data = bulk_data(seq, len);
+            let sent = Instant::now();
+            wire.send(&echo_request(seq, &data));
+            let verdict = loop {
+                let left = PING_WAIT.saturating_sub(sent.elapsed());
+                if left.is_zero() {
+                    break Err("no reply".to_string());
+                }
+                let Some(f) = wire.recv(left) else { continue };
+                if let Some(r) = check_echo_reply(&f, seq, &data) {
+                    break r;
+                }
+            };
+            if let Err(why) = verdict {
+                fail(
+                    "bulk",
+                    &expected,
+                    &format!(
+                        "ping {} of {} (seq {seq}, {len} data bytes) failed after {} replies ({bytes} data bytes each way): {why}",
+                        i + 1,
+                        args.bulk,
+                        i
+                    ),
+                );
+                ok = false;
+                break;
+            }
+            bytes += len;
+        }
+        if ok {
+            step(
+                "bulk",
+                true,
+                &expected,
+                &format!(
+                    "{} replies, {bytes} data bytes each way, in {} ms",
+                    args.bulk,
+                    begun.elapsed().as_millis()
+                ),
+            );
+        }
+    }
     if wire.seen > wire.printed {
         println!("    ({} more frames not shown)", wire.seen - wire.printed);
     }
     if ok { Ok(()) } else { Err(()) }
 }
 
+/// Data length of bulk ping `seq`: varies so frames land at shifting offsets.
+fn bulk_len(seq: u16) -> usize {
+    BULK_MIN + (usize::from(seq) * 37) % BULK_SPAN
+}
+
+/// Data of bulk ping `seq`: differs per ping and per byte, so a reply that
+/// carries another ping's data, or bytes from the wrong offset, cannot match.
+fn bulk_data(seq: u16, len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seq as u8).wrapping_add((i >> 8) as u8)).collect()
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            step("args", false, "--ports-file FILE [--deadline-s N] [--pings N]", &e);
+            step("args", false, "--ports-file FILE [--deadline-s N] [--pings N] [--bulk N]", &e);
             return ExitCode::from(2);
         }
     };
@@ -437,6 +520,18 @@ mod tests {
         let mut f = good_echo_reply(3, &data);
         f[11] ^= 1;
         assert!(matches!(check_echo_reply(&f, 3, &data), Some(Err(_))));
+    }
+
+    #[test]
+    fn bulk_pings_cover_the_size_range_and_differ() {
+        let lens: Vec<usize> = (4..304u16).map(bulk_len).collect();
+        assert!(lens.iter().all(|l| (BULK_MIN..BULK_MIN + BULK_SPAN).contains(l)));
+        assert_eq!(*lens.iter().max().unwrap() + 42, 1514, "the largest frame is 1514 bytes");
+        assert!(lens.windows(2).all(|w| w[0] != w[1]), "consecutive sizes differ");
+        assert_ne!(bulk_data(4, 1000), bulk_data(5, 1000));
+        // A full-size reply checks out like a small one.
+        let data = bulk_data(9, 1472);
+        assert_eq!(check_echo_reply(&good_echo_reply(9, &data), 9, &data), Some(Ok(())));
     }
 
     #[test]
