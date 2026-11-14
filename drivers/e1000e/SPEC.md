@@ -98,9 +98,17 @@ non-zero and must be programmed.
 
 Each step that waits has a bounded timeout. Every failure returns an error
 that names the step, the register, the expected value and the value read.
+Registers are read as in "Robustness contract: reading registers".
 
-1. **Probe.** Read STATUS. `0xFFFFFFFF` means the device is not responding:
-   fail.
+1. **Probe.** Read STATUS. `0xFFFFFFFF` (8 times in a row) means the device
+   is not responding: fail.
+1a. **Allocate** the RX ring, RX buffers, TX ring and TX buffers (see
+   "Memory"), all before configuring the device, so a failed allocation
+   leaves it untouched. A second `start` reuses the first one's buffers.
+
+Steps 2–15 are also the re-initialisation used for recovery (see
+"Robustness contract: recovery").
+
 2. **Mask interrupts** (4.6.1): IMC ← `0xFFFFFFFF`.
 3. **Quiesce** (CTRL note in 10.2.2.1, which points to 3.1.3.10): RCTL ← 0,
    TCTL ← 0; set CTRL.`GIO_MASTER_DISABLE`; poll STATUS bit 19 until clear
@@ -116,7 +124,9 @@ that names the step, the register, the expected value and the value read.
 7. **Link setup** (4.6.3.2, the preferred mechanism, where the MAC follows
    the PHY): in CTRL, set `SLU` and bit 3; clear `ASDE`, `FRCSPD`,
    `FRCDPLX`, `RFCE`, `TFCE`, `VME`, `PHY_RST`, `GIO_MASTER_DISABLE`.
-8. **Station address** (10.2.5.22–23): read RAL0 and RAH0. Require
+8. **Station address** (10.2.5.22–23): read RAL0 and RAH0, twice; both
+   reads must agree (and, on a re-initialisation, equal the address read
+   by `start`). Require
    RAH0.`AV` = 1, or fail ("no valid station address loaded from NVM"). The
    MAC is RAL0 bytes 0–3 (little-endian) then RAH0 bytes 0–1. Reject an
    all-zero, broadcast or multicast (bit 0 of byte 0) address.
@@ -147,15 +157,24 @@ Statistics (4.6.4) are not cleared: nothing reads them yet.
 
 Keep `rx_next` (the next descriptor the hardware will fill, starting at 0).
 
-1. Read descriptor `rx_next`. If `DD` = 0: return `none`.
-2. If `EOP` = 0, or errors ≠ 0, or length is outside 14–1514: log a warning
+1. Read the status byte of descriptor `rx_next`. If `DD` = 0: run the RX
+   check if 50 ms have passed since the last one ("Noticing a stall"), and
+   return `none`.
+2. Confirm: read the whole descriptor until two reads agree and its
+   address field is the one the driver wrote (7.1.3.1); otherwise return
+   `none` this call. `DD` must still be set.
+3. Read RDH. If it equals `rx_next`, the device has not written this
+   descriptor back (7.1.8): return `none`, do not take it.
+4. If `EOP` = 0, or errors ≠ 0, or length is outside 14–1514: log a warning
    naming the descriptor, status, errors and length, recycle the
-   descriptor (step 4) and return `none` for this call. With LPE = 0 and
+   descriptor (step 6) and return `none` for this call. With LPE = 0 and
    2048-byte buffers, a valid frame never spans two descriptors.
-3. Copy `length` bytes from that descriptor's buffer.
-4. Recycle: zero the status byte, then RDT ← `rx_next` (this hands the
-   descriptor back), and advance `rx_next` modulo 32.
-5. Return the frame.
+5. Copy `length` bytes from that descriptor's buffer, reading until two
+   reads agree (up to 6); if none agree, drop the frame with a warning.
+6. Recycle: zero bytes 8–15 (length, checksum, status, errors, VLAN), then
+   RDT ← `rx_next` (this hands the descriptor back), and advance `rx_next`
+   modulo 32.
+7. Return the frame.
 
 ## `transmit`
 
@@ -166,21 +185,166 @@ descriptor not yet confirmed done).
    length. PSP pads short frames to 64 bytes on the wire (10.2.6.1 asks
    for at least 17 bytes when padding; any valid frame is at least 14, so
    a frame of 14–16 bytes is padded in software to 17).
-2. Reclaim: while `tx_clean` ≠ `tx_tail` and descriptor `tx_clean` has
-   `DD` set, advance `tx_clean`.
+2. Reclaim, when 16 or more descriptors are pending: read TDH (two
+   agreeing reads). TDH counts descriptors "already loaded in the transmit
+   FIFO" (7.2.4), so if TDH lies between `tx_clean` and `tx_tail`, set
+   `tx_clean` ← TDH. Otherwise see "Noticing a stall".
 3. If advancing `tx_tail` would make it equal `tx_clean`, the ring is full:
-   return an error giving TDH, TDT, `tx_clean` and `tx_tail`.
+   rewrite TDT (a device that missed the last write sees it again), and
+   return an error giving TDH, TDT, `tx_clean` and the link state. If the
+   ring stays full with TDH unchanged for 1 s while the link is up,
+   re-initialise.
 4. Copy the frame into buffer `tx_tail`; write the descriptor: address,
    length, CMD = `EOP` | `IFCS` | `RS`, STA = 0.
 5. TDT ← `tx_tail` + 1 modulo 32, then store that as `tx_tail`.
 
-`RS` on every descriptor makes the hardware write `DD` back for each one
-(7.2.10.1.4), which step 2 relies on.
+`RS` is set on every descriptor (7.2.10.1.4). The driver does not read the
+`DD` it causes: TDH is the authority (step 2), so the driver reads no
+device-written TX memory.
 
 ## `mac-address`, `link-up`
 
 `mac-address` returns the address read in step 8. `link-up` reads
-STATUS.`LU` each time it is called.
+STATUS.`LU` each time it is called; a STATUS that reads all-ones 8 times
+in a row is reported as link down. At most every 500 ms, `link-up` also
+runs the health check ("Noticing a stall"); the host calls it every
+100 ms.
+
+## Robustness contract
+
+How the driver meets each item of the NIC robustness contract
+(`portals/wit` `interface ethernet`, `docs/design/robust-nic.md`). Device
+facts are from the datasheet sections cited; "observed" marks behaviour
+seen on QEMU 6.2.0's `e1000e` (recorded in `PROVENANCE.md`).
+
+### Principles
+
+1. **No single read is trusted.** Registers and device-written memory are
+   both read again before the driver acts on them (below).
+2. **The head registers are the authority** on what the device has
+   finished. RDH: "Hardware OWNS all descriptors between [head... tail]",
+   and used descriptors are written back "just prior to advancing the head
+   pointer" (7.1.8). TDH "returns the value of head corresponding to
+   descriptors already loaded in the transmit FIFO" (7.2.4).
+3. **A disagreement that lasts is resynchronised, not waited on.** The
+   driver never waits forever on a descriptor; it compares its own ring
+   positions with the device's and moves to where the device is.
+4. **Lost configuration is rebuilt by a reset**, reusing the buffers from
+   `start`. CTRL.RST is "a last-ditch software mechanism to recover from an
+   indeterminate or suspected hung hardware state"; it returns the receive
+   and transmit registers to their power-on values (10.2.2.1). RDH and TDH
+   may be written only after a reset and before RCTL.EN / TCTL.EN (10.2.5.8,
+   10.2.6.7), so every ring rebuild goes through the reset.
+5. **Every wait is bounded**, every retry loop has a fixed count, and no
+   call sleeps except the bounded waits of the reset sequence (about 110 ms
+   at most) and `start`'s 5 s link wait (`start` has 15 s).
+
+### Reading registers
+
+No register the driver reads can hold `0xFFFFFFFF` in this configuration:
+STATUS, CTRL, RCTL, TCTL, GCR and the length and index registers have
+reserved fields that read 0 (10.2.2.1–2, 10.2.3.1, 10.2.5.1, 10.2.5.7–9,
+10.2.6.1, 10.2.6.6–8), RDBAL and TDBAL hold 4096-aligned addresses,
+RDBAH and TDBAH the high half of an IOVA the DMA portal gave (observed:
+1), and an all-ones RAL0 would be a multicast address, which step 8
+rejects. So all-ones is what a removed or wedged PCIe device returns,
+never a value. `read` retries such a read up to 8 times and then reports "device not responding: <register> read 0xffffffff 8 times in
+a row". Read-modify-writes (CTRL, GCR) use only such a validated read, so
+an all-ones read is never written back (it would set CTRL.RST and
+CTRL.PHY_RST).
+
+Ring indexes (RDH, RDT, TDH, TDT) are 16-bit fields in a ring of 32
+(10.2.5.8–9, 10.2.6.7–8): `read_index` needs two reads that agree and
+are below 32, within 12 reads; a read of 32 or more (all-ones) is skipped,
+since it says nothing about the index. Otherwise it returns an error
+naming every value it got. (Observed under injected faults: all-ones reads
+can alternate with good ones, so requiring two *consecutive* good reads
+failed needlessly; see the grind log.)
+
+The station address (RAL0/RAH0) is read twice and both reads must agree;
+after a re-initialisation it must equal the address read by `start`.
+
+### Reading device-written memory
+
+- **RX descriptor.** A first one-byte read of the status decides only that
+  a descriptor is *not* ready (a wrong "not done" only delays a frame).
+  Before a descriptor is taken, the whole 16 bytes are read until two
+  reads agree (up to 6), and bytes 0–7 must be the buffer address the
+  driver wrote: the device writes only length, checksum, status, errors
+  and VLAN (7.1.3.1), so a different address is a corrupted read. Then
+  RDH must have moved past the descriptor (7.1.8): if RDH equals it, the
+  descriptor cannot have been written back and is not taken. Only then is
+  the length checked (14–1514), with EOP set and errors 0, or the frame is
+  dropped with a warning.
+- **RX payload.** Read until two reads agree (up to 6); otherwise the
+  frame is dropped with a warning. A frame that changes between reads is
+  never handed up.
+- **TX.** The driver reads no device-written TX memory: TDH (validated,
+  as above) says which descriptors are free (7.2.4).
+
+### Items of the contract
+
+| Contract item | How |
+| --- | --- |
+| Link goes down: `link-up` false within 1 s | `link-up` reads STATUS.LU (10.2.2.2) on every call; a device that does not answer (8 all-ones reads) is reported as link down. |
+| Link comes back: up and frames flow within 5 s, no new `start` | Nothing is torn down while the link is down. QEMU sets STATUS.LU about 0.6 s after the link returns (observed). A transmit ring that filled while the link was down is restarted by rewriting TDT when `transmit` finds it full; a full ring whose TDH has not moved for 1 s while the link is up is re-initialised. |
+| Receive overflow | When the ring is full the device stops storing frames until the tail moves (7.1.8). Each `receive` hands one descriptor back (RDT), so draining restarts receive. Every 50 ms an idle `receive` checks RDH and RDT against its position (below). |
+| Hostile frames | Length outside 14–1514, EOP clear or any error bit: dropped with a warning, descriptor recycled. Frames are copied out of fixed 2048-byte buffers, so no length can reach outside them. |
+| Transmit ring full | `transmit` returns "transmit ring full: expected a free descriptor, got TDH, TDT, oldest pending, link" at once. It never waits. |
+| Registers read all-ones | Every read retries a fixed number of times, then returns an error naming the register; `link-up` reports down. Configuration is not "repaired" on all-ones reads: only a valid value that differs (read twice) triggers re-initialisation, so a device that comes back with its configuration intact just continues, and one that comes back reset is re-initialised. |
+| Device writes nonsense into DMA memory | Section "Reading device-written memory": two agreeing reads, address check, RDH check, length/status check. A bad value is a dropped frame with a warning. |
+| DMA allocation fails | `start` allocates all four buffers before writing any register except a STATUS read, and returns the portal's error naming the buffer. Buffers already allocated are dropped (freed by the host). |
+| Over a run: no growth in DMA memory | Only `start` allocates; re-initialisation reuses the same buffers, and a second `start` reuses the first one's. |
+| Every error says what was attempted, expected and got | All errors are built from the register or buffer name, the expected value and the value read. Repeated warnings are logged in full 10 times, then every 100th, with a count. |
+
+### Noticing a stall
+
+The driver keeps RDT one behind `rx_next` (`start` step 10 and `receive`
+step 6).
+The device has filled the descriptors from `rx_next` up to RDH (7.1.8).
+
+- **RX check** (an idle `receive`, at most every 50 ms, and in `link-up`'s
+  health check): read RDH and RDT.
+  - RDT is not one behind `rx_next`: only the driver writes RDT, so the
+    device lost its state: re-initialise.
+  - RDH equals `rx_next`: nothing waiting; consistent.
+  - RDH has passed `rx_next`, but descriptor `rx_next` is not done: if
+    this lasts 100 ms, the descriptors from `rx_next` up to RDH belong to
+    the driver (7.1.8); their status is cleared, `rx_next` moves to RDH and
+    RDT to RDH − 1. This is the state the old driver deadlocked in (RDT set
+    to a descriptor the device had not filled: head equal to tail, an
+    empty ring); it is now recognised and left within about 100 ms.
+- **Health check** (`link-up`, at most every 500 ms; the host polls it
+  every 100 ms): RCTL, TCTL.EN, RDBAL/H, RDLEN, TDBAL/H, TDLEN must hold
+  what the driver wrote. A differing value read twice means the device was
+  reset or lost its configuration: re-initialise. Then the RX check.
+- **TX check** (when at least 16 descriptors are pending, and when the
+  ring is full): TDH must lie between the oldest pending descriptor and
+  the tail. Outside it for 100 ms: re-initialise.
+
+### Recovery (re-initialisation)
+
+Steps 2–15 of the `start` sequence, unchanged, on the existing buffers:
+reset, rewrite every descriptor, RDH = TDH = 0, RDT = 31, TDT = 0. It does
+not wait for the link (the device brings it back on its own, 4.6.3.2;
+`link-up` reports it), so it finishes inside one call. Frames in the rings
+are lost. A failed re-initialisation is reported and tried again at the
+next health check.
+
+### How the recovery paths were checked
+
+With the validation above, the test's faults never reach the resync or
+re-initialisation paths, so each was run once on purpose, through the
+harness, with a temporary driver change that was then removed (grind log
+in `PROVENANCE.md`, runs 5 and 6):
+
+- with `receive` trusting a single descriptor read again (the old
+  behaviour), the driver fell into the old deadlock (RDH = RDT, one behind
+  `rx_next`) five times; each time the RX check resynchronised it, and
+  the run passed;
+- with one re-initialisation forced 20 s into serving (just after the
+  third link flap), traffic continued and the run passed, with no DMA
+  growth.
 
 ## Open questions
 
