@@ -119,9 +119,46 @@ commands count up from 1.
   before the first command is sent**, so a refused write writes nothing,
   not even the blocks that fit (the block error contract in
   `portals/wit`). They split the range into commands, issue them one at
-  a time, wait for each completion (up to 500 ms), and fail on any non-zero
-  status, naming SCT, SC and the LBA.
-- `flush` issues Flush for namespace 1 and waits for it.
+  a time, and wait for each completion. A call's commands, retries and
+  waits all share one budget of 750 ms (the host's call limit is 1 s). A
+  failure names the command's LBA range and the call it belongs to, and
+  gives SCT, SC and DNR (see "Robustness" below).
+- `flush` issues Flush for namespace 1 and waits for it, with the same
+  budget and retries.
 
 Every failure returns an error string that says what was attempted, what
 was expected and what happened (rule 3).
+
+## Robustness (the block contract in `portals/wit`, interface `block`)
+
+The I/O path rests on one rule and one fact.
+
+- **Rule: at most one command is ever outstanding at the device**,
+  including one the driver gave up on. A command is outstanding from a
+  successful `submit` until a completion entry for it has been collected
+  from CQ 1. No new command is submitted, and the one data buffer is not
+  written or read for a new command, while one is outstanding.
+- **Fact: every submitted command produces exactly one completion entry**
+  in the completion queue bound to its submission queue (FreeBSD matches
+  each entry to one outstanding tracker by CID, and logs an entry whose CID
+  maps to none, `nvme_qpair.c:436-461`; completion layout
+  `nvme.h:926-940`),
+  and the shim hands each entry to the driver once (`portals/wit`,
+  `complete`). So with one command outstanding, *the arrival of an entry*
+  says the device is done with it and its buffer, whatever the entry's
+  bytes say. The driver relies on the count of entries, never on their
+  contents, to know that; the contents (CID, SQID, status) decide only
+  whether the command succeeded. A failed `submit` queued nothing (the
+  portal returns the error before queueing).
+
+| Contract item | How the driver meets it | Sources |
+| --- | --- | --- |
+| The device reports an error (a bad block) | A non-zero status (SC bits 8:1, SCT bits 11:9) is an error. After the bounded retries below, the call returns `<Read\|Write> LBA a-b of read/write(lba, n): attempt 1: expected success, got status SCT x SC y; ...`, naming the command's block range. Nothing is left outstanding, so the next call works normally. | status layout `nvme.h:282-305`; SCT values `nvme.h:956-963`; media error SC 80h/81h `nvme.h:1058-1059` |
+| A transient error is retried a bounded number of times | A failed attempt is retried, up to 4 attempts in all and within the call's 750 ms budget, when its status has DNR (bit 15) clear, or its completion cannot be this command's (below). DNR set: no retry. This is broader than FreeBSD, which retries only a few generic and path codes (`nvme_completion_is_retry`, `nvme_qpair.c:150-206`) and never media errors; the contract asks for the transient error to be retried, and DNR is the device's own word on whether a retry can help. Retrying is safe because the failed attempt is no longer outstanding: a retried read rereads, a retried write writes the same data again. | DNR `nvme.h:292-293`; FreeBSD's retry count is bounded too (`nvme_qpair.c:222`, `nvme_ctrlr.c:1919`) |
+| Nonsense in completions | Each entry is checked: exactly one entry for one outstanding command, 16 bytes, SQID = 1, CID = the command's, status success. Anything else fails the attempt (retried as above, since the command is over) and never returns data. DW0 and SQHD are not used. A corrupted CID that names a command given up on cannot be mistaken for it: by the rule above no such command is outstanding when a new one is sent. | `nvme.h:926-940` |
+| Nonsense in Identify data | `start` refuses: NN = 0; a format index beyond NLBAF; metadata (MS != 0); LBADS outside 9-12; NSZE = 0; a transfer limit smaller than a block. Each with a readable error. | `nvme.h:1309-1695, 712-716, 2268-2279` |
+| A slow device | Each call has a 750 ms budget for everything it does. If a command has not completed by then, the call fails readably ("expected a completion within N ms, got none; the command stays outstanding ...") and the command stays outstanding. The next call first waits, within its own budget, for that command's entry and discards it (logged as `late completion discarded`), then proceeds; if it does not arrive in time, that call fails readably too. Late completions therefore never confuse a later command, and the buffer is never reused under a device still writing or reading it. | observed: QEMU throttled to 1 I/O per second completes a given-up read about 1 s after submission (harness run `20261114T195812Z`) |
+| The device gone, then back | A failing `submit` or `complete` fails the call at once with the portal's error and CSTS (all-ones reads as "the device looks gone"). A command already submitted stays outstanding, and its completion, still in the shim's queue, is collected and discarded once the portal works again. Nothing in the driver needs `start` again. | CSTS `nvme.h:177-180` |
+| `flush` succeeded, then power loss | `flush` sends Flush (NSID 1) and returns ok only for a successful completion with the right CID. Writes return ok only after their own successful completion, so every write that returned before a successful flush was complete when the Flush was sent. A write given up on stays outstanding, and Flush, like every command, is sent only after it has completed. | Flush `nvme.h:2225` |
+| DMA allocation fails | `start` returns the allocation error, naming which buffer. | `portals/wit`, `dma` |
+| Over a run | Two DMA buffers (Identify, freed when `start` returns; data), none after `start`. Every error string names the call, the command and what was expected and got. Recoverable events (a retry, a late completion) are logged: the first three of each kind in full, then a summary with a count and the latest one at most once a second, so a misbehaving device cannot flood the log. | |
