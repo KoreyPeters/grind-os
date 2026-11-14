@@ -226,6 +226,12 @@ An independent oracle, like `nic-peer`: the **disk image itself**.
 
    As built, the run is 40 blocks rather than 16: more than one command
    can carry, so the driver must split it.
+
+   Added after the first driver passed (approved 2026-11-14): a 256-block
+   run, and the error contract in `portals/wit` (interface `block`). Reads
+   and writes that do not fit the disk, are empty, or are not whole blocks
+   must return a readable error; a write past the end must write nothing;
+   the driver must keep working afterwards. See `tests/block/README.md`.
 3. After the VM powers off, `check.sh` reads the image file: the written
    ranges hold the new pattern, and **every other block still holds the
    seed**. This catches a driver that fakes reads from memory, misses the
@@ -247,9 +253,10 @@ Negative controls (each must fail, with a readable reason):
 | writes CC | `mmio-denied` |
 
 The portal-level controls are built in `tests/portals` (see its README).
-The block test adds two: the in-memory `fake`, and a `cheat` that
+The block test adds four: the in-memory `fake`; a `cheat` that
 synthesizes the seed and keeps writes in memory, so every in-VM check
-passes and only the image check catches it (see `tests/block/README.md`).
+passes and only the image check catches it; and `lenient` and `partial`,
+which break the error contract (see `tests/block/README.md`).
 
 ## VM changes
 

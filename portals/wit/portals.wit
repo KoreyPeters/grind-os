@@ -162,15 +162,22 @@ world nvme-driver {
 
 /// The block-facing side of a storage driver. The driver exports it; the
 /// host calls it only after `start` returned ok, and never concurrently.
+///
+/// Every error string says what was attempted, what was expected and what
+/// happened (rule 3). After returning an error, the driver keeps working.
 interface block {
     /// Bytes per logical block.
     block-size: func() -> u32;
     /// Number of logical blocks.
     capacity: func() -> u64;
-    /// Read `count` blocks starting at `lba`.
+    /// Read `count` blocks starting at `lba`. An error, reading nothing, if
+    /// `count` is 0 or the range does not fit inside `capacity` (including
+    /// when `lba + count` overflows).
     read: func(lba: u64, count: u32) -> result<list<u8>, string>;
-    /// Write whole blocks starting at `lba`; `data` is a multiple of the
-    /// block size.
+    /// Write whole blocks starting at `lba`. An error, writing nothing at
+    /// all, if `data` is empty, is not a whole number of blocks, or the
+    /// range does not fit inside `capacity`: a write that runs past the end
+    /// must not leave the blocks that fit written.
     write: func(lba: u64, data: list<u8>) -> result<_, string>;
     /// Make every completed write durable.
     flush: func() -> result<_, string>;

@@ -5,16 +5,25 @@
 //! exports and checks every answer against patterns it computes itself.
 //!
 //! The disk image starts with the seed pattern; the host reads the first
-//! block, the last block and a 40-block run (more than one command can
-//! carry, so the driver must split it), writes the data pattern to the same
-//! places, flushes, and reads them back. tests/block/check.sh then checks
-//! the image file itself after the VM powers off, so a driver that only
-//! pretends (for example, keeping writes in memory) still fails.
+//! block, the last block, a 40-block run and a 256-block run (more than one
+//! command can carry, so the driver must split them), writes the data
+//! pattern to the same places, flushes, and reads them back.
+//!
+//! Then the error contract (`portals/wit`, interface `block`): reads and
+//! writes that do not fit the disk, empty ones, and a write that is not a
+//! whole number of blocks must each return a non-empty error. A write that
+//! runs past the end must write nothing, not even the blocks that fit, so
+//! afterwards the host reads the last and first blocks again: they must
+//! still hold the data pattern, which also shows the driver kept working.
+//!
+//! tests/block/check.sh then checks the image file itself after the VM
+//! powers off, so a driver that only pretends (for example, keeping writes
+//! in memory) still fails.
 //!
 //! Patterns, in 16-byte records: record `r` of block `lba` is the 4-byte
-//! tag (`SEED` or `DATA`), `lba` as a little-endian u64, then `r` as a
-//! little-endian u32. Every block differs from every other block, so a read
-//! from the wrong place cannot match.
+//! tag (`SEED`, `DATA` or `BADW`), `lba` as a little-endian u64, then `r`
+//! as a little-endian u32. Every block differs from every other block, so a
+//! read from the wrong place cannot match.
 
 use grind_shim::log::{emit, Value};
 use std::time::Duration;
@@ -25,10 +34,18 @@ use crate::{call_failed, driver_error, set_deadline, State, CALL_LIMIT};
 
 pub const SEED: &[u8; 4] = b"SEED";
 pub const DATA: &[u8; 4] = b"DATA";
+/// Written only by calls that must fail; never expected on the disk.
+pub const BADW: &[u8; 4] = b"BADW";
 /// First block of the multi-block run.
 pub const RUN_LBA: u64 = 1000;
 /// Length of the multi-block run, in blocks.
 pub const RUN_BLOCKS: u32 = 40;
+/// First block of the long run.
+pub const LONG_LBA: u64 = 8192;
+/// Length of the long run, in blocks (128 KiB of 512-byte blocks).
+pub const LONG_BLOCKS: u32 = 256;
+/// The block a short write must not touch.
+pub const SHORT_WRITE_LBA: u64 = 5;
 
 /// What the test expects of the disk.
 pub struct Expect {
@@ -147,6 +164,7 @@ pub fn exercise(
         ("first", 0, 1),
         ("last", last, 1),
         ("run", RUN_LBA, RUN_BLOCKS),
+        ("long run", LONG_LBA, LONG_BLOCKS),
     ];
 
     let read = |store: &mut Store<State>, tag: &[u8; 4], what: &str, lba: u64, count: u32| {
@@ -197,7 +215,109 @@ pub fn exercise(
     for (what, lba, count) in places {
         read(store, DATA, what, lba, count)?;
     }
+
+    // The error contract. Each call must return a non-empty error.
+    let bs = block_size as usize;
+    let invalid_reads: [(&str, u64, u32); 4] = [
+        ("read at capacity", blocks, 1),
+        ("read across the end", last, 2),
+        ("read where lba + count overflows", u64::MAX, 1),
+        ("read of 0 blocks", 0, 0),
+    ];
+    for (what, lba, count) in invalid_reads {
+        set_deadline(store, limit);
+        let r = blk
+            .call_read(&mut *store, lba, count)
+            .map_err(|e| call_failed("read", limit, e))?;
+        let accepted = r
+            .as_ref()
+            .ok()
+            .map(|d| format!("ok with {} bytes", d.len()));
+        expect_error(what, &format!("read({lba}, {count})"), accepted, r.err())?;
+    }
+    let invalid_writes: [(&str, u64, Vec<u8>); 3] = [
+        (
+            "write across the end",
+            last,
+            pattern(BADW, last, 2, block_size),
+        ),
+        (
+            "write of part of a block",
+            SHORT_WRITE_LBA,
+            pattern(BADW, SHORT_WRITE_LBA, 1, block_size)[..100.min(bs)].to_vec(),
+        ),
+        ("write of nothing", 0, Vec::new()),
+    ];
+    for (what, lba, data) in invalid_writes {
+        set_deadline(store, limit);
+        let r = blk
+            .call_write(&mut *store, lba, &data)
+            .map_err(|e| call_failed("write", limit, e))?;
+        let accepted = r.is_ok().then(|| "ok".to_string());
+        expect_error(
+            what,
+            &format!("write({lba}, {} bytes)", data.len()),
+            accepted,
+            r.err(),
+        )?;
+    }
+    // Still working, and the write across the end wrote nothing.
+    read(store, DATA, "last after the errors", last, 1)?;
+    read(store, DATA, "first after the errors", 0, 1)?;
     Ok(())
+}
+
+/// A call that must fail: fail the run if it succeeded or if its error
+/// says nothing.
+fn expect_error(
+    what: &str,
+    call: &str,
+    accepted: Option<String>,
+    error: Option<String>,
+) -> Result<(), &'static str> {
+    match (accepted, error) {
+        (Some(got), _) => {
+            emit(
+                "block-accepted-invalid",
+                &[
+                    ("check", Value::Str(what)),
+                    ("call", Value::Str(call)),
+                    (
+                        "expected",
+                        Value::Str("an error (portals/wit, interface block)"),
+                    ),
+                    ("got", Value::Str(&got)),
+                ],
+            );
+            Err("block-accepted-invalid")
+        }
+        (None, Some(msg)) if msg.trim().is_empty() => {
+            emit(
+                "block-error-unreadable",
+                &[
+                    ("check", Value::Str(what)),
+                    ("call", Value::Str(call)),
+                    (
+                        "expected",
+                        Value::Str("an error saying what was attempted, expected and got (rule 3)"),
+                    ),
+                    ("got", Value::Str("an empty error")),
+                ],
+            );
+            Err("block-error-unreadable")
+        }
+        (None, msg) => {
+            emit(
+                "block-error-ok",
+                &[
+                    ("check", Value::Str(what)),
+                    ("call", Value::Str(call)),
+                    ("error", Value::Str(msg.as_deref().unwrap_or(""))),
+                ],
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

@@ -6,13 +6,15 @@ it after the VM has powered off.
     image.py check IMAGE BLOCKS BLOCK_SIZE
 
 Patterns, in 16-byte records: record r of block lba is the 4-byte tag
-(b"SEED" or b"DATA"), lba as a little-endian u64, then r as a little-endian
-u32. This file computes them on its own, apart from grind-host's block.rs,
+(b"SEED", b"DATA", or b"BADW" for writes that must fail), lba as a
+little-endian u64, then r as a little-endian u32. This file computes them on its own, apart from grind-host's block.rs,
 so the image check does not trust anything that ran in the VM.
 
 `check` expects the data pattern in the blocks the host writes (the first
-block, the last block, and RUN_BLOCKS blocks from RUN_LBA) and the seed
-pattern in every other block. It prints
+block, the last block, RUN_BLOCKS blocks from RUN_LBA and LONG_BLOCKS from
+LONG_LBA) and the seed pattern in every other block. Writes the driver must
+refuse (past the end, part of a block at block 5) would show up here as
+damage to the last block or block 5. It prints
     BLOCK step=image result=pass|fail expected="..." got="..."
 and exits 0 only on pass.
 """
@@ -22,6 +24,8 @@ import sys
 
 RUN_LBA = 1000
 RUN_BLOCKS = 40
+LONG_LBA = 8192
+LONG_BLOCKS = 256
 
 
 def block(tag, lba, size):
@@ -29,7 +33,8 @@ def block(tag, lba, size):
 
 
 def written(blocks):
-    return {0, blocks - 1} | set(range(RUN_LBA, RUN_LBA + RUN_BLOCKS))
+    return ({0, blocks - 1} | set(range(RUN_LBA, RUN_LBA + RUN_BLOCKS))
+            | set(range(LONG_LBA, LONG_LBA + LONG_BLOCKS)))
 
 
 def seed(path, blocks, size):
@@ -42,7 +47,8 @@ def check(path, blocks, size):
     data = written(blocks)
     expected = (
         f"{len(data)} written blocks hold the DATA pattern (0, {blocks - 1}, "
-        f"{RUN_LBA}-{RUN_LBA + RUN_BLOCKS - 1}); the other {blocks - len(data)} hold the SEED pattern"
+        f"{RUN_LBA}-{RUN_LBA + RUN_BLOCKS - 1}, {LONG_LBA}-{LONG_LBA + LONG_BLOCKS - 1}); "
+        f"the other {blocks - len(data)} hold the SEED pattern"
     )
     bad = []
     with open(path, "rb") as f:
@@ -56,6 +62,7 @@ def check(path, blocks, size):
             if have != block(tag, lba, size):
                 what = "seed still there" if have == block(b"SEED", lba, size) else \
                     "data pattern" if have == block(b"DATA", lba, size) else \
+                    "BADW: a write that had to fail reached the disk" if have[:4] == b"BADW" else \
                     f"other bytes, first record {have[:16].hex()}"
                 bad.append(f"block {lba} ({'written' if lba in data else 'untouched'}): {what}")
         got = "all blocks as expected" if not bad else \

@@ -43,10 +43,14 @@ grind-host --device <pci-address> --module <driver.wasm>
 5. **Exercise** (only with `--exercise-block`). The device must take NVMe
    commands and the driver must target world `block-driver`. The host
    checks `block-size` and `capacity` against the expected values, then
-   reads the first block, the last block and a 40-block run and compares
-   them with the seed pattern, writes the data pattern there, flushes, and
-   reads it back (`src/block.rs`). Each call has 1 s. A wrong answer is
-   `block-mismatch` (or `block-geometry`), logged with the first bad byte.
+   reads the first block, the last block, a 40-block and a 256-block run
+   and compares them with the seed pattern, writes the data pattern there,
+   flushes, and reads it back. Then it checks the error contract: seven
+   reads and writes that do not fit, or are empty or partial, must each
+   return a non-empty error, and the last and first blocks must read back
+   unchanged afterwards (`src/block.rs`). Each call has 1 s. A wrong answer
+   is `block-mismatch`, `block-geometry`, `block-accepted-invalid` or
+   `block-error-unreadable`, logged with what was expected.
    Whether the data really reached the disk is for the test to judge from
    the image (`tests/block`).
 6. **Teardown.** The host calls `Device::quiesce` to turn bus mastering
@@ -59,7 +63,7 @@ Wasm backtrace with function names.
 | Exit | Meaning |
 | --- | --- |
 | 0 | `start` returned ok, no denied write was attempted and no command was refused |
-| 1 | the driver failed (`driver-error`, `trap`, `timeout`, `link-down`, `block-geometry`, `block-mismatch`, `deny-list-violation`, `command-refused`), or bus mastering could not be cleared at the end (`quiesce`) |
+| 1 | the driver failed (`driver-error`, `trap`, `timeout`, `link-down`, `block-geometry`, `block-mismatch`, `block-accepted-invalid`, `block-error-unreadable`, `deny-list-violation`, `command-refused`), or bus mastering could not be cleared at the end (`quiesce`) |
 | 2 | the run could not start: arguments, module rejected, device not opened |
 
 Dependencies are pinned exactly: `wasmtime` 50.0.1 (no WASI, no default
