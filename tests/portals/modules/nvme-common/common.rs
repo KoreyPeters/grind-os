@@ -63,8 +63,13 @@ impl Io {
     /// Ask for one queue pair, then create completion queue 1 and
     /// submission queue 1. PRP1 = 0 for both: the shim allocates them.
     pub fn new() -> Result<Io, String> {
-        admin_ok("Set Features (Number of Queues)", command(0x09, 0, 0, 0, [0x07, 0, 0, 0, 0, 0]))?;
         let data = dma::allocate(16384).map_err(|e| format!("allocate data: {e:?}"))?;
+        Io::with_data(data)
+    }
+
+    /// The same, with a data buffer the caller allocated.
+    pub fn with_data(data: dma::Buffer) -> Result<Io, String> {
+        admin_ok("Set Features (Number of Queues)", command(0x09, 0, 0, 0, [0x07, 0, 0, 0, 0, 0]))?;
         let size = u32::from(QUEUE_ENTRIES - 1) << 16;
         admin_ok("Create I/O CQ 1", command(0x05, 0, 0, 0, [size | 1, 1, 0, 0, 0, 0]))?;
         admin_ok("Create I/O SQ 1", command(0x01, 0, 0, 0, [size | 1, (1 << 16) | 1, 0, 0, 0, 0]))?;

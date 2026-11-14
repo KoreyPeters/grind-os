@@ -21,8 +21,18 @@ The only code that touches a device on a driver's behalf. Trusted.
   list refuses are not performed; they are logged (`mmio-denied`) and
   counted. Any count above zero fails the run.
 - `DmaAllocator` and `DmaBuffer` handle DMA memory. Buffers are page-aligned,
-  zeroed, pinned and mapped with `VFIO_IOMMU_MAP_DMA` at IOVAs from 4 GiB up,
-  with an unmapped guard page after each one. Dropping a buffer unmaps it
+  zeroed, pinned and mapped with `VFIO_IOMMU_MAP_DMA`, with an unmapped
+  guard page after each one. IOVAs are never reused. At open the shim asks
+  the IOMMU which IOVAs it will map (`VFIO_IOMMU_GET_INFO`, the IOVA-range
+  capability, which excludes reserved regions such as the MSI window) and
+  logs them as `dma-regions`. `allocate` takes IOVAs from 4 GiB up to the
+  end of that usable range; `allocate32` takes them from 1 MiB up to the
+  first reserved hole below 4 GiB, for devices that can only address 32
+  bits (issue #13). On QEMU 6.2.0 the usable ranges are `0x0-0xfedfffff`
+  and `0xfef00000-0x7fffffffff`, so the regions are `0x100000-0xfee00000`
+  and `0x100000000-0x8000000000`. If the kernel reports no ranges, the
+  high region is assumed as before (up to 2^39) and `allocate32` fails
+  with `out-of-memory`, logged. Dropping a buffer unmaps it
   before freeing it. If the unmap fails, the memory is leaked and logged
   rather than freed while the device might still reach it.
 - For a device that fetches commands from memory (NVMe), `Device::open`
@@ -277,7 +287,8 @@ every register. Config space is never exposed either.
 ## Sources
 
 - VFIO and PCI constants (including `PCI_BASE_ADDRESS_0`, added for the
-  register BAR): Linux userspace API headers `<linux/vfio.h>` and
+  register BAR, and `VFIO_IOMMU_GET_INFO` with its IOVA-range capability,
+  added for the DMA regions): Linux userspace API headers `<linux/vfio.h>` and
   `<linux/pci_regs.h>` (GPL-2.0 WITH Linux-syscall-note). Values were checked
   by compiling a C program against the host's headers and printing them.
 - No Linux driver code was consulted.

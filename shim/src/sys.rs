@@ -23,6 +23,7 @@ pub const VFIO_GROUP_GET_DEVICE_FD: c_ulong = 0x3b6a;
 pub const VFIO_DEVICE_GET_INFO: c_ulong = 0x3b6b;
 pub const VFIO_DEVICE_GET_REGION_INFO: c_ulong = 0x3b6c;
 pub const VFIO_DEVICE_RESET: c_ulong = 0x3b6f;
+pub const VFIO_IOMMU_GET_INFO: c_ulong = 0x3b70;
 pub const VFIO_IOMMU_MAP_DMA: c_ulong = 0x3b71;
 pub const VFIO_IOMMU_UNMAP_DMA: c_ulong = 0x3b72;
 
@@ -37,6 +38,10 @@ pub const VFIO_PCI_BAR0_REGION_INDEX: u32 = 0;
 pub const VFIO_PCI_CONFIG_REGION_INDEX: u32 = 7;
 pub const VFIO_DMA_MAP_FLAG_READ: u32 = 1 << 0;
 pub const VFIO_DMA_MAP_FLAG_WRITE: u32 = 1 << 1;
+/// `vfio_iommu_type1_info.flags`: the reply has a capability chain.
+pub const VFIO_IOMMU_INFO_CAPS: u32 = 1 << 1;
+/// Capability: the valid IOVA ranges, excluding reserved regions.
+pub const VFIO_IOMMU_TYPE1_INFO_CAP_IOVA_RANGE: u16 = 1;
 
 // <linux/pci_regs.h>
 pub const PCI_COMMAND: u64 = 0x04;
@@ -89,6 +94,23 @@ pub struct DmaUnmap {
     pub flags: u32,
     pub iova: u64,
     pub size: u64,
+}
+
+/// `struct vfio_iommu_type1_info` followed by room for its capability
+/// chain. Layout: argsz u32 @0, flags u32 @4, iova_pgsizes u64 @8,
+/// cap_offset u32 @16 (24 bytes); each capability starts with id u16,
+/// version u16, next u32; the IOVA-range capability then has nr_iovas u32
+/// @8 and ranges of {start u64, end u64 inclusive} from @16.
+#[repr(C, align(8))]
+pub struct IommuInfoBuf(pub [u8; 4096]);
+
+/// `VFIO_IOMMU_GET_INFO` on a container with an IOMMU set: the raw reply,
+/// for `dma::parse_iova_ranges`.
+pub fn iommu_info(container: &File) -> io::Result<Vec<u8>> {
+    let mut buf = IommuInfoBuf([0; 4096]);
+    buf.0[..4].copy_from_slice(&4096u32.to_le_bytes());
+    ioctl_ptr(container, VFIO_IOMMU_GET_INFO, &mut buf)?;
+    Ok(buf.0.to_vec())
 }
 
 /// `argsz` for a struct: its size in bytes.

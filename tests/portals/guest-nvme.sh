@@ -72,6 +72,9 @@ run_case nvme-smoke 0 nvme-smoke \
 	'"message":"nvme-smoke","field.serial":"grind0001","field.round_trip_bytes":"4096"' \
 	'"status":"pass"'
 
+# A real device does DMA through a buffer from dma.allocate32 (issue #13).
+run_case nvme-dma32 0 nvme-dma32 '"message":"nvme-dma32","field.iova":"0x' '"field.round_trip_bytes":"8192"' '"status":"pass"'
+
 # Flow control: the shim learns how far the device has fetched only from
 # completions it reads itself, so an SQ fills until they are collected.
 run_case nvme-queue-full 0 nvme-queue-full \

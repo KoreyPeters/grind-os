@@ -85,6 +85,11 @@ run_case denied-write 1 '"event":"mmio-denied","attempted":"write32","offset":"0
 run_case reset-at-open 0 '"reset":"VFIO_DEVICE_RESET ok"' read-status $EMU
 run_case quiesce-at-close 0 '"event":"device-quiesce","bdf":"'"$BDF"'","command_before":"0x' dma $EMU
 
+# dma.allocate32 (issue #13): buffers below 4 GiB, from 1 MiB, clear of the
+# MSI window, with guard pages; the shim logs the IOMMU's usable ranges.
+run_case dma32 0 '"message":"dma32","field.first":"0x100000"' dma32 $EMU
+run_case dma-regions 0 '"event":"dma-regions","iova_ranges":"0x0-0xfedfffff 0xfef00000-0x7fffffffff","high":"0x100000000-0x8000000000","low":"0x100000-0xfee00000"' dma32 $EMU
+
 # The nvme portal exists only for a device that takes commands: a module
 # importing it is rejected on the e1000e before it runs.
 run_case nvme-portal-on-nic 2 'grind:portals/nvme@0.1.0 only for a device that takes NVMe commands' nvme-format $EMU

@@ -382,12 +382,33 @@ fn dma_error(op: &str, e: DmaError) -> wasmtime::Result<dma::Error> {
 
 impl dma::Host for State {
     fn allocate(&mut self, size: u32) -> wasmtime::Result<Result<Resource<DmaBuffer>, dma::Error>> {
-        match self.device.dma().allocate(size) {
+        let r = self.device.dma().allocate(size);
+        self.dma_buffer("allocate", r)
+    }
+
+    fn allocate32(
+        &mut self,
+        size: u32,
+    ) -> wasmtime::Result<Result<Resource<DmaBuffer>, dma::Error>> {
+        let r = self.device.dma().allocate32(size);
+        self.dma_buffer("allocate32", r)
+    }
+}
+
+impl State {
+    /// Hand a new buffer to the driver, or map the shim's error.
+    fn dma_buffer(
+        &mut self,
+        op: &str,
+        r: Result<DmaBuffer, DmaError>,
+    ) -> wasmtime::Result<Result<Resource<DmaBuffer>, dma::Error>> {
+        match r {
             Ok(buf) => {
                 if self.trace {
                     emit(
                         "dma-allocate",
                         &[
+                            ("op", Value::Str(op)),
                             ("size", Value::Hex(buf.size().into())),
                             ("iova", Value::Hex(buf.iova())),
                         ],
@@ -395,7 +416,7 @@ impl dma::Host for State {
                 }
                 Ok(Ok(self.table.push(buf)?))
             }
-            Err(e) => Ok(Err(dma_error("allocate", e)?)),
+            Err(e) => Ok(Err(dma_error(op, e)?)),
         }
     }
 }

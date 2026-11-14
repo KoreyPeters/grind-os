@@ -62,6 +62,11 @@ interface dma {
 
     /// Allocate a zeroed, 4096-byte-aligned buffer.
     allocate: func(size: u32) -> result<buffer, error>;
+
+    /// Like `allocate`, but the whole buffer lies below 4 GiB (IOVA +
+    /// size <= 2^32), for devices that can only address 32 bits. Returns
+    /// `out-of-memory` if the IOMMU leaves no usable addresses there.
+    allocate32: func(size: u32) -> result<buffer, error>;
 }
 
 interface clock {

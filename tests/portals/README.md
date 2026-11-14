@@ -30,6 +30,8 @@ host's JSON log indented underneath.
 | `denied-write` | writes NVM word 0 through EEWR (0x102C), then "handles" the `denied` error | exit 1, `mmio-denied` logged, `deny-list-violation` |
 | `reset-at-open` | `read-status` | exit 0, `device-open` reports `reset: VFIO_DEVICE_RESET ok` |
 | `quiesce-at-close` | `dma` (allocates buffers) | exit 0, `device-quiesce` logged with bus mastering off before the buffers are unmapped |
+| `dma32` | two `allocate32` buffers and one `allocate` | exit 0: the low buffers lie from 1 MiB, below 4 GiB, clear of the MSI window, a guard page apart, and round-trip data; the ordinary one is from 4 GiB up |
+| `dma-regions` | (same module) | `dma-regions` logs QEMU's usable IOVA ranges and the regions chosen from them |
 | `nvme-portal-on-nic` | `nvme-format` (imports `nvme`) | exit 2 at `module-imports`: the `nvme` portal exists only for a device that takes commands |
 | `result-last` | (same run) | the `result` line is still the last line after a setup error |
 | `no-dma-faults` | (after all cases) | `dmesg` has no Intel IOMMU DMA fault lines |
@@ -41,6 +43,7 @@ handles the error and returns ok; the host must still fail the run.
 | --- | --- | --- |
 | `nvme-gate` | `nvme-smoke` without the allow flag | exit 0: the register and command lists are human-reviewed (`deny_reviewed`, `commands_reviewed` true) |
 | `nvme-smoke` | Identify (serial `grind0001`), Set Features, create an I/O queue pair, write 8 blocks, read them back exactly, flush | exit 0, `nvme-ready` logged with `dstrd: 0` |
+| `nvme-dma32` | a 16-block write and read back through a buffer from `allocate32`, then flush | exit 0: the device reaches IOVAs below 4 GiB, and the shim's address checks accept them |
 | `nvme-queue-full` | 15 Flushes on a 16-entry queue without collecting, then one more | exit 0: the 16th gets `queue-full`; after collecting, submitting works |
 | `nvme-format` | Format NVM (80h) | exit 1, `command-refused` (`check: opcode`) |
 | `nvme-save` | Set Features with Save set | exit 1, `command-refused` (`check: feature`) |

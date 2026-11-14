@@ -116,6 +116,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-test-dma32"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "portal-test-nvme-cc-write"
 version = "0.1.0"
 dependencies = [
@@ -131,6 +138,13 @@ dependencies = [
 
 [[package]]
 name = "portal-test-nvme-cq-in-driver"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "portal-test-nvme-dma32"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen",

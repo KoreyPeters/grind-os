@@ -3,7 +3,7 @@
 //! Opening a PCI device through VFIO.
 
 use crate::deny::{self, WriteList};
-use crate::dma::{DmaAllocator, Domain};
+use crate::dma::{parse_iova_ranges, DmaAllocator, Domain, Regions};
 use crate::log::{emit, Value};
 use crate::nvme::{Nvme, NvmeError, COMPLETION_BYTES};
 use crate::sys::*;
@@ -165,6 +165,44 @@ impl Device {
         ioctl_val(&container, VFIO_SET_IOMMU, VFIO_TYPE1V2_IOMMU)
             .map_err(fails("container", "VFIO_SET_IOMMU Type1 v2 succeeds"))?;
 
+        // Which IOVAs the IOMMU will map (reserved regions such as the MSI
+        // window excluded), for the DMA allocator's regions. If the kernel
+        // does not say, the allocator assumes the high region and offers no
+        // low one.
+        let ranges = match iommu_info(&container) {
+            Ok(reply) => parse_iova_ranges(&reply),
+            Err(e) => {
+                emit(
+                    "dma-ranges-error",
+                    &[
+                        ("attempted", Value::Str("VFIO_IOMMU_GET_INFO")),
+                        ("error", Value::Str(&e.to_string())),
+                    ],
+                );
+                None
+            }
+        };
+        let regions = Regions::from_ranges(ranges.as_deref());
+        let show = |r: Option<(u64, u64)>| {
+            r.map_or("none".to_string(), |(s, e)| format!("0x{s:x}-0x{e:x}"))
+        };
+        emit(
+            "dma-regions",
+            &[
+                (
+                    "iova_ranges",
+                    Value::Str(&ranges.as_ref().map_or("not reported".to_string(), |rs| {
+                        rs.iter()
+                            .map(|(s, e)| format!("0x{s:x}-0x{e:x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })),
+                ),
+                ("high", Value::Str(&show(regions.high))),
+                ("low", Value::Str(&show(regions.low))),
+            ],
+        );
+
         // Device.
         let name = CString::new(bdf).map_err(fails("device", "a PCI address without NUL bytes"))?;
         let fd = ioctl_str(&group, VFIO_GROUP_GET_DEVICE_FD, &name)
@@ -289,6 +327,7 @@ impl Device {
                 _group: group,
             }),
             dma_limit,
+            regions,
         );
         // A device that fetches commands from memory: the shim configures
         // it and owns its queues (rule 10). Bus mastering is already on, so

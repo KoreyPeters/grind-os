@@ -14,6 +14,14 @@
 //! driver hands the device lies inside the driver's own buffers (rule 10).
 //! IOVAs are never reused, so a freed driver buffer's addresses can never
 //! come to name shim memory.
+//!
+//! IOVAs come from two regions of the device's IOMMU address space, chosen
+//! from the usable ranges the kernel reports ([`Regions::from_ranges`]):
+//! the high region, from 4 GiB up, for ordinary buffers; and the low
+//! region, from 1 MiB up to the first reserved hole below 4 GiB, for
+//! devices that can only address 32 bits ([`DmaAllocator::allocate32`]).
+//! IOVAs are addresses in the device's own domain, not physical memory, so
+//! any page can sit at a low IOVA.
 
 use crate::log::{emit, Value};
 use crate::sys::*;
@@ -27,10 +35,90 @@ use std::sync::{Arc, Mutex};
 pub const PAGE: u64 = 4096;
 /// Largest single buffer.
 pub const MAX_BUFFER: u32 = 16 << 20;
-/// IOVAs start above 4 GiB, clear of the x86 MSI window at 0xfee00000.
-const IOVA_BASE: u64 = 1 << 32;
+/// The high region starts at 4 GiB, clear of the x86 MSI window at
+/// 0xfee00000.
+const HIGH_BASE: u64 = 1 << 32;
+/// Assumed end of the high region when the kernel reports no ranges:
 /// QEMU's emulated Intel IOMMU has a 39-bit address width.
-const IOVA_LIMIT: u64 = 1 << 39;
+const HIGH_LIMIT_ASSUMED: u64 = 1 << 39;
+/// The low region starts at 1 MiB, so IOVA 0 and its neighbours (what a
+/// zeroed descriptor names) are never a buffer.
+const LOW_BASE: u64 = 1 << 20;
+/// The low region ends at 4 GiB: a device with 32-bit addressing must
+/// reach the whole buffer.
+const LOW_LIMIT: u64 = 1 << 32;
+
+/// Which region a buffer comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Region {
+    High,
+    Low,
+}
+
+/// The two regions, each `[start, end)`. `None` when it cannot be offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Regions {
+    pub high: Option<(u64, u64)>,
+    pub low: Option<(u64, u64)>,
+}
+
+impl Regions {
+    /// Choose the regions from the usable IOVA ranges (`[start, end]`,
+    /// inclusive, as VFIO reports them). With no ranges reported, the high
+    /// region is assumed as before ([4 GiB, 2^39)) and there is no low
+    /// region. Each region is the part of one usable range from its base;
+    /// it ends at the first reserved hole.
+    pub fn from_ranges(ranges: Option<&[(u64, u64)]>) -> Regions {
+        let Some(ranges) = ranges else {
+            return Regions {
+                high: Some((HIGH_BASE, HIGH_LIMIT_ASSUMED)),
+                low: None,
+            };
+        };
+        let containing = |base: u64, cap: u64| {
+            ranges
+                .iter()
+                .find(|(s, e)| *s <= base && base <= *e)
+                .map(|(_, e)| (base, e.saturating_add(1).min(cap)))
+                .filter(|(s, e)| s < e)
+        };
+        Regions {
+            high: containing(HIGH_BASE, u64::MAX),
+            low: containing(LOW_BASE, LOW_LIMIT),
+        }
+    }
+}
+
+/// The usable IOVA ranges from a `VFIO_IOMMU_GET_INFO` reply
+/// ([`crate::sys::iommu_info`]), or `None` if it has no IOVA-range
+/// capability or does not parse.
+pub fn parse_iova_ranges(reply: &[u8]) -> Option<Vec<(u64, u64)>> {
+    let u32_at = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(reply.get(at..at + 4)?.try_into().ok()?))
+    };
+    let u64_at = |at: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(reply.get(at..at + 8)?.try_into().ok()?))
+    };
+    if u32_at(4)? & VFIO_IOMMU_INFO_CAPS == 0 {
+        return None;
+    }
+    let mut off = u32_at(16)? as usize;
+    // A chain longer than the buffer could hold is malformed.
+    for _ in 0..reply.len() / 8 {
+        if off == 0 {
+            return None;
+        }
+        let id = u16::from_le_bytes(reply.get(off..off + 2)?.try_into().ok()?);
+        if id == VFIO_IOMMU_TYPE1_INFO_CAP_IOVA_RANGE {
+            let n = u32_at(off + 8)? as usize;
+            return (0..n)
+                .map(|i| Some((u64_at(off + 16 + 16 * i)?, u64_at(off + 24 + 16 * i)?)))
+                .collect();
+        }
+        off = u32_at(off + 4)? as usize;
+    }
+    None
+}
 
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
@@ -47,7 +135,8 @@ pub(crate) struct Domain {
 pub enum DmaError {
     /// Zero, or larger than [`MAX_BUFFER`].
     BadSize,
-    /// The allocator's total limit (or the IOVA space) is used up.
+    /// The allocator's total limit (or the region's IOVA space) is used up,
+    /// or the region cannot be offered.
     OutOfMemory,
     /// The access does not fit inside the buffer.
     OutOfRange,
@@ -56,7 +145,9 @@ pub enum DmaError {
 }
 
 struct State {
-    next_iova: u64,
+    /// Next free IOVA and end of each region; `None` if not offered.
+    high: Option<(u64, u64)>,
+    low: Option<(u64, u64)>,
     /// Bytes in the driver's buffers (counted against the limit).
     used: u64,
     /// The driver's live buffers: IOVA -> length.
@@ -78,11 +169,12 @@ pub struct DmaAllocator {
 }
 
 impl DmaAllocator {
-    pub(crate) fn new(domain: Arc<Domain>, limit: u64) -> Self {
+    pub(crate) fn new(domain: Arc<Domain>, limit: u64, regions: Regions) -> Self {
         DmaAllocator {
             domain,
             state: Arc::new(Mutex::new(State {
-                next_iova: IOVA_BASE,
+                high: regions.high,
+                low: regions.low,
                 used: 0,
                 driver: BTreeMap::new(),
             })),
@@ -98,14 +190,20 @@ impl DmaAllocator {
     /// Allocate a zeroed buffer for the driver, of at least `size` bytes,
     /// rounded up to whole pages.
     pub fn allocate(&self, size: u32) -> Result<DmaBuffer, DmaError> {
-        self.allocate_for(size, Owner::Driver)
+        self.allocate_for(size, Owner::Driver, Region::High)
+    }
+
+    /// Like [`DmaAllocator::allocate`], but the whole buffer lies below
+    /// 4 GiB, for devices that can only address 32 bits.
+    pub fn allocate32(&self, size: u32) -> Result<DmaBuffer, DmaError> {
+        self.allocate_for(size, Owner::Driver, Region::Low)
     }
 
     /// Allocate a zeroed buffer the shim keeps for itself. It is not the
     /// driver's, so [`DmaAllocator::driver_owns`] never covers it, and it
     /// does not count against the driver's limit.
     pub(crate) fn allocate_shim(&self, size: u32) -> Result<DmaBuffer, DmaError> {
-        self.allocate_for(size, Owner::Shim)
+        self.allocate_for(size, Owner::Shim, Region::High)
     }
 
     /// Whether `[iova, iova + len)` lies entirely inside one of the
@@ -115,15 +213,34 @@ impl DmaAllocator {
         covers(&state.driver, iova, len)
     }
 
-    fn allocate_for(&self, size: u32, owner: Owner) -> Result<DmaBuffer, DmaError> {
+    fn allocate_for(&self, size: u32, owner: Owner, region: Region) -> Result<DmaBuffer, DmaError> {
         if size == 0 || size > MAX_BUFFER {
             return Err(DmaError::BadSize);
         }
         let len = u64::from(size).div_ceil(PAGE) * PAGE;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let iova = state.next_iova;
+        let Some((iova, end)) = (match region {
+            Region::High => state.high,
+            Region::Low => state.low,
+        }) else {
+            emit(
+                "dma-error",
+                &[
+                    ("attempted", Value::Str("allocate below 4 GiB")),
+                    (
+                        "expected",
+                        Value::Str("a low IOVA region (usable IOVAs from 1 MiB)"),
+                    ),
+                    (
+                        "got",
+                        Value::Str("none: the IOMMU reported no usable range there"),
+                    ),
+                ],
+            );
+            return Err(DmaError::OutOfMemory);
+        };
         let over_limit = owner == Owner::Driver && state.used + len > self.limit;
-        if over_limit || iova + len > IOVA_LIMIT {
+        if over_limit || iova + len > end {
             return Err(DmaError::OutOfMemory);
         }
 
@@ -154,7 +271,12 @@ impl DmaAllocator {
             return Err(DmaError::Io(e));
         }
 
-        state.next_iova = iova + len + PAGE; // leave an unmapped guard page
+        // Leave an unmapped guard page.
+        let next = Some((iova + len + PAGE, end));
+        match region {
+            Region::High => state.high = next,
+            Region::Low => state.low = next,
+        }
         if owner == Owner::Driver {
             state.used += len;
             state.driver.insert(iova, len);
@@ -292,6 +414,80 @@ impl Drop for DmaBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What QEMU 6.2.0's Intel IOMMU reports for each test device.
+    const QEMU: [(u64, u64); 2] = [(0x0, 0xfedf_ffff), (0xfef0_0000, 0x7f_ffff_ffff)];
+
+    #[test]
+    fn regions_from_the_measured_qemu_ranges() {
+        let r = Regions::from_ranges(Some(&QEMU));
+        assert_eq!(r.high, Some((1 << 32, 1 << 39)));
+        assert_eq!(
+            r.low,
+            Some((1 << 20, 0xfee0_0000)),
+            "stops at the MSI window"
+        );
+    }
+
+    #[test]
+    fn regions_without_reported_ranges() {
+        let r = Regions::from_ranges(None);
+        assert_eq!(r.high, Some((1 << 32, 1 << 39)), "as before");
+        assert_eq!(r.low, None, "no low region without knowing the holes");
+    }
+
+    #[test]
+    fn low_region_stops_at_the_first_hole_and_at_4_gib() {
+        // A hole at 16 MiB: the low region is 1-16 MiB only.
+        let r = Regions::from_ranges(Some(&[(0, 0xff_ffff), (0x200_0000, u64::MAX)]));
+        assert_eq!(r.low, Some((1 << 20, 0x100_0000)));
+        assert_eq!(r.high, Some((1 << 32, u64::MAX)));
+        // One range covering everything: low still ends at 4 GiB.
+        let r = Regions::from_ranges(Some(&[(0, u64::MAX)]));
+        assert_eq!(r.low, Some((1 << 20, 1 << 32)));
+        // Nothing usable at 1 MiB: no low region.
+        let r = Regions::from_ranges(Some(&[(0x8000_0000, u64::MAX)]));
+        assert_eq!(r.low, None);
+        // A range ending below 4 GiB and nothing above: no high region.
+        let r = Regions::from_ranges(Some(&[(0, 0xfedf_ffff)]));
+        assert_eq!(r.high, None);
+        assert_eq!(r.low, Some((1 << 20, 0xfee0_0000)));
+    }
+
+    /// A GET_INFO reply: flags with CAPS, a migration capability (id 2)
+    /// first, then the IOVA-range capability with `ranges`.
+    fn reply(ranges: &[(u64, u64)]) -> Vec<u8> {
+        let mut b = vec![0u8; 4096];
+        b[4..8].copy_from_slice(&3u32.to_le_bytes()); // PGSIZES | CAPS
+        b[16..20].copy_from_slice(&24u32.to_le_bytes()); // first cap at 24
+        b[24..26].copy_from_slice(&2u16.to_le_bytes()); // id 2
+        b[28..32].copy_from_slice(&48u32.to_le_bytes()); // next at 48
+        b[48..50].copy_from_slice(&1u16.to_le_bytes()); // IOVA range
+        b[56..60].copy_from_slice(&(ranges.len() as u32).to_le_bytes());
+        for (i, (start, end)) in ranges.iter().enumerate() {
+            b[64 + 16 * i..72 + 16 * i].copy_from_slice(&start.to_le_bytes());
+            b[72 + 16 * i..80 + 16 * i].copy_from_slice(&end.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn parse_iova_ranges_follows_the_capability_chain() {
+        assert_eq!(parse_iova_ranges(&reply(&QEMU)), Some(QEMU.to_vec()));
+        let mut no_caps = reply(&QEMU);
+        no_caps[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse_iova_ranges(&no_caps), None);
+        let mut no_range_cap = reply(&QEMU);
+        no_range_cap[48..50].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(parse_iova_ranges(&no_range_cap), None);
+        let mut looped = reply(&QEMU);
+        looped[48..50].copy_from_slice(&3u16.to_le_bytes());
+        looped[52..56].copy_from_slice(&24u32.to_le_bytes()); // back to the first
+        assert_eq!(parse_iova_ranges(&looped), None, "a loop ends");
+        let mut too_many = reply(&QEMU);
+        too_many[56..60].copy_from_slice(&1_000_000u32.to_le_bytes());
+        assert_eq!(parse_iova_ranges(&too_many), None, "ranges past the end");
+    }
 
     #[test]
     fn covers_only_whole_ranges_inside_one_buffer() {
