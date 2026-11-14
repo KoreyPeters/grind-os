@@ -42,6 +42,18 @@ reset method, and the shim refuses a device it cannot reset. `run.sh` passes
 hands its address to `--run`. The e1000e is still present but is left to
 Linux.
 
+To use a Realtek RTL8139 as the network card, and the device under test,
+instead of the e1000e:
+
+```sh
+vm/run.sh --check --nic rtl8139 [--net-udp PEER:LOCAL] [--run /bin/prog]
+```
+
+It has the same MAC address and network backend as the e1000e. Like the
+NVMe controller, it sits behind its own PCIe root port, because on the
+root bus it has no reset method. `--nvme` and `--nic rtl8139` each choose
+the device under test, so they cannot be combined.
+
 ## Prerequisites
 
 - `qemu-system-x86_64`, `curl`, `dpkg-deb`, `depmod`/`modprobe` (kmod), `cpio`, `gzip`.
@@ -84,7 +96,10 @@ for), `-device e1000e` on a user-mode network backend, kernel command line
 `console=ttyS0 intel_iommu=on`. With `--nvme IMAGE`, also
 `-device pcie-root-port,id=rp1,chassis=1`,
 `-drive file=IMAGE,if=none,id=nvm,format=raw` and
-`-device nvme,serial=grind0001,drive=nvm,bus=rp1`.
+`-device nvme,serial=grind0001,drive=nvm,bus=rp1`. With `--nic rtl8139`,
+`-device pcie-root-port,id=rp2,chassis=2` and
+`-device rtl8139,netdev=net0,mac=52:54:00:12:34:56,bus=rp2` replace the
+e1000e.
 
 ## Checks
 
@@ -98,7 +113,7 @@ VMCHECK result=fail failed_step=<step>
 
 | Step | Passes when |
 | --- | --- |
-| `device-select` | `grind.device` (default `8086:10d3`) is a known device: `8086:10d3` or `1b36:0010` |
+| `device-select` | `grind.device` (default `8086:10d3`) is a known device: `8086:10d3`, `1b36:0010` or `10ec:8139` |
 | `iommu` | `/sys/class/iommu` has a DMAR unit |
 | `irq-remap` | dmesg reports interrupt remapping enabled |
 | `modules` | `e1000e`, `vfio-pci` and `vfio_iommu_type1` load |
@@ -107,7 +122,7 @@ VMCHECK result=fail failed_step=<step>
 | `reset-method` | Linux can reset it (`reset_method` isn't empty), as the shim requires |
 | `bound-e1000e` | e1000e only: Linux's `e1000e` driver claimed it |
 | `unbind` | e1000e only: it is unbound from `e1000e` |
-| `unbound` | NVMe only: no Linux driver claimed it |
+| `unbound` | NVMe and RTL8139: no Linux driver claimed it |
 | `bind-vfio` | `driver_override` plus `drivers_probe` binds it to `vfio-pci` |
 | `vfio-dev` | `/dev/vfio/vfio` and `/dev/vfio/<group>` exist |
 | `run` | only with `--run`: the program exits 0 |

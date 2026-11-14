@@ -22,6 +22,7 @@
 #                      (default 8086:10d3, the e1000e). Known devices:
 #                        8086:10d3  e1000e (82574L), starts bound to e1000e
 #                        1b36:0010  QEMU NVMe, starts with no driver
+#                        10ec:8139  Realtek RTL8139, starts with no driver
 
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 
@@ -93,9 +94,10 @@ SELECT="${SELECT:-8086:10d3}"
 case "$SELECT" in
 8086:10d3) NAME=e1000e LINUX_DRIVER=e1000e ;; # 82574L, the model QEMU's e1000e emulates
 1b36:0010) NAME=nvme LINUX_DRIVER=none ;;     # QEMU NVMe; no nvme module in the initramfs
+10ec:8139) NAME=rtl8139 LINUX_DRIVER=none ;;  # Realtek RTL8139; no 8139too in the initramfs
 *)
 	NAME="$SELECT"
-	fail device-select "grind.device is one of 8086:10d3 1b36:0010" "$SELECT"
+	fail device-select "grind.device is one of 8086:10d3 1b36:0010 10ec:8139" "$SELECT"
 	;;
 esac
 VENDOR="0x${SELECT%:*}"

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Boot the test VM: q35 + KVM, emulated Intel IOMMU, emulated e1000e, and
-# optionally an emulated NVMe controller.
+# Boot the test VM: q35 + KVM, emulated Intel IOMMU, an emulated network card
+# (e1000e by default, or RTL8139), and optionally an emulated NVMe controller.
 #
 #   vm/run.sh                 interactive; serial console on this terminal,
 #                             shell after the checks (Ctrl-A x quits QEMU)
@@ -14,7 +14,7 @@
 #   --run GUEST_PATH          after the VM checks, run this initramfs program
 #                             with the device under test's PCI address
 #                             (see build-initramfs.sh --add)
-#   --net-udp PEER:LOCAL      connect the e1000e to a UDP socket instead of
+#   --net-udp PEER:LOCAL      connect the network card to a UDP socket instead of
 #                             user-mode networking: QEMU binds 127.0.0.1:LOCAL
 #                             and sends each frame as one datagram to
 #                             127.0.0.1:PEER (see tests/nic)
@@ -23,8 +23,12 @@
 #                             own PCIe root port, and make it the device
 #                             under test instead of the e1000e. IMAGE is
 #                             written to: use a scratch image (see tests/block)
+#   --nic MODEL               the network card: e1000e (default, on the root
+#                             bus) or rtl8139 (behind its own PCIe root port,
+#                             and the device under test)
 #
-# The e1000e's MAC address is always 52:54:00:12:34:56.
+# The network card's MAC address is always 52:54:00:12:34:56. --nvme and
+# --nic rtl8139 each choose the device under test, so they cannot be combined.
 #
 # Host-side failures print one line of the form
 #   VMRUN step=<step> expected="..." got="..."
@@ -42,9 +46,10 @@ LOG="$BUILD/serial.log"
 RUN=""
 NETDEV="user,id=net0"
 NVME=""
+NIC=e1000e
 
 usage() {
-	sed -n '4,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+	sed -n '4,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 	exit 2
 }
 
@@ -62,6 +67,7 @@ while [ $# -gt 0 ]; do
 		shift
 		;;
 	--nvme) NVME="${2:?--nvme needs a disk image}"; shift ;;
+	--nic) NIC="${2:?--nic needs a model}"; shift ;;
 	-h | --help) usage ;;
 	*) echo "run.sh: unknown argument: $1" >&2; usage ;;
 	esac
@@ -89,6 +95,13 @@ case "$RUN" in
 *) fail args "--run takes an absolute guest path" "$RUN" ;;
 esac
 
+case "$NIC" in
+e1000e | rtl8139) ;;
+*) fail args "--nic e1000e or --nic rtl8139" "$NIC" ;;
+esac
+[ -z "$NVME" ] || [ "$NIC" = e1000e ] ||
+	fail args "--nvme or --nic $NIC, not both (each chooses the device under test)" "both"
+
 # The NVMe image must be a writable regular file. QEMU's -drive option
 # splits on commas, so a comma in the path is refused instead of escaped.
 if [ -n "$NVME" ]; then
@@ -101,6 +114,7 @@ fi
 APPEND="console=ttyS0 intel_iommu=on loglevel=4 panic=-1 grind.mode=$MODE"
 [ -z "$RUN" ] || APPEND="$APPEND grind.run=$RUN"
 [ -z "$NVME" ] || APPEND="$APPEND grind.device=1b36:0010"
+[ "$NIC" != rtl8139 ] || APPEND="$APPEND grind.device=10ec:8139"
 
 QEMU_ARGS=(
 	-machine q35,accel=kvm,kernel-irqchip=split
@@ -109,11 +123,21 @@ QEMU_ARGS=(
 	# The IOMMU must be created before the devices it translates for.
 	-device intel-iommu,intremap=on
 	-netdev "$NETDEV"
-	-device e1000e,netdev=net0,mac=52:54:00:12:34:56
 	-kernel "$BUILD/vmlinuz"
 	-initrd "$BUILD/initramfs.gz"
 	-append "$APPEND"
 )
+# The network card. Like the NVMe controller below, the RTL8139 has no reset
+# method on the root bus, so it gets its own PCIe root port.
+case "$NIC" in
+e1000e) QEMU_ARGS+=(-device e1000e,netdev=net0,mac=52:54:00:12:34:56) ;;
+rtl8139)
+	QEMU_ARGS+=(
+		-device pcie-root-port,id=rp2,chassis=2
+		-device rtl8139,netdev=net0,mac=52:54:00:12:34:56,bus=rp2
+	)
+	;;
+esac
 # On the root bus QEMU's NVMe controller has no reset method, and the shim
 # refuses a device it cannot reset. Behind its own PCIe root port it gets a
 # secondary bus reset and its own IOMMU group.
