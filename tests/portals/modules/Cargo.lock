@@ -256,6 +256,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-test-sleep"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "portal-test-spin"
 version = "0.1.0"
 dependencies = [

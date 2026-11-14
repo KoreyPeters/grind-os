@@ -5,7 +5,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "read-status", "bounds", "dma", "denied-write", "wasi-import", "spin", "trap",
+    "read-status", "bounds", "dma", "denied-write", "wasi-import", "spin", "sleep", "trap",
     "nvme-smoke", "nvme-format", "nvme-save", "nvme-vendor-admin", "nvme-unlisted-io", "nvme-prp-shim", "nvme-prp-list", "nvme-sq-doorbell", "nvme-cc-write",
     "nvme-queue-full", "nvme-cq-doorbell", "nvme-cq-in-driver",
     "dma32", "nvme-dma32",

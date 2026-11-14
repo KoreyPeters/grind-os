@@ -24,6 +24,7 @@ host's JSON log indented underneath.
 | `dma` | two buffers: alignment, no overlap, zeroed, round trip, bounds, bad size | exit 0 |
 | `wasi-rejected` | imports `wasi_snapshot_preview1::proc_exit` | exit 2, import named, device untouched |
 | `timeout` | spins forever, 1 s limit | exit 1, `timeout` |
+| `sleep-deadline` | sleeps 1 s at a time, forever, 300 ms limit | exit 1, `timeout`, run over within 600 ms: a sleep stops at the call's deadline (issue #10; the old host took 1001 ms) |
 | `trap` | panics | exit 1, `trap` with backtrace |
 | `deny-list-gate` | `read-status` without `--allow-unreviewed-deny-list` | follows the list's `reviewed` flag: exit 2 at `device-deny-list` while unreviewed, exit 0 with `deny_reviewed: true` once reviewed (the gate is unit-tested in `shim/src/deny.rs` for both states) |
 | `emulator-detected` | `read-status` with the allow flag | exit 0, `device-open` reports `dmi_sys_vendor: QEMU` (the value the rule 10 gate checks) |

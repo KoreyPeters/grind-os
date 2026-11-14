@@ -52,6 +52,28 @@ run_case wasi-rejected 2 'import wasi_snapshot_preview1::proc_exit is not a port
 run_case timeout 1 '"reason":"timeout"' spin $EMU --timeout-ms 1000
 run_case trap 1 '"reason":"trap"' trap $EMU
 
+# A sleep may not carry a call past its deadline (issue #10): the module
+# sleeps 1 s at a time under a 300 ms limit, and must be stopped as a
+# timeout well before its first sleep would have ended. Elapsed time is the
+# host's whole run, including opening the device.
+sl_expected="exit 1, reason timeout, and the run over within 600 ms (limit 300 ms; one sleep is 1000 ms)"
+if [ ! -f "$DIR/sleep.wasm" ]; then
+	sl=fail sl_got="$DIR/sleep.wasm missing from the initramfs"
+else
+	out="$("$HOST" --device "$BDF" --module "$DIR/sleep.wasm" $EMU --timeout-ms 300 2>&1)"
+	rc=$?
+	printf '%s\n' "$out" | sed 's/^/    /'
+	ms="$(printf '%s\n' "$out" | grep -o '"elapsed_ms":[0-9]*' | tail -n 1 | cut -d: -f2)"
+	sl_got="exit $rc; elapsed_ms ${ms:-none}"
+	if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF '"reason":"timeout"' && [ -n "$ms" ] && [ "$ms" -le 600 ]; then
+		sl=pass
+	else
+		sl=fail
+	fi
+fi
+[ "$sl" = pass ] || failed=1
+printf 'PORTALS step=sleep-deadline result=%s expected="%s" got="%s"\n' "$sl" "$sl_expected" "$(clean "$sl_got")"
+
 # deny-list-gate: without --allow-unreviewed-deny-list, the host must follow
 # the list's reviewed flag: refuse at device-deny-list while the list is
 # unreviewed, and open the device (deny_reviewed true) once the human has

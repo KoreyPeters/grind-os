@@ -306,6 +306,10 @@ struct State {
     started: Instant,
     /// Injected device faults (docs/design/robust-nic.md).
     faults: faults::Faults,
+    /// When the current call into the driver runs out of time (set with
+    /// its epoch deadline). A sleep stops here, so it cannot carry the
+    /// call past its limit (issue #10).
+    deadline: Option<Instant>,
 }
 
 impl mmio::Host for State {
@@ -563,7 +567,15 @@ impl clock::Host for State {
     }
 
     fn sleep_us(&mut self, us: u32) -> wasmtime::Result<()> {
-        std::thread::sleep(Duration::from_micros(us.min(MAX_SLEEP_US).into()));
+        let mut sleep = Duration::from_micros(us.min(MAX_SLEEP_US).into());
+        // The epoch deadline interrupts only Wasm code, not this host
+        // thread: without the cut, a call could overrun its limit by up to
+        // MAX_SLEEP_US. Cut short, the call is interrupted at its next
+        // epoch check, within a tick or so of its deadline.
+        if let Some(deadline) = self.deadline {
+            sleep = sleep.min(deadline.saturating_duration_since(Instant::now()));
+        }
+        std::thread::sleep(sleep);
         Ok(())
     }
 }
@@ -896,6 +908,7 @@ fn main() -> ExitCode {
             args.fault_identify,
             started,
         ),
+        deadline: None,
     };
     if let Some(entries) = args.fault_mqes {
         state.faults.limit_queues(entries);
@@ -1053,6 +1066,7 @@ impl World {
 
 /// Give the next call into the driver `limit` before it is interrupted.
 fn set_deadline(store: &mut Store<State>, limit: Duration) {
+    store.data_mut().deadline = Some(Instant::now() + limit);
     let ticks = limit.as_millis().div_ceil(TICK.as_millis()) as u64;
     // One extra tick: the current tick may be about to end.
     store.set_epoch_deadline(ticks + 1);
