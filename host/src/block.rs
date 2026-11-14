@@ -301,6 +301,10 @@ pub fn exercise(
         1000,
     )?;
     recovery(store, blk, block_size, "device-gone")?;
+    if expect.device_errors {
+        slow_device(store, blk, block_size)?;
+        recovery(store, blk, block_size, "slow-device")?;
+    }
 
     if expect.device_errors {
         device_errors(store, blk, block_size)?;
@@ -389,6 +393,62 @@ fn faulty_reads(
             ("reads_failed", Value::U64(errors)),
         ],
     );
+    Ok(())
+}
+
+/// How long the slow-device phase reads while tests/block/director.py has
+/// the disk throttled (1 I/O per second), and how long to wait for the
+/// director to act on each marker.
+const SLOW_WINDOW_MS: u64 = 3000;
+const DIRECTOR_GRACE_MS: u64 = 700;
+
+/// Phase: a slow device (docs/design/robust-block.md). The host prints a
+/// marker; tests/block/director.py, outside the VM, throttles the disk to
+/// 1 I/O per second through QEMU's monitor, slower than a driver may want
+/// to wait. Every call must still return within the limit (a timeout is
+/// fatal), reads may fail readably but never return wrong data, and a
+/// command the driver gave up on but the device completes later must not
+/// confuse it: the recovery check after the phase tests that.
+fn slow_device(store: &mut Store<State>, blk: &Block, block_size: u32) -> Result<(), &'static str> {
+    let limit = CALL_LIMIT;
+    let phase = "slow-device";
+    emit("block-phase", &[("phase", Value::Str(phase))]);
+    std::thread::sleep(Duration::from_millis(DIRECTOR_GRACE_MS));
+    let end = std::time::Instant::now() + Duration::from_millis(SLOW_WINDOW_MS);
+    let (mut ok, mut errors, mut i, mut slowest) = (0u64, 0u64, 0u64, Duration::ZERO);
+    while std::time::Instant::now() < end {
+        let lba = FAULTY_LBA + (i * 7) % FAULTY_SPAN;
+        i += 1;
+        set_deadline(store, limit);
+        let began = std::time::Instant::now();
+        let r = blk
+            .call_read(&mut *store, lba, 1)
+            .map_err(|e| call_failed("read", limit, e))?;
+        slowest = slowest.max(began.elapsed());
+        match r {
+            Err(msg) if msg.trim().is_empty() => return Err("block-error-unreadable"),
+            Err(_) => errors += 1,
+            Ok(got) => {
+                let want = pattern(SEED, lba, 1, block_size);
+                if got != want {
+                    let _ = compare("read of a slow device", lba, 1, block_size, &want, &got);
+                    return Err("block-wrong-answer");
+                }
+                ok += 1;
+            }
+        }
+    }
+    emit(
+        "block-phase-end",
+        &[
+            ("phase", Value::Str(phase)),
+            ("reads_ok", Value::U64(ok)),
+            ("reads_failed", Value::U64(errors)),
+            ("slowest_call_ms", Value::U64(slowest.as_millis() as u64)),
+        ],
+    );
+    // Let the director lift the throttle, and late completions arrive.
+    std::thread::sleep(Duration::from_millis(DIRECTOR_GRACE_MS));
     Ok(())
 }
 

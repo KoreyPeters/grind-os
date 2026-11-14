@@ -58,6 +58,15 @@ off, as `nic-peer` is for the NIC test.
        every `nvme` portal call fails; reads must fail readably within
        the limit, and the recovery check afterwards must pass without
        `start` being called again.
+     - **slow device**: the host prints a phase marker; `director.py`,
+       outside the VM, follows the serial log and throttles the disk to
+       1 I/O per second through QEMU's monitor (`block_set_io_throttle`),
+       then lifts it at the end marker. Every call must still return
+       within the limit; reads may fail readably, never return wrong
+       data; and a command the driver gave up on but the device
+       completes later must not confuse it (the recovery check after the
+       phase). `guest.sh` streams the host's output live, flushing every
+       line, so the director acts on time.
      - **device errors**: QEMU's `blkdebug` layer under the disk
        (`vm/run.sh --nvme-errors`, config written by `check.sh`) fails
        reads of block 3000 and writes to block 3100 with real I/O
@@ -130,7 +139,11 @@ only the image check can catch.
 **Status (2026-11-14):** the NVMe driver refuses impossible Identify
 data, survives completion nonsense (937 corrupted completions, no wrong
 answers) and the device going away, and gives readable errors for the
-bad blocks, but does not retry the transient one
+bad blocks and for reads of the throttled disk. It fails two items:
+it does not retry the transient error, and after the slow-device phase
+the completions of commands it gave up on arrive late and it rejects
+the next command ("expected one 16-byte completion, got 4") instead of
+discarding them
 (`block-transient-not-retried`). It will be reground against the full
 test (docs/design/robust-block.md, step 6).
 

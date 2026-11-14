@@ -72,11 +72,18 @@ printf 'BLOCK step=identify-nonsense result=%s expected="%s" got="%s"\n' "$ident
 
 # No --allow-unreviewed-deny-list: the device's register and command lists
 # are human-reviewed (rule 10), the same path real hardware takes.
-out="$(/bin/grind-host --device "$BDF" --module "$MODULE" --timeout-ms 15000 \
-	--exercise-block --expect-block-size "$BLOCK_SIZE" --expect-blocks "$BLOCKS" --fault-seed "$SEED" \
-	--block-device-errors 2>&1)"
-rc=$?
-printf '%s\n' "$out" | sed 's/^/    /'
+# Streamed live, not collected and printed at the end: tests/block's
+# director, outside the VM, acts on the host's phase markers as they appear
+# on the serial console. awk flushes every line (sed would hold them back
+# when writing to a pipe, and the director would act too late).
+{
+	/bin/grind-host --device "$BDF" --module "$MODULE" --timeout-ms 15000 \
+		--exercise-block --expect-block-size "$BLOCK_SIZE" --expect-blocks "$BLOCKS" --fault-seed "$SEED" \
+		--block-device-errors 2>&1
+	echo "$?" >/tmp/host.rc
+} | tee /tmp/host.out | awk '{ print "    " $0; fflush() }'
+rc="$(cat /tmp/host.rc)"
+out="$(cat /tmp/host.out)"
 last="$(printf '%s\n' "$out" | tail -n 1)"
 [ "$rc" -eq 0 ] && result=pass || result=fail
 printf 'BLOCK step=host result=%s expected="%s" got="%s"\n' "$result" "$expected" "$(clean "exit $rc; last line: $last")"

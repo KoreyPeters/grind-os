@@ -80,10 +80,25 @@ sector = "3200"
 once = "on"
 EOF
 
+# The director (director.py) follows the serial log for the host's phase
+# markers and acts through QEMU's monitor: it throttles the disk during the
+# slow-device phase. The old log is removed first, so it never acts on a
+# previous run's markers. The monitor socket is in a short temporary
+# directory (a Unix socket path must be under 108 bytes).
+SERIAL="$ROOT/vm/build/serial.log"
+QMP_DIR="$(mktemp -d /tmp/grind-qmp.XXXXXX)"
+QMP="$QMP_DIR/qmp.sock"
+rm -f "$SERIAL"
+python3 -I "$ROOT/tests/block/director.py" "$SERIAL" "$QMP" >"$WORK/director.log" 2>&1 &
+director=$!
+trap 'kill "$director" 2>/dev/null || true; rm -rf "$QMP_DIR"' EXIT
+
 set +e
-"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --nvme-errors "$ERRORS" --seed "$SEED" --run /tests/block/guest.sh --timeout 180 "$@"
+"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --nvme-errors "$ERRORS" --seed "$SEED" --qmp "$QMP" --run /tests/block/guest.sh --timeout 180 "$@"
 vm_status=$?
+kill "$director" 2>/dev/null
 echo
+cat "$WORK/director.log"
 python3 -I "$ROOT/tests/block/image.py" check "$IMAGE" "$BLOCKS" "$BLOCK_SIZE"
 image_status=$?
 set -e
