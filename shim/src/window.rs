@@ -95,6 +95,28 @@ impl<R: RegionIo> Window<R> {
         Ok(u32::from_le_bytes(buf))
     }
 
+    /// A write by the shim itself, to a register the shim owns (for
+    /// example, NVMe controller configuration and submission queue
+    /// doorbells). Not filtered by the write list, which describes what
+    /// drivers may write. Never reachable from a driver.
+    pub(crate) fn write32_shim(&self, offset: u32, value: u32) -> Result<(), MmioError> {
+        self.check(offset)?;
+        self.io
+            .write_all_at(&value.to_le_bytes(), self.base + u64::from(offset))
+            .map_err(|e| {
+                emit(
+                    "mmio-io-error",
+                    &[
+                        ("attempted", Value::Str("shim write32")),
+                        ("offset", Value::Hex(offset.into())),
+                        ("value", Value::Hex(value.into())),
+                        ("error", Value::Str(&e.to_string())),
+                    ],
+                );
+                MmioError::Io(e)
+            })
+    }
+
     pub fn write32(&self, offset: u32, value: u32) -> Result<(), MmioError> {
         self.check(offset)?;
         if let Err(refusal) = self.deny.check_write(offset, 4) {
@@ -168,6 +190,7 @@ mod tests {
         model: "test",
         kind: ListKind::Deny,
         reviewed: true,
+        commands: None,
         entries: &[WriteEntry {
             offset: 0x10,
             len: 4,
@@ -223,6 +246,7 @@ mod tests {
         model: "test allow",
         kind: ListKind::Allow,
         reviewed: true,
+        commands: None,
         entries: &[WriteEntry {
             offset: 0x8,
             len: 4,
@@ -240,7 +264,10 @@ mod tests {
         assert_eq!(w.violations(), 0);
 
         let r = w.write32(0xc, 0x1234_5678);
-        assert!(matches!(r, Err(MmioError::Denied(WriteRefusal::NotAllowed))));
+        assert!(matches!(
+            r,
+            Err(MmioError::Denied(WriteRefusal::NotAllowed))
+        ));
         assert_eq!(w.violations(), 1);
         assert_eq!(&w.io.0.lock().unwrap()[0x10c..0x110], &[0, 0, 0, 0]);
         // Reads stay allowed everywhere.

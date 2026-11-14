@@ -9,7 +9,10 @@
 //!            [--serve-ping <ipv4> [--serve-ms N]]
 //! ```
 //!
-//! With `--serve-ping`, the module must target world `nic`. After `start`
+//! The world depends on the device and the options. For an NVMe controller
+//! the module targets world `nvme-driver`, which adds the `nvme` portal;
+//! the host links that portal for no other device. With `--serve-ping`, the
+//! module must target world `nic`. After `start`
 //! succeeds, the host polls the driver's `receive` for `--serve-ms` and
 //! answers ARP and ICMP echo requests for the address through `transmit`
 //! (see `net.rs`).
@@ -22,12 +25,12 @@
 //! Output is JSON lines on stdout. The last line is always
 //! `{"event":"result","status":"pass"|"fail",...}`.
 //!
-//! Exit status: 0 pass; 1 the driver failed (error, trap, timeout or a
-//! denied register write); 2 the run could not start (bad arguments,
+//! Exit status: 0 pass; 1 the driver failed (error, trap, timeout, a
+//! denied register write or a refused command); 2 the run could not start (bad arguments,
 //! rejected module, device could not be opened).
 
 use grind_shim::log::{emit, Value};
-use grind_shim::{Device, DmaBuffer, DmaError, MmioError};
+use grind_shim::{Device, DmaBuffer, DmaError, MmioError, NvmeError};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
@@ -61,9 +64,26 @@ mod nic_world {
     });
 }
 
+/// World `nvme-driver`: the portals plus `nvme`.
+mod nvme_world {
+    wasmtime::component::bindgen!({
+        path: "../portals/wit",
+        world: "nvme-driver",
+        imports: { default: trappable },
+        with: {
+            "grind:portals/mmio": crate::driver_world::grind::portals::mmio,
+            "grind:portals/dma": crate::driver_world::grind::portals::dma,
+            "grind:portals/clock": crate::driver_world::grind::portals::clock,
+            "grind:portals/log": crate::driver_world::grind::portals::log,
+        },
+    });
+}
+
 use driver_world::grind::portals::{clock, dma, log, mmio};
 use driver_world::Driver;
 use nic_world::Nic;
+use nvme_world::grind::portals::nvme;
+use nvme_world::NvmeDriver;
 use std::net::Ipv4Addr;
 
 /// Core-module import names a driver may use: the portal interfaces.
@@ -72,7 +92,10 @@ const PORTAL_IMPORTS: &[&str] = &[
     "grind:portals/dma@0.1.0",
     "grind:portals/clock@0.1.0",
     "grind:portals/log@0.1.0",
+    NVME_IMPORT,
 ];
+/// The command portal, linked only for devices that take commands.
+const NVME_IMPORT: &str = "grind:portals/nvme@0.1.0";
 
 /// Longest single sleep a driver can request.
 const MAX_SLEEP_US: u32 = 1_000_000;
@@ -370,6 +393,93 @@ impl log::Host for State {
     }
 }
 
+impl nvme::Host for State {
+    fn admin(&mut self, command: Vec<u8>) -> wasmtime::Result<Result<Vec<u8>, nvme::Error>> {
+        let r = self.device.nvme_admin(&command).ok_or_else(|| {
+            wasmtime::Error::msg("nvme portal used on a device that takes no commands")
+        })?;
+        if self.trace {
+            emit(
+                "nvme",
+                &[
+                    ("op", "admin".into()),
+                    (
+                        "opcode",
+                        Value::Hex(command.first().copied().unwrap_or(0).into()),
+                    ),
+                    ("ok", Value::Bool(r.is_ok())),
+                ],
+            );
+        }
+        Ok(r.map(|c| c.to_vec()).map_err(nvme_error))
+    }
+
+    fn submit(&mut self, sqid: u16, command: Vec<u8>) -> wasmtime::Result<Result<(), nvme::Error>> {
+        let r = self.device.nvme_submit(sqid, &command).ok_or_else(|| {
+            wasmtime::Error::msg("nvme portal used on a device that takes no commands")
+        })?;
+        if self.trace {
+            emit(
+                "nvme",
+                &[
+                    ("op", "submit".into()),
+                    ("sqid", Value::U64(sqid.into())),
+                    (
+                        "opcode",
+                        Value::Hex(command.first().copied().unwrap_or(0).into()),
+                    ),
+                    ("ok", Value::Bool(r.is_ok())),
+                ],
+            );
+        }
+        Ok(r.map_err(nvme_error))
+    }
+
+    fn complete(&mut self, cqid: u16) -> wasmtime::Result<Result<Vec<Vec<u8>>, nvme::Error>> {
+        let r = self.device.nvme_complete(cqid).ok_or_else(|| {
+            wasmtime::Error::msg("nvme portal used on a device that takes no commands")
+        })?;
+        if self.trace {
+            if let Ok(c) = &r {
+                if !c.is_empty() {
+                    emit(
+                        "nvme",
+                        &[
+                            ("op", "complete".into()),
+                            ("cqid", Value::U64(cqid.into())),
+                            ("completions", Value::U64(c.len() as u64)),
+                        ],
+                    );
+                }
+            }
+        }
+        Ok(r.map(|c| c.iter().map(|e| e.to_vec()).collect())
+            .map_err(nvme_error))
+    }
+}
+
+/// The shim's errors as the portal's. Every one is already logged by the shim.
+fn nvme_error(e: NvmeError) -> nvme::Error {
+    match e {
+        NvmeError::Refused(_) => nvme::Error::Refused,
+        NvmeError::UnknownQueue => nvme::Error::UnknownQueue,
+        NvmeError::QueueFull => nvme::Error::QueueFull,
+        NvmeError::Timeout => nvme::Error::Timeout,
+        NvmeError::Failed => nvme::Error::Failed,
+    }
+}
+
+/// Whether a module imports the `nvme` portal.
+fn imports_nvme(bytes: &[u8]) -> bool {
+    use wasmparser::{Parser, Payload};
+    Parser::new(0).parse_all(bytes).any(|p| match p {
+        Ok(Payload::ImportSection(reader)) => reader
+            .into_imports()
+            .any(|i| i.is_ok_and(|i| i.module == NVME_IMPORT)),
+        _ => false,
+    })
+}
+
 /// Check that a module is a core module whose imports are all portals.
 fn check_module(bytes: &[u8]) -> Result<(), String> {
     use wasmparser::{Encoding, Parser, Payload};
@@ -489,9 +599,41 @@ fn main() -> ExitCode {
         Err(e) => return setup_error(&format!("device-{}", e.step), &e.expected, &e.got),
     };
 
-    // 3. Instantiate with portals only, under memory and time limits.
+    // 3. Which world: the nvme portal exists only for a device that takes
+    //    commands, and such a device has no other world yet.
+    let world = match (device.takes_commands(), args.serve_ping.is_some()) {
+        (false, false) => World::Driver,
+        (false, true) => World::Nic,
+        (true, false) => World::NvmeDriver,
+        (true, true) => {
+            // Close the device first, so the result line stays last.
+            drop(device);
+            return setup_error(
+                "world",
+                "--serve-ping only with a network device",
+                &format!("{} takes NVMe commands", args.device),
+            );
+        }
+    };
+    if imports_nvme(&bytes) && world != World::NvmeDriver {
+        drop(device);
+        return setup_error(
+            "module-imports",
+            &format!("{NVME_IMPORT} only for a device that takes NVMe commands"),
+            &format!(
+                "{} imports it; {} takes no commands",
+                args.module, args.device
+            ),
+        );
+    }
+
+    // 4. Instantiate with portals only, under memory and time limits.
     let mut linker: Linker<State> = Linker::new(&engine);
-    if let Err(e) = Driver::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s) {
+    let linked = match world {
+        World::NvmeDriver => NvmeDriver::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s),
+        _ => Driver::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s),
+    };
+    if let Err(e) = linked {
         return setup_error("linker", "portals added to the linker", &format!("{e:#}"));
     }
     let state = State {
@@ -514,23 +656,28 @@ fn main() -> ExitCode {
     // Instantiation runs the module's start section, so it needs a deadline
     // too.
     set_deadline(&mut store, args.timeout);
-    let instance = match args.serve_ping {
-        None => Driver::instantiate(&mut store, &component, &linker).map(Instance::Driver),
-        Some(_) => Nic::instantiate(&mut store, &component, &linker).map(Instance::Nic),
+    let instance = match world {
+        World::Driver => Driver::instantiate(&mut store, &component, &linker).map(Instance::Driver),
+        World::Nic => Nic::instantiate(&mut store, &component, &linker).map(Instance::Nic),
+        World::NvmeDriver => {
+            NvmeDriver::instantiate(&mut store, &component, &linker).map(Instance::NvmeDriver)
+        }
     };
     let instance = match instance {
         Ok(i) => i,
         Err(e) => {
-            let world = if args.serve_ping.is_some() { "nic" } else { "driver" };
             return setup_error(
                 "instantiate",
-                &format!("the driver instantiates as world {world} against the portals"),
+                &format!(
+                    "the driver instantiates as world {} against the portals",
+                    world.name()
+                ),
                 &format!("{e:#}"),
             );
         }
     };
 
-    // 4. Run: start, then (for a NIC) serve.
+    // 5. Run: start, then (for a NIC) serve.
     emit(
         "start",
         &[
@@ -542,6 +689,7 @@ fn main() -> ExitCode {
     let started = match &instance {
         Instance::Driver(d) => d.call_start(&mut store),
         Instance::Nic(n) => n.call_start(&mut store),
+        Instance::NvmeDriver(n) => n.call_start(&mut store),
     };
     let failure: Option<&'static str> = match started {
         Err(e) => Some(call_failed("start", args.timeout, e)),
@@ -564,6 +712,7 @@ fn main() -> ExitCode {
 
     let elapsed_ms = store.data().started.elapsed().as_millis() as u64;
     let violations = store.data().device.window().violations();
+    let refused = store.data().device.refused_commands();
     let dma_used = store.data().device.dma().used();
     // Stop DMA before the driver's buffers are unmapped (logged either way).
     let quiesced = store.data().device.quiesce();
@@ -574,6 +723,7 @@ fn main() -> ExitCode {
 
     let extra = [
         ("violations", Value::U64(violations.into())),
+        ("refused_commands", Value::U64(refused.into())),
         ("elapsed_ms", Value::U64(elapsed_ms)),
         ("dma_bytes_at_exit", Value::U64(dma_used)),
     ];
@@ -581,6 +731,7 @@ fn main() -> ExitCode {
         Some(reason) => finish("fail", reason, &extra, 1),
         None if quiesced.is_err() => finish("fail", "quiesce", &extra, 1),
         None if violations > 0 => finish("fail", "deny-list-violation", &extra, 1),
+        None if refused > 0 => finish("fail", "command-refused", &extra, 1),
         None => finish("pass", "ok", &extra, 0),
     }
 }
@@ -588,6 +739,24 @@ fn main() -> ExitCode {
 enum Instance {
     Driver(Driver),
     Nic(Nic),
+    NvmeDriver(NvmeDriver),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum World {
+    Driver,
+    Nic,
+    NvmeDriver,
+}
+
+impl World {
+    fn name(self) -> &'static str {
+        match self {
+            World::Driver => "driver",
+            World::Nic => "nic",
+            World::NvmeDriver => "nvme-driver",
+        }
+    }
 }
 
 /// Give the next call into the driver `limit` before it is interrupted.
@@ -654,7 +823,10 @@ fn serve(
         &[
             ("ipv4", Value::Str(&ip.to_string())),
             ("mac", Value::Str(&net::fmt_mac(&mac))),
-            ("link_up", Value::Str(if link_up { "true" } else { "false" })),
+            (
+                "link_up",
+                Value::Str(if link_up { "true" } else { "false" }),
+            ),
             ("serve_ms", Value::U64(duration.as_millis() as u64)),
         ],
     );
@@ -662,7 +834,10 @@ fn serve(
         emit(
             "link-down",
             &[
-                ("expected", Value::Str("link-up returns true once start has returned ok")),
+                (
+                    "expected",
+                    Value::Str("link-up returns true once start has returned ok"),
+                ),
                 ("got", Value::Str("false")),
             ],
         );
@@ -700,7 +875,10 @@ fn serve(
             return Err("driver-error");
         }
         match responder.handle(&frame) {
-            net::Outcome::Reply { frame: reply, summary } => {
+            net::Outcome::Reply {
+                frame: reply,
+                summary,
+            } => {
                 set_deadline(store, CALL_LIMIT);
                 match eth.call_transmit(&mut *store, &reply) {
                     Err(e) => return Err(call_failed("transmit", CALL_LIMIT, e)),

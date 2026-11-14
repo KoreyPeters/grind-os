@@ -22,6 +22,19 @@ The only code that touches a device on a driver's behalf. Trusted.
   with an unmapped guard page after each one. Dropping a buffer unmaps it
   before freeing it. If the unmap fails, the memory is leaked and logged
   rather than freed while the device might still reach it.
+- For a device that fetches commands from memory (NVMe), `Device::open`
+  also brings the controller up (`nvme.rs`): it checks CAP, disables the
+  controller, sets up the admin queue in shim-owned DMA memory and enables
+  it, logging `nvme-ready`. `Device::nvme_admin` and `Device::nvme_submit`
+  check each driver command against the device's command list and the
+  driver's own DMA buffers, copy it into a shim-owned queue and ring the
+  doorbell. `Device::nvme_complete` reads new entries from a shim-owned
+  completion queue, learns each submission queue's head from them, and
+  returns copies. A refused command is logged (`command-refused`) and counted;
+  any count above zero fails the run.
+- The DMA allocator remembers which live buffers are the driver's, so the
+  shim can tell a driver's addresses from its own queues. IOVAs are never
+  reused.
 - `log` writes JSON lines, one per event.
 
 No crate dependencies. `unsafe` is limited to the ioctl wrappers in
@@ -36,6 +49,9 @@ has a kind (CLAUDE.md rule 10), logged in `device-open` as `list_kind`:
 | --- | --- | --- | --- |
 | `deny` | the device's datasheet | it touches no entry | a datasheet section |
 | `allow` | a reference driver's source (if rule 6 permits it) or traces of it | it lies entirely inside one entry | a file at an exact commit (`... at commit <hash>`), or a trace (`trace <file>`) |
+
+A device that takes commands also has a command list (below). It counts as
+reviewed only when both lists are.
 
 A refused write logs `mmio-denied` with the entry it hit (deny list) or
 `register: unlisted` (allow list), plus `list_kind`. An allow list with no
@@ -56,6 +72,78 @@ through to a QEMU guest would pass this check, so a reviewed list is still
 required before passing real hardware through.
 
 Writes are the only thing filtered: reads are allowed everywhere in BAR0.
+
+### QEMU NVMe controller: register allow list
+
+`QEMU_NVME` in `src/deny.rs` is an allow list from a reference driver's
+source (rule 10's third kind): FreeBSD's nvme(4). In normal operation
+FreeBSD writes only CC, ASQ, ACQ, AQA, INTMS, INTMC, the submission-queue
+tail doorbells and the completion-queue head doorbells
+(`nvme_ctrlr.c:346, 387, 388, 396, 424, 1537, 1540, 2089`;
+`nvme_qpair.c:480, 1085`). The shim owns CC, AQA, ASQ, ACQ and every
+queue with its doorbells. That leaves INTMS and INTMC
+(`nvme_ctrlr.c:1537, 1540`), the interrupt masks; drivers poll and never
+need them, so the human chose to leave them out too. **The list is empty:
+every driver register write is refused**, including every doorbell and
+NSSR, CMB, PMR and boot-partition registers, which FreeBSD never writes. The shim's own
+doorbell offsets assume CAP.DSTRD = 0 (`nvme_qpair.c:622-625`,
+`nvme_ctrlr.c:1888`); it refuses the controller at open (`nvme-cap`) if
+it reads anything else. QEMU 6.2.0 reports 0.
+
+The shim owns the completion queues, not just the submission queues, so
+that it learns how far the device has fetched each submission queue from
+the device (each completion's SQHD) rather than from the driver. It never
+overwrites an entry the device may still be reading; a torn read of two
+checked commands could otherwise reach the shim's own memory. See
+`docs/design/milestone-5-nvme.md`, "Why the shim owns the completion
+queues".
+
+### NVMe command list
+
+`NVME_COMMANDS` in `src/nvme.rs` is attached to the QEMU NVMe write list.
+Every other command is refused, including Firmware Image Download,
+Firmware Commit, Namespace Management, Format NVM, Security Send, Sanitize
+and every vendor-specific admin opcode (C0h and up). Every field a rule
+does not name must be zero; FUSE, PSDT (no SGLs) and the metadata pointer
+must be zero for every command.
+
+| Queue | Opcode | Command | Rule |
+| --- | --- | --- | --- |
+| admin | 06h | Identify | CNS 1 (controller) or 0 (namespace) only, as FreeBSD uses (`nvme_ctrlr_cmd.c:49, 65`); a 4096-byte data buffer inside the driver's buffers |
+| admin | 09h | Set Features | Number of Queues (FID 07h) only; Save clear; no data |
+| admin | 0Ah | Get Features | Number of Queues only; no data |
+| admin | 05h | Create I/O Completion Queue | QID 1–64, 2–256 entries; contiguous; interrupts off; PRP1 = 0, the shim allocates the queue |
+| admin | 01h | Create I/O Submission Queue | QID 1–64, 2–64 entries, an existing CQ; PRP1 = 0, the shim allocates the queue |
+| admin | 00h, 04h | Delete I/O SQ / CQ | an existing queue; a CQ only once its SQs are gone |
+| I/O | 00h | Flush | no data, no options |
+| I/O | 01h, 02h | Write, Read | no options (CDW12 bits 31:16 and CDW13–15 zero); (NLB + 1) blocks inside the driver's buffers through at most two PRP entries |
+
+Data addresses: PRP1 covers the transfer up to the end of its page, PRP2
+(page-aligned) the rest, and both ranges must lie inside the driver's live
+DMA buffers. A transfer that needs more than two entries would need a PRP
+list, which lives in driver memory the driver could change after the
+check, so it is refused (`prp-list`). For Read and Write the shim learns
+the block size by identifying the namespace itself, into its own page; a
+namespace with metadata, or a block size outside 512–4096 bytes, is refused.
+
+Not yet reviewed by the human. Until both lists are, the device opens only
+with `--allow-unreviewed-deny-list` under an emulator.
+
+**Sources.** Facts only; no code copied. The NVM Express specification is
+not a source (see `docs/design/milestone-5-nvme.md`).
+
+- FreeBSD `sys/dev/nvme/nvme.h`, `nvme_ctrlr.c`, `nvme_ctrlr_cmd.c`,
+  `nvme_qpair.c` at commit `74d72b3491e810068313e49629c3b8fe46f29318`
+  (BSD-2-Clause); checksums in the design doc. `nvme_ns_cmd.c` and
+  `nvme_private.h` were read only.
+- SPDK `include/spdk/nvme_spec.h` at commit
+  `91404c6437e45395a943bfeaf48f58ea1d6aff74` (BSD-3-Clause), sha256
+  `244249b1d9b560484851b804de8155f371de4e5d80e5f9719b2db5006a3ef01c`:
+  vendor-specific admin opcodes from C0h (line 1803); field positions in
+  CDW10–12 for queue creation and Read/Write (lines 1203-1205, 1308-1323,
+  1386-1391).
+
+All are kept in the gitignored `.cache/sources/`.
 
 ### Intel 82574L (QEMU e1000e): written
 

@@ -49,10 +49,10 @@ Rule 10 gives three defences.
 | Controller enable (CC), admin queue registers (AQA, ASQ, ACQ) | shim | whoever owns the admin queue can issue any admin command |
 | Admin submission and completion queues | shim | admin commands are the dangerous ones |
 | **All** I/O submission queues | shim | the device fetches I/O commands from them |
-| I/O completion queues | driver (in its DMA buffers) | the device only writes completions there |
+| **All** I/O completion queues | shim | the shim must learn from the device, not the driver, how far each submission queue has been fetched (see "Why the shim owns the completion queues") |
 | Data buffers | driver | the device reads and writes data there |
-| SQ tail doorbells, admin CQ head doorbell | shim | ringing them is how commands get submitted |
-| I/O CQ head doorbells, INTMS, INTMC | driver | consuming completions; interrupt masks (unused, polled) |
+| Every doorbell | shim | ringing them submits commands and returns completion entries |
+| INTMS, INTMC | shim (unused) | interrupt masks; drivers poll, so the human left them off the list |
 
 The shim brings the controller up after its VFIO reset, in FreeBSD's order
 (`nvme_ctrlr.c:289-424`): clear CC.EN and wait for CSTS.RDY to clear;
@@ -72,20 +72,23 @@ registers:
 | --- | --- | --- |
 | CC | `nvme_ctrlr.c:346, 424, 2089` | shim only |
 | ASQ, ACQ, AQA | `nvme_ctrlr.c:387, 388, 396` | shim only |
-| INTMS, INTMC (0Ch, 10h) | `nvme_ctrlr.c:1537, 1540` | **driver** |
+| INTMS, INTMC (0Ch, 10h) | `nvme_ctrlr.c:1537, 1540` | nobody: drivers poll |
 | SQ tail doorbells | `nvme_qpair.c:1085` | shim only |
-| CQ head doorbells | `nvme_qpair.c:480` | **driver**, I/O queues 1–64 only |
+| CQ head doorbells | `nvme_qpair.c:480` | shim only |
 
 FreeBSD never writes NSSR, the CMB, PMR (persistent memory) or boot
 partition registers (`nvme.h:817-853`), so the list leaves them out, and
 every other write is refused.
 
-Doorbell offsets: FreeBSD stores `dstrd = CAP.DSTRD + 2`
-(`nvme_ctrlr.c:1888`) and puts queue *y*'s CQ head doorbell at
-`1000h + (y << (dstrd + 1)) + (1 << dstrd)` (`nvme_qpair.c:622-625`), that
-is, `1000h + (2y + 1) × (4 << CAP.DSTRD)`. With DSTRD = 0 the driver's
-doorbells are 100Ch, 1014h, …, 1204h. QEMU's CAP.DSTRD is not yet
-confirmed; it will be read in the VM before the list is written.
+So the list is empty: drivers may write no register at all. (FreeBSD's
+INTMS and INTMC writes were candidates; the human left them out on
+2026-11-14 because drivers poll.)
+
+Doorbell offsets, for the shim: FreeBSD stores `dstrd = CAP.DSTRD + 2`
+(`nvme_ctrlr.c:1888`) and puts queue *y*'s SQ tail doorbell at
+`1000h + (y << (dstrd + 1))` and its CQ head doorbell `1 << dstrd` after
+it (`nvme_qpair.c:622-625`). The shim requires CAP.DSTRD = 0 and refuses
+the controller otherwise; QEMU 6.2.0 reports 0.
 
 ### 3. Command portal
 
@@ -115,12 +118,16 @@ refused:
 
 | Opcode | Command | Condition |
 | --- | --- | --- |
-| 06h | Identify | data buffer checked |
+| 06h | Identify | CNS 1 (controller) or 0 (namespace) only, the two FreeBSD uses (`nvme_ctrlr_cmd.c:49, 65`); data buffer checked |
 | 09h | Set Features | Number of Queues only (FID 07h, `nvme.h:1158`; FreeBSD's only use at start-up, `nvme_ctrlr_cmd.c:203-211`); Save (bit 31) clear |
-| 0Ah | Get Features | data buffer checked |
-| 05h | Create I/O Completion Queue | physically contiguous (PC, `nvme.h:262`) and entirely inside one driver buffer; interrupts disabled (IEN clear, `nvme.h:263`) |
+| 0Ah | Get Features | Number of Queues only, no data buffer (the data lengths of other features are not in the BSD sources) |
+| 05h | Create I/O Completion Queue | PRP1 must be 0: **the shim allocates the queue**; physically contiguous (PC, `nvme.h:262`); interrupts disabled (IEN clear, `nvme.h:263`) |
 | 01h | Create I/O Submission Queue | PRP1 must be 0: **the shim allocates the queue** and fills it in |
-| 04h, 00h | Delete I/O CQ / SQ | the shim frees an SQ's memory after the delete completes |
+| 04h, 00h | Delete I/O CQ / SQ | the shim frees a queue's memory after the delete completes |
+
+Every field a rule does not name must be zero. For Read and Write that
+means no options: CDW12 bits 31:16 and CDW13–15 are zero, so the shim
+relies only on the NLB field (CDW12 bits 15:0, SPDK `nvme_spec.h:1391`).
 
 I/O allow list (`nvme.h:1128-1131`): Flush (00h), Write (01h), Read (02h).
 Every other opcode is refused, including Write Zeroes, Dataset Management,
@@ -128,11 +135,32 @@ Write Uncorrectable and any vendor-specific opcode.
 
 Admin commands are synchronous: the shim polls its admin CQ and returns
 the 16-byte completion to the driver. I/O commands are asynchronous: the
-completion arrives in the driver's own CQ. The shim doesn't see I/O
-completions, so for flow control the driver tells it the latest SQ head it
-has seen. A lying driver can only make the shim overwrite commands of its
-own that the device hasn't fetched yet, and every entry was checked, so
-that harms nothing but its own I/O.
+driver submits them, then collects completions with `complete(cqid)`,
+which returns copies of the new entries from the shim's completion queue.
+
+### Why the shim owns the completion queues
+
+Found in review before the first commit; approved by the human on
+2026-11-14. The first version of this design let the driver own its I/O
+completion queues and report, with each submit, the latest SQ head it had
+seen. A lying driver could then report a head the device had not reached,
+and the shim would overwrite a submission-queue entry the device might be
+fetching at that moment. The device could read part of the old command
+and part of the new one. Both had passed the checks, but the mix had not:
+bytes of two valid PRP addresses can combine into the address of the
+shim's admin queue, and the length of one command with the PRP1 offset of
+the other can make the device treat PRP2 as a PRP list in driver memory.
+Either lets the device write driver-chosen bytes into the shim's admin
+queue.
+
+So the shim owns every completion queue. It reads each completion itself,
+and the SQHD field (`struct nvme_completion`, `nvme.h:926-940`) tells it
+how far the device has fetched that submission queue. It never writes an
+entry between that head and its tail, and `submit` returns `queue-full`
+until the driver collects completions. The driver cannot forge a
+completion, because it cannot write the shim's memory. The admin queue
+has no such risk: the shim waits for each admin command to complete
+before reusing its slot.
 
 A refused command logs `command-refused` (opcode, which check failed,
 expected, got), counts as a violation, and fails the run, just like a
@@ -151,9 +179,10 @@ interface nvme {
     }
     /// Run one admin command and return its 16-byte completion entry.
     admin: func(command: list<u8>) -> result<list<u8>, error>;
-    /// Queue one I/O command on submission queue `sqid`. `sq-head` is the
-    /// latest SQ head the driver has seen in a completion.
-    submit: func(sqid: u16, sq-head: u16, command: list<u8>) -> result<_, error>;
+    /// Queue one I/O command on submission queue `sqid`.
+    submit: func(sqid: u16, command: list<u8>) -> result<_, error>;
+    /// Take the new completions from completion queue `cqid`.
+    complete: func(cqid: u16) -> result<list<list<u8>>, error>;
 }
 
 /// Exported by block drivers (world `block`).
@@ -165,12 +194,19 @@ interface block {
     flush: func() -> result<_, string>;
 }
 
-world block-driver {
+world nvme-driver {
     include driver;   // mmio (BAR0, write-listed), dma, clock, log
     import nvme;
+}
+
+world block-driver {
+    include nvme-driver;
     export block;
 }
 ```
+
+As built, the `nvme` error enum also has `failed`: the controller or the
+admin queue failed earlier in the run (already logged).
 
 The `nvme` portal is the first device-class portal. The host links it only
 for NVMe devices and rejects it everywhere else.
@@ -203,27 +239,31 @@ Negative controls (each must fail, with a readable reason):
 | unlisted I/O opcode (Write Zeroes, 08h) | `command-refused` |
 | PRP outside its buffers | `command-refused` (address) |
 | PRP list | `command-refused` |
-| writes an SQ tail doorbell directly | `mmio-denied` |
+| completion queue in its own buffer | `command-refused` |
+| writes an SQ tail or CQ head doorbell directly | `mmio-denied` |
 | writes CC | `mmio-denied` |
+
+The portal-level controls are built in `tests/portals` (see its README);
+the block test adds the in-memory fake.
 
 ## VM changes
 
 - `vm/run.sh --nvme IMAGE`: `-device pcie-root-port,id=rp1,chassis=1`,
   `-drive file=IMAGE,if=none,id=nvm,format=raw`,
   `-device nvme,serial=grind0001,drive=nvm,bus=rp1`.
-- `vm/init` today checks for and binds exactly the e1000e. It needs a
-  device selector (for example `grind.device=1b36:0010` on the kernel
-  command line, defaulting to the e1000e) and must handle a device with no
-  Linux driver bound.
+- `vm/init` takes a device selector, `grind.device=1b36:0010` on the
+  kernel command line (default the e1000e), and handles a device with no
+  Linux driver bound. Done in commit `552854f`.
 
 ## The cost
 
 The shim gains NVMe-specific code (controller bring-up, queue ownership,
-command checks): about the size of the existing shim again, all trusted.
-That is what rule 10 asks for once a device takes commands from memory. The
-driver still does the device work: reading CAP and Identify data, sizing
-and creating queues, building commands and PRPs, polling completions with
-phase bits, decoding status, and splitting transfers.
+completion handling, command checks): about the size of the existing shim
+again, all trusted. That is what rule 10 asks for once a device takes
+commands from memory. The driver still does the device work: reading CAP
+and Identify data, sizing and creating queues, building commands and PRPs,
+matching completions to commands, decoding status, and splitting
+transfers.
 
 ## Sources
 

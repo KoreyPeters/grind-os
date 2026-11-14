@@ -5,6 +5,8 @@
 #   1. Shim unit tests on this machine (bounds, alignment, deny list, logging).
 #   2. Build grind-host (static) and the Wasm test modules.
 #   3. Boot the test VM and run tests/portals/guest.sh against the e1000e.
+#   4. Boot it again with an emulated NVMe controller backed by a fresh
+#      scratch image, and run tests/portals/guest-nvme.sh against that.
 # Exits 0 only if everything passes. Requires vm/fetch.sh to have run once.
 
 set -euo pipefail
@@ -34,11 +36,21 @@ dyn="$(readelf -lW "$HOST_BIN" | grep -i 'program interpreter' || true)$(readelf
 cargo build --release --locked --manifest-path "$MODULES/Cargo.toml" --target wasm32-unknown-unknown ||
 	fail build-modules "test modules build for wasm32-unknown-unknown" "exit $?"
 
-adds=(--add "$HOST_BIN=/bin/grind-host" --add "$ROOT/tests/portals/guest.sh=/tests/portals/guest.sh")
+adds=(--add "$HOST_BIN=/bin/grind-host"
+	--add "$ROOT/tests/portals/guest.sh=/tests/portals/guest.sh"
+	--add "$ROOT/tests/portals/guest-nvme.sh=/tests/portals/guest-nvme.sh")
 for wasm in "$WASM"/portal_test_*.wasm; do
 	name="$(basename "$wasm" .wasm)"
 	name="${name#portal_test_}"
 	adds+=(--add "$wasm=/tests/portals/${name//_/-}.wasm")
 done
 "$ROOT/vm/build-initramfs.sh" "${adds[@]}"
-"$ROOT/vm/run.sh" --check --run /tests/portals/guest.sh --timeout 180 "$@"
+"$ROOT/vm/run.sh" --check --run /tests/portals/guest.sh --timeout 180 "$@" ||
+	fail vm-e1000e "tests/portals/guest.sh passes against the e1000e" "exit $?"
+
+# A scratch image the NVMe cases may write to; recreated every run.
+IMAGE="$ROOT/target/portals-nvme.img"
+rm -f "$IMAGE"
+truncate -s 16M "$IMAGE"
+"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --run /tests/portals/guest-nvme.sh --timeout 180 "$@" ||
+	fail vm-nvme "tests/portals/guest-nvme.sh passes against the NVMe controller" "exit $?"

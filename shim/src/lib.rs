@@ -18,9 +18,11 @@ pub mod deny;
 mod device;
 mod dma;
 pub mod log;
+pub mod nvme;
 mod sys;
 mod window;
 
 pub use device::{Device, OpenError};
 pub use dma::{DmaAllocator, DmaBuffer, DmaError};
+pub use nvme::NvmeError;
 pub use window::{MmioError, RegionIo, Window};

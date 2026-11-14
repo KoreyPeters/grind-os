@@ -4,7 +4,11 @@
 # Each exercises one portal behaviour; see tests/portals/README.md.
 [workspace]
 resolver = "2"
-members = ["read-status", "bounds", "dma", "denied-write", "wasi-import", "spin", "trap"]
+members = [
+    "read-status", "bounds", "dma", "denied-write", "wasi-import", "spin", "trap",
+    "nvme-smoke", "nvme-format", "nvme-save", "nvme-vendor-admin", "nvme-unlisted-io", "nvme-prp-shim", "nvme-prp-list", "nvme-sq-doorbell", "nvme-cc-write",
+    "nvme-queue-full", "nvme-cq-doorbell", "nvme-cq-in-driver",
+]
 
 [workspace.dependencies]
 wit-bindgen = "=0.63.0"

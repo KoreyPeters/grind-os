@@ -14,6 +14,10 @@
 //!
 //! Either way, a refused write is logged and counted, and fails the run.
 //!
+//! A device that fetches commands from memory (NVMe) also has a command
+//! allow list ([`crate::nvme::CommandList`]), attached to its write list.
+//! The device counts as reviewed only when both lists are.
+//!
 //! A device with no list here cannot be opened at all. A list that has not
 //! been reviewed by the human is refused unless the caller explicitly allows
 //! it (for emulated devices only).
@@ -62,6 +66,9 @@ pub struct WriteList {
     pub kind: ListKind,
     /// True once the human has reviewed `entries` against their sources.
     pub reviewed: bool,
+    /// For a device that fetches commands from memory: the commands the
+    /// shim lets a driver submit (rule 10).
+    pub commands: Option<&'static crate::nvme::CommandList>,
     pub entries: &'static [WriteEntry],
 }
 
@@ -75,6 +82,12 @@ pub enum WriteRefusal {
 }
 
 impl WriteList {
+    /// Whether the human has reviewed this list and, if the device takes
+    /// commands, its command list.
+    pub fn fully_reviewed(&self) -> bool {
+        self.reviewed && self.commands.is_none_or(|c| c.reviewed)
+    }
+
     /// Whether a write of `len` bytes at `offset` may go to the device.
     pub fn check_write(&self, offset: u32, len: u32) -> Result<(), WriteRefusal> {
         let start = u64::from(offset);
@@ -157,6 +170,7 @@ pub static E1000E_82574L: WriteList = WriteList {
     model: "Intel 82574L",
     kind: ListKind::Deny,
     reviewed: true,
+    commands: None,
     entries: &[
         e82574(0x0_0010, 4, "EEC",
             "bit-bangs the NVM (EE_SK/EE_CS/EE_DI); FWE enables Flash write and erase; AUPDEN enables autonomous Flash update",
@@ -200,7 +214,52 @@ pub static E1000E_82574L: WriteList = WriteList {
     ],
 };
 
-static ALL: &[&WriteList] = &[&E1000E_82574L];
+/// The FreeBSD NVMe source the QEMU NVMe list cites.
+#[allow(unused_macros)]
+macro_rules! freebsd_nvme {
+    ($file_line:literal) => {
+        concat!(
+            "FreeBSD sys/dev/nvme/",
+            $file_line,
+            " at commit 74d72b3491e810068313e49629c3b8fe46f29318 (BSD-2-Clause)"
+        )
+    };
+}
+
+/// I/O queue IDs a driver may create: 1 to 64 (QEMU's default
+/// `max_ioqpairs`).
+pub const NVME_MAX_IO_QUEUES: u16 = 64;
+
+/// QEMU's emulated NVMe controller (`-device nvme`).
+///
+/// An allow list from a reference driver (rule 10's third kind), taken from
+/// FreeBSD's nvme(4) source. In normal operation FreeBSD writes only CC,
+/// ASQ, ACQ, AQA, INTMS, INTMC, the submission-queue tail doorbells and the
+/// completion-queue head doorbells (nvme_ctrlr.c:346, 387, 388, 396, 424,
+/// 1537, 1540, 2089; nvme_qpair.c:480, 1085). The shim owns CC, ASQ, ACQ,
+/// AQA and every queue with its doorbells (rule 10: the queues the device
+/// fetches from, and the registers that control or ring them; and the
+/// completion queues, so that the shim learns from the device how far each
+/// submission queue has been fetched). That leaves INTMS and INTMC
+/// (nvme_ctrlr.c:1537, 1540), the interrupt masks. Drivers poll and never
+/// need them, so the human chose to leave them out too (2026-11-14): the
+/// list is empty and every driver register write is refused. FreeBSD never
+/// writes NSSR, the CMB, PMR or boot-partition registers (nvme.h:817-853).
+///
+/// The source macro stays for when an entry is added.
+///
+/// Not yet reviewed by the human.
+pub static QEMU_NVME: WriteList = WriteList {
+    vendor: 0x1b36,
+    device: 0x0010,
+    model: "QEMU NVM Express controller",
+    kind: ListKind::Allow,
+    reviewed: false,
+    commands: Some(&crate::nvme::NVME_COMMANDS),
+    entries: &[],
+};
+
+static ALL: &[&WriteList] = &[&E1000E_82574L, &QEMU_NVME];
 
 /// The write list for a PCI vendor and device ID, if the shim supports it.
 pub fn for_device(vendor: u16, device: u16) -> Option<&'static WriteList> {
@@ -265,13 +324,18 @@ fn gate(
         expected: format!("a write list (rule 10) for {vendor:04x}:{device:04x}"),
         got: "none; the shim refuses devices without one (rule 10)".into(),
     })?;
-    if list.reviewed {
+    if list.fully_reviewed() {
         return Ok(list);
     }
     if !allow_unreviewed {
+        let commands = if list.commands.is_some() {
+            " and command list"
+        } else {
+            ""
+        };
         return Err(Refusal {
             expected: format!(
-                "a human-reviewed {} list for {}",
+                "a human-reviewed {} list{commands} for {}",
                 list.kind.as_str(),
                 list.model
             ),
@@ -305,6 +369,7 @@ mod tests {
         model: "test",
         kind: ListKind::Deny,
         reviewed: true,
+        commands: None,
         entries: &[
             WriteEntry {
                 offset: 0x10,
@@ -349,6 +414,7 @@ mod tests {
         model: "test allow",
         kind: ListKind::Allow,
         reviewed: true,
+        commands: None,
         entries: &[
             WriteEntry {
                 offset: 0x0,
@@ -372,7 +438,10 @@ mod tests {
         let l = &ALLOW_LIST;
         // Inside, including both edges of a multi-dword entry.
         for (offset, len) in [(0x0, 4), (0x100, 4), (0x10c, 4), (0x100, 0x10)] {
-            assert!(l.check_write(offset, len).is_ok(), "0x{offset:x}+{len} allowed");
+            assert!(
+                l.check_write(offset, len).is_ok(),
+                "0x{offset:x}+{len} allowed"
+            );
         }
         // Outside: unlisted gaps, just before, just after, straddling an
         // edge, and the top of the address space.
@@ -401,10 +470,14 @@ mod tests {
             model: "test empty allow",
             kind: ListKind::Allow,
             reviewed: true,
+            commands: None,
             entries: &[],
         };
         for offset in [0x0, 0x8, 0x100, 0x1fffc] {
-            assert!(matches!(EMPTY.check_write(offset, 4), Err(WriteRefusal::NotAllowed)));
+            assert!(matches!(
+                EMPTY.check_write(offset, 4),
+                Err(WriteRefusal::NotAllowed)
+            ));
         }
     }
 
@@ -417,7 +490,9 @@ mod tests {
                 return Err(format!("{what}: not an aligned dword range"));
             }
             if u64::from(e.offset) < prev_end {
-                return Err(format!("{what}: not sorted, or overlaps the previous entry"));
+                return Err(format!(
+                    "{what}: not sorted, or overlaps the previous entry"
+                ));
             }
             // Rule 7: deny lists cite a datasheet section; allow lists cite
             // a file at an exact commit, or a trace.
@@ -478,6 +553,7 @@ mod tests {
             model: "cite",
             kind: ListKind::Allow,
             reviewed: false,
+            commands: None,
             entries,
         };
         assert!(well_formed(&list(&FILE)).is_ok());
@@ -511,6 +587,7 @@ mod tests {
         model: "test unreviewed",
         kind: ListKind::Deny,
         reviewed: false,
+        commands: None,
         entries: &[],
     };
     static REVIEWED: WriteList = WriteList {
@@ -519,12 +596,39 @@ mod tests {
         model: "test reviewed",
         kind: ListKind::Deny,
         reviewed: true,
+        commands: None,
         entries: &[],
     };
     static GATE_LISTS: &[&WriteList] = &[&UNREVIEWED, &REVIEWED];
 
     const QEMU: Option<&str> = Some("QEMU");
     const DELL: Option<&str> = Some("Dell Inc.");
+
+    static UNREVIEWED_COMMANDS: crate::nvme::CommandList = crate::nvme::CommandList {
+        model: "test commands",
+        reviewed: false,
+        entries: &[],
+    };
+    static REVIEWED_REGS_ONLY: WriteList = WriteList {
+        vendor: 0xfffe,
+        device: 0x0003,
+        model: "test commands unreviewed",
+        kind: ListKind::Allow,
+        reviewed: true,
+        commands: Some(&UNREVIEWED_COMMANDS),
+        entries: &[],
+    };
+
+    #[test]
+    fn gate_needs_the_command_list_reviewed_too() {
+        let lists: &[&WriteList] = &[&REVIEWED_REGS_ONLY];
+        for sv in [QEMU, DELL, None] {
+            let r = gate(lists, 0xfffe, 0x0003, false, sv).unwrap_err();
+            assert!(r.expected.contains("and command list"), "{r:?}");
+        }
+        assert!(gate(lists, 0xfffe, 0x0003, true, QEMU).is_ok());
+        assert!(gate(lists, 0xfffe, 0x0003, true, DELL).is_err());
+    }
 
     #[test]
     fn gate_refuses_devices_without_a_list() {
@@ -546,17 +650,26 @@ mod tests {
 
     #[test]
     fn gate_honours_the_flag_only_under_an_emulator() {
-        assert_eq!(gate(GATE_LISTS, 0xfffe, 0x0001, true, QEMU).unwrap().model, "test unreviewed");
+        assert_eq!(
+            gate(GATE_LISTS, 0xfffe, 0x0001, true, QEMU).unwrap().model,
+            "test unreviewed"
+        );
         // sysfs values end in a newline.
         assert!(gate(GATE_LISTS, 0xfffe, 0x0001, true, Some("QEMU\n")).is_ok());
 
         let r = gate(GATE_LISTS, 0xfffe, 0x0001, true, DELL).unwrap_err();
-        assert!(r.got.contains("\"Dell Inc.\"") && r.got.contains("not an emulator"), "{r:?}");
+        assert!(
+            r.got.contains("\"Dell Inc.\"") && r.got.contains("not an emulator"),
+            "{r:?}"
+        );
         let r = gate(GATE_LISTS, 0xfffe, 0x0001, true, None).unwrap_err();
         assert!(r.got.contains("unreadable"), "{r:?}");
         // Exact match only: no prefixes, no case folding.
         for sv in ["qemu", "QEMU-ish", "", "Standard PC (Q35 + ICH9, 2009)"] {
-            assert!(gate(GATE_LISTS, 0xfffe, 0x0001, true, Some(sv)).is_err(), "{sv:?}");
+            assert!(
+                gate(GATE_LISTS, 0xfffe, 0x0001, true, Some(sv)).is_err(),
+                "{sv:?}"
+            );
         }
     }
 
@@ -564,7 +677,10 @@ mod tests {
     fn gate_admits_reviewed_lists_anywhere() {
         for allow in [false, true] {
             for sv in [QEMU, DELL, None] {
-                assert_eq!(gate(GATE_LISTS, 0xfffe, 0x0002, allow, sv).unwrap().model, "test reviewed");
+                assert_eq!(
+                    gate(GATE_LISTS, 0xfffe, 0x0002, allow, sv).unwrap().model,
+                    "test reviewed"
+                );
             }
         }
     }

@@ -105,3 +105,79 @@ world nic {
     include driver;
     export ethernet;
 }
+
+/// NVMe commands, submitted through the shim (CLAUDE.md rule 10). Linked
+/// only when the device under test is an NVMe controller.
+///
+/// The shim owns the controller's configuration and every queue: the admin
+/// queue and all I/O submission and completion queues, in the shim's own
+/// memory, with their doorbells. A driver hands it 64-byte commands; the
+/// shim checks each one against the device's command allow list and the
+/// driver's own DMA buffers, copies it into its own queue, and rings the
+/// doorbell. Completions come back through `complete`. Because the shim
+/// reads every completion itself, it knows how far the device has fetched
+/// each submission queue and never overwrites an entry the device may
+/// still be reading.
+interface nvme {
+    enum error {
+        /// The shim refused the command (rule 10). The refusal is logged
+        /// and the run counts as a failure even if the driver handles this
+        /// error.
+        refused,
+        /// No I/O queue with this ID exists.
+        unknown-queue,
+        /// The submission queue is full: collect completions with
+        /// `complete` to free entries.
+        queue-full,
+        /// The admin command did not complete in time. The admin queue is
+        /// no longer usable in this run.
+        timeout,
+        /// The controller or the admin queue failed earlier in this run;
+        /// already logged.
+        failed,
+    }
+
+    /// Run one admin command and wait for it. Returns the 16-byte
+    /// completion queue entry, with the driver's command identifier.
+    /// Create I/O Completion Queue and Create I/O Submission Queue must
+    /// have PRP1 = 0: the shim allocates every queue.
+    admin: func(command: list<u8>) -> result<list<u8>, error>;
+
+    /// Queue one I/O command on submission queue `sqid`. Its completion is
+    /// returned by `complete` for the completion queue the submission queue
+    /// was created with.
+    submit: func(sqid: u16, command: list<u8>) -> result<_, error>;
+
+    /// Take the completions waiting in I/O completion queue `cqid`, oldest
+    /// first: each a 16-byte entry as the device wrote it. Empty if none
+    /// are waiting. Does not wait.
+    complete: func(cqid: u16) -> result<list<list<u8>>, error>;
+}
+
+/// An NVMe driver: the driver world plus the nvme portal.
+world nvme-driver {
+    include driver;
+    import nvme;
+}
+
+/// The block-facing side of a storage driver. The driver exports it; the
+/// host calls it only after `start` returned ok, and never concurrently.
+interface block {
+    /// Bytes per logical block.
+    block-size: func() -> u32;
+    /// Number of logical blocks.
+    capacity: func() -> u64;
+    /// Read `count` blocks starting at `lba`.
+    read: func(lba: u64, count: u32) -> result<list<u8>, string>;
+    /// Write whole blocks starting at `lba`; `data` is a multiple of the
+    /// block size.
+    write: func(lba: u64, data: list<u8>) -> result<_, string>;
+    /// Make every completed write durable.
+    flush: func() -> result<_, string>;
+}
+
+/// A block driver for an NVMe controller.
+world block-driver {
+    include nvme-driver;
+    export block;
+}

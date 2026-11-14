@@ -5,6 +5,7 @@
 use crate::deny::{self, WriteList};
 use crate::dma::{DmaAllocator, Domain};
 use crate::log::{emit, Value};
+use crate::nvme::{Nvme, NvmeError, COMPLETION_BYTES};
 use crate::sys::*;
 use crate::window::Window;
 use std::ffi::CString;
@@ -79,6 +80,9 @@ pub struct Device {
     deny: &'static WriteList,
     window: Window<File>,
     dma: DmaAllocator,
+    /// For a device that takes commands (NVMe): the controller the shim
+    /// brought up, with its admin and submission queues.
+    nvme: Option<Nvme>,
     /// A second handle on the VFIO device fd, for config space.
     config: File,
     config_offset: u64,
@@ -242,6 +246,11 @@ impl Device {
                 ("list_kind", Value::Str(deny.kind.as_str())),
                 ("deny_entries", Value::U64(deny.entries.len() as u64)),
                 ("deny_reviewed", Value::Bool(deny.reviewed)),
+                ("commands", Value::Bool(deny.commands.is_some())),
+                (
+                    "commands_reviewed",
+                    Value::Bool(deny.commands.is_some_and(|c| c.reviewed)),
+                ),
                 (
                     "dmi_sys_vendor",
                     Value::Str(sys_vendor.as_deref().unwrap_or("unreadable")),
@@ -259,6 +268,20 @@ impl Device {
             }),
             dma_limit,
         );
+        // A device that fetches commands from memory: the shim configures
+        // it and owns its queues (rule 10). Bus mastering is already on, so
+        // a failure here quiesces before returning.
+        let nvme = match deny.commands {
+            None => None,
+            Some(list) => match Nvme::bring_up(&window, &dma, list) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    let cleared = cmd & !PCI_COMMAND_MASTER;
+                    let _ = config.write_all_at(&cleared.to_le_bytes(), cfg.offset + PCI_COMMAND);
+                    return Err(fail(e.step, e.expected, e.got));
+                }
+            },
+        };
         Ok(Device {
             bdf: bdf.to_string(),
             vendor,
@@ -266,6 +289,7 @@ impl Device {
             deny,
             window,
             dma,
+            nvme,
             config,
             config_offset: cfg.offset,
             quiesced: AtomicBool::new(false),
@@ -343,6 +367,41 @@ impl Device {
 
     pub fn dma(&self) -> &DmaAllocator {
         &self.dma
+    }
+
+    /// Whether the device takes commands through the shim (NVMe).
+    pub fn takes_commands(&self) -> bool {
+        self.nvme.is_some()
+    }
+
+    /// Commands the shim refused so far (rule 10). Any value above zero
+    /// fails the run.
+    pub fn refused_commands(&self) -> u32 {
+        self.nvme.as_ref().map_or(0, Nvme::refused)
+    }
+
+    /// Run one admin command for the driver. `None` if the device takes no
+    /// commands.
+    pub fn nvme_admin(&self, command: &[u8]) -> Option<Result<[u8; COMPLETION_BYTES], NvmeError>> {
+        let n = self.nvme.as_ref()?;
+        Some(n.admin(&self.window, &self.dma, command))
+    }
+
+    /// Queue one I/O command for the driver. `None` if the device takes no
+    /// commands.
+    pub fn nvme_submit(&self, sqid: u16, command: &[u8]) -> Option<Result<(), NvmeError>> {
+        let n = self.nvme.as_ref()?;
+        Some(n.submit(&self.window, &self.dma, sqid, command))
+    }
+
+    /// Take the completions waiting in I/O completion queue `cqid`. `None`
+    /// if the device takes no commands.
+    pub fn nvme_complete(
+        &self,
+        cqid: u16,
+    ) -> Option<Result<Vec<[u8; COMPLETION_BYTES]>, NvmeError>> {
+        let n = self.nvme.as_ref()?;
+        Some(n.complete(&self.window, cqid))
     }
 }
 

@@ -18,8 +18,12 @@ grind-host --device <pci-address> --module <driver.wasm>
    module whose imports all come from the portal interfaces. Anything else
    (WASI included) is rejected and the rejection names the import. It is
    then wrapped as a component (`wit-component`) and compiled.
-2. **Device.** `grind_shim::Device::open`.
-3. **Run.** The driver is instantiated with only the portals linked and a
+2. **Device.** `grind_shim::Device::open`. For an NVMe controller this
+   includes the shim's controller bring-up.
+3. **Run.** The world follows from the device and the options: `driver`;
+   `nic` with `--serve-ping`; `nvme-driver` (adds the `nvme` portal) for a
+   device that takes commands. A module that imports `nvme` is rejected on
+   any other device. The driver is instantiated with only the portals linked and a
    64 MiB memory limit, and its `start` is called with `--timeout-ms` to
    finish (epoch interruption).
 4. **Serve** (only with `--serve-ping`). The driver must target world
@@ -43,8 +47,8 @@ Wasm backtrace with function names.
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | `start` returned ok and no denied write was attempted |
-| 1 | the driver failed (`driver-error`, `trap`, `timeout`, `link-down`, `deny-list-violation`), or bus mastering could not be cleared at the end (`quiesce`) |
+| 0 | `start` returned ok, no denied write was attempted and no command was refused |
+| 1 | the driver failed (`driver-error`, `trap`, `timeout`, `link-down`, `deny-list-violation`, `command-refused`), or bus mastering could not be cleared at the end (`quiesce`) |
 | 2 | the run could not start: arguments, module rejected, device not opened |
 
 Dependencies are pinned exactly: `wasmtime` 50.0.1 (no WASI, no default

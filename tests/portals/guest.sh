@@ -85,6 +85,16 @@ run_case denied-write 1 '"event":"mmio-denied","attempted":"write32","offset":"0
 run_case reset-at-open 0 '"reset":"VFIO_DEVICE_RESET ok"' read-status $EMU
 run_case quiesce-at-close 0 '"event":"device-quiesce","bdf":"'"$BDF"'","command_before":"0x' dma $EMU
 
+# The nvme portal exists only for a device that takes commands: a module
+# importing it is rejected on the e1000e before it runs.
+run_case nvme-portal-on-nic 2 'grind:portals/nvme@0.1.0 only for a device that takes NVMe commands' nvme-format $EMU
+# ...and the result line is still the last line: the device is closed
+# before the setup error is reported.
+last="$(printf '%s\n' "$out" | tail -n 1)"
+if printf '%s' "$last" | grep -qF '"event":"result"'; then result=pass; else result=fail failed=1; fi
+printf 'PORTALS step=result-last result=%s expected="%s" got="%s"\n' "$result" \
+	"the result line last after a setup error" "$(clean "$last")"
+
 # After every case above: the IOMMU logged no DMA faults (teardown included).
 expected="no DMAR fault lines in dmesg after all cases"
 faults="$(dmesg | grep -E 'DMAR: \[DMA (Read|Write)|DMAR: DRHD: handling fault' || true)"

@@ -7,9 +7,17 @@
 //! pointer crosses the portal. The device can reach mapped buffers and
 //! nothing else; a page-sized gap after each buffer makes an overrun fault
 //! in the IOMMU instead of landing in the next buffer.
+//!
+//! Each buffer is owned either by the driver or by the shim itself (for
+//! example, NVMe submission queues). The allocator remembers which live
+//! ranges are the driver's, so the shim can check that every address a
+//! driver hands the device lies inside the driver's own buffers (rule 10).
+//! IOVAs are never reused, so a freed driver buffer's addresses can never
+//! come to name shim memory.
 
 use crate::log::{emit, Value};
 use crate::sys::*;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::ptr::NonNull;
@@ -49,7 +57,17 @@ pub enum DmaError {
 
 struct State {
     next_iova: u64,
+    /// Bytes in the driver's buffers (counted against the limit).
     used: u64,
+    /// The driver's live buffers: IOVA -> length.
+    driver: BTreeMap<u64, u64>,
+}
+
+/// Who a buffer belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Driver,
+    Shim,
 }
 
 /// Allocates DMA buffers for one device, up to a total limit.
@@ -66,25 +84,46 @@ impl DmaAllocator {
             state: Arc::new(Mutex::new(State {
                 next_iova: IOVA_BASE,
                 used: 0,
+                driver: BTreeMap::new(),
             })),
             limit,
         }
     }
 
-    /// Bytes currently allocated.
+    /// Bytes currently allocated to the driver.
     pub fn used(&self) -> u64 {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).used
     }
 
-    /// Allocate a zeroed buffer of at least `size` bytes, rounded up to whole pages.
+    /// Allocate a zeroed buffer for the driver, of at least `size` bytes,
+    /// rounded up to whole pages.
     pub fn allocate(&self, size: u32) -> Result<DmaBuffer, DmaError> {
+        self.allocate_for(size, Owner::Driver)
+    }
+
+    /// Allocate a zeroed buffer the shim keeps for itself. It is not the
+    /// driver's, so [`DmaAllocator::driver_owns`] never covers it, and it
+    /// does not count against the driver's limit.
+    pub(crate) fn allocate_shim(&self, size: u32) -> Result<DmaBuffer, DmaError> {
+        self.allocate_for(size, Owner::Shim)
+    }
+
+    /// Whether `[iova, iova + len)` lies entirely inside one of the
+    /// driver's live buffers. False for `len == 0`.
+    pub fn driver_owns(&self, iova: u64, len: u64) -> bool {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        covers(&state.driver, iova, len)
+    }
+
+    fn allocate_for(&self, size: u32, owner: Owner) -> Result<DmaBuffer, DmaError> {
         if size == 0 || size > MAX_BUFFER {
             return Err(DmaError::BadSize);
         }
         let len = u64::from(size).div_ceil(PAGE) * PAGE;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let iova = state.next_iova;
-        if state.used + len > self.limit || iova + len > IOVA_LIMIT {
+        let over_limit = owner == Owner::Driver && state.used + len > self.limit;
+        if over_limit || iova + len > IOVA_LIMIT {
             return Err(DmaError::OutOfMemory);
         }
 
@@ -116,7 +155,10 @@ impl DmaAllocator {
         }
 
         state.next_iova = iova + len + PAGE; // leave an unmapped guard page
-        state.used += len;
+        if owner == Owner::Driver {
+            state.used += len;
+            state.driver.insert(iova, len);
+        }
         Ok(DmaBuffer {
             domain: Arc::clone(&self.domain),
             state: Arc::clone(&self.state),
@@ -124,6 +166,7 @@ impl DmaAllocator {
             pages,
             iova,
             len,
+            owner,
         })
     }
 }
@@ -136,6 +179,19 @@ pub struct DmaBuffer {
     pages: usize,
     iova: u64,
     len: u64,
+    owner: Owner,
+}
+
+/// Whether `[iova, iova + len)` lies inside one range of `ranges`.
+fn covers(ranges: &BTreeMap<u64, u64>, iova: u64, len: u64) -> bool {
+    let Some(end) = iova.checked_add(len) else {
+        return false;
+    };
+    len > 0
+        && ranges
+            .range(..=iova)
+            .next_back()
+            .is_some_and(|(&start, &size)| end <= start + size)
 }
 
 // SAFETY: the buffer exclusively owns its allocation (no references to it
@@ -183,6 +239,12 @@ impl DmaBuffer {
 
 impl Drop for DmaBuffer {
     fn drop(&mut self) {
+        // From here on the driver may not name this range in a command,
+        // whether or not the unmap below succeeds.
+        if self.owner == Owner::Driver {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.driver.remove(&self.iova);
+        }
         let mut unmap = DmaUnmap {
             argsz: argsz::<DmaUnmap>(),
             flags: 0,
@@ -197,8 +259,10 @@ impl Drop for DmaBuffer {
                 // SAFETY: `raw` is the Box allocation from `allocate`, and it
                 // is no longer mapped, so the device cannot reach it.
                 drop(unsafe { Box::from_raw(raw) });
-                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                state.used -= self.len;
+                if self.owner == Owner::Driver {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.used -= self.len;
+                }
             }
             other => {
                 // The device might still reach this memory, so it is leaked
@@ -222,5 +286,29 @@ impl Drop for DmaBuffer {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn covers_only_whole_ranges_inside_one_buffer() {
+        let mut r = BTreeMap::new();
+        r.insert(0x1_0000_0000, 0x2000); // two pages
+        r.insert(0x1_0000_3000, 0x1000); // after a guard page
+        let base = 0x1_0000_0000u64;
+        assert!(covers(&r, base, 1));
+        assert!(covers(&r, base, 0x2000));
+        assert!(covers(&r, base + 0x1ffc, 4));
+        assert!(!covers(&r, base + 0x1ffc, 8), "runs into the guard page");
+        assert!(!covers(&r, base, 0x4000), "spans two buffers and the gap");
+        assert!(!covers(&r, base - 4, 8), "starts before the buffer");
+        assert!(!covers(&r, base + 0x2000, 4), "the guard page");
+        assert!(covers(&r, base + 0x3000, 0x1000));
+        assert!(!covers(&r, base, 0), "empty ranges are never covered");
+        assert!(!covers(&r, u64::MAX - 1, 4), "overflow");
+        assert!(!covers(&BTreeMap::new(), base, 4));
     }
 }
