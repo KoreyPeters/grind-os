@@ -183,7 +183,10 @@ fn dma_err(what: &str, e: dma::Error) -> String {
 }
 
 fn emit(level: log::Level, message: &str, fields: &[(&str, String)]) {
-    let fields: Vec<(String, String)> = fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    let fields: Vec<(String, String)> = fields
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
     log::emit(level, message, &fields);
 }
 
@@ -255,8 +258,16 @@ fn regs_now() -> String {
 
 /// Read `len` bytes of DMA memory until two reads agree (at most three
 /// reads). `None` if no two agree: the memory cannot be trusted right now.
-fn read_agreed(buf: &dma::Buffer, offset: u32, len: u32, what: &str) -> Result<Option<Vec<u8>>, String> {
-    let rd = || buf.read(offset, len).map_err(|e| dma_err(&format!("read {what}"), e));
+fn read_agreed(
+    buf: &dma::Buffer,
+    offset: u32,
+    len: u32,
+    what: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let rd = || {
+        buf.read(offset, len)
+            .map_err(|e| dma_err(&format!("read {what}"), e))
+    };
     let a = rd()?;
     let b = rd()?;
     if a == b {
@@ -356,7 +367,10 @@ fn rx_cmd(slot: u32) -> u32 {
 }
 
 fn fmt_mac(m: &[u8; 6]) -> String {
-    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    m.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn dword(d: &[u8], i: usize) -> u32 {
@@ -396,7 +410,13 @@ fn start() -> Result<Nic, String> {
 
     // 2. Software reset (DS 6.5).
     let reset_us = reset()?;
-    info("reset complete", &[("waited_us", reset_us.to_string()), ("tcr", format!("0x{tcr:08x}"))]);
+    info(
+        "reset complete",
+        &[
+            ("waited_us", reset_us.to_string()),
+            ("tcr", format!("0x{tcr:08x}")),
+        ],
+    );
 
     // 3. Station address (DS 6, IDR0-5).
     let mut mac = [0u8; 6];
@@ -492,13 +512,19 @@ impl Nic {
             ring[at..at + 4].copy_from_slice(&rx_cmd(i).to_le_bytes());
             ring[at + 8..at + 16].copy_from_slice(&self.rx_buf_iova(i).to_le_bytes());
         }
-        self.rx_desc.write(0, &ring).map_err(|e| dma_err("write RX descriptors", e))?;
+        self.rx_desc
+            .write(0, &ring)
+            .map_err(|e| dma_err("write RX descriptors", e))?;
 
         let mut ring = vec![0u8; RING_BYTES as usize];
         let last = ((RING - 1) * DESC_SIZE) as usize;
         ring[last..last + 4].copy_from_slice(&bit::D_EOR.to_le_bytes());
-        self.tx_desc.write(0, &ring).map_err(|e| dma_err("write TX descriptors", e))?;
-        self.tx_hi.write(0, &ring).map_err(|e| dma_err("write high-priority TX descriptors", e))?;
+        self.tx_desc
+            .write(0, &ring)
+            .map_err(|e| dma_err("write TX descriptors", e))?;
+        self.tx_hi
+            .write(0, &ring)
+            .map_err(|e| dma_err("write high-priority TX descriptors", e))?;
         self.rx_next = 0;
         self.rx_unstable = 0;
         self.tx_next = 0;
@@ -558,7 +584,9 @@ impl Nic {
         let ret = bit::CR_RE | bit::CR_TE;
         if let Some(cr) = cr {
             if cr & ret != ret {
-                wrong.push(format!("CR = 0x{cr:02x}, expected RE and TE (bits 3, 2) set (DS 6.5)"));
+                wrong.push(format!(
+                    "CR = 0x{cr:02x}, expected RE and TE (bits 3, 2) set (DS 6.5)"
+                ));
             }
         }
         if let Some(c) = cpcr {
@@ -571,7 +599,10 @@ impl Nic {
         }
         if let Some(r) = rcr {
             if r & bit::RCR_VALUE != bit::RCR_VALUE {
-                wrong.push(format!("RCR = 0x{r:08x}, expected bits 0x{:08x} set (DS 6.9)", bit::RCR_VALUE));
+                wrong.push(format!(
+                    "RCR = 0x{r:08x}, expected bits 0x{:08x} set (DS 6.9)",
+                    bit::RCR_VALUE
+                ));
             }
         }
         if !wrong.is_empty() {
@@ -597,14 +628,24 @@ impl Nic {
                     warn(
                         "device not responding",
                         &[
-                            ("expected", "CR, C+CR and RCR as configured (DS 6.5, 6.33, 6.9)".into()),
-                            ("got", format!("each read all-ones {REG_TRIES} times in a row")),
-                            ("action", "report errors; rebuild the device when it answers again".into()),
+                            (
+                                "expected",
+                                "CR, C+CR and RCR as configured (DS 6.5, 6.33, 6.9)".into(),
+                            ),
+                            (
+                                "got",
+                                format!("each read all-ones {REG_TRIES} times in a row"),
+                            ),
+                            (
+                                "action",
+                                "report errors; rebuild the device when it answers again".into(),
+                            ),
                         ],
                     );
                 }
                 self.device_gone = true;
-                self.reinit_reason = Some("the device stopped responding (all-ones) and came back".into());
+                self.reinit_reason =
+                    Some("the device stopped responding (all-ones) and came back".into());
                 return Err(format!(
                     "device not responding: CR, C+CR and RCR each read all-ones {REG_TRIES} times in a row (expected CR bits 3,2 set, C+CR 0x{:04x}, RCR 0x{:08x}); the device may be gone or wedged; it will be rebuilt when it answers",
                     bit::CPCR_VALUE,
@@ -639,7 +680,10 @@ impl Nic {
     fn reinit(&mut self) -> Result<(), String> {
         let reason = self.reinit_reason.clone().unwrap_or_default();
         if self.reinits > 0 && elapsed_ns(self.reinit_ns) < REINIT_RETRY_NS {
-            return Err(format!("device rebuild pending ({reason}); retrying within {} ms", REINIT_RETRY_NS / 1_000_000));
+            return Err(format!(
+                "device rebuild pending ({reason}); retrying within {} ms",
+                REINIT_RETRY_NS / 1_000_000
+            ));
         }
         self.reinit_ns = clock::now_ns();
         self.reinits += 1;
@@ -657,10 +701,18 @@ impl Nic {
         match r {
             Ok(()) => {
                 self.reinit_reason = None;
-                info("device rebuilt", &[("rebuild", self.reinits.to_string()), ("registers", regs_now())]);
+                info(
+                    "device rebuilt",
+                    &[
+                        ("rebuild", self.reinits.to_string()),
+                        ("registers", regs_now()),
+                    ],
+                );
                 Ok(())
             }
-            Err(e) => Err(format!("rebuilding the device ({reason}) failed: {e}; will retry")),
+            Err(e) => Err(format!(
+                "rebuilding the device ({reason}) failed: {e}; will retry"
+            )),
         }
     }
 
@@ -690,14 +742,25 @@ impl Nic {
     /// Read RX descriptor `slot` until two reads agree. `None`: they never
     /// did; try again on the next call.
     fn rx_descriptor(&mut self, slot: u32) -> Result<Option<Vec<u8>>, String> {
-        let d = read_agreed(&self.rx_desc, slot * DESC_SIZE, DESC_SIZE, &format!("RX descriptor {slot}"))?;
+        let d = read_agreed(
+            &self.rx_desc,
+            slot * DESC_SIZE,
+            DESC_SIZE,
+            &format!("RX descriptor {slot}"),
+        )?;
         if d.is_none() {
             self.limiter.warn(
                 "RX descriptor reads disagree",
                 &[
                     ("descriptor", slot.to_string()),
-                    ("expected", "two of three reads of the same 16 bytes agree".into()),
-                    ("action", "nothing consumed; read again on the next call".into()),
+                    (
+                        "expected",
+                        "two of three reads of the same 16 bytes agree".into(),
+                    ),
+                    (
+                        "action",
+                        "nothing consumed; read again on the next call".into(),
+                    ),
                 ],
             );
         }
@@ -731,7 +794,9 @@ impl Nic {
         let Some(ring) = read_agreed(&self.rx_desc, 0, RING_BYTES, "RX descriptor ring")? else {
             return Ok(());
         };
-        let filled: Vec<bool> = (0..RING as usize).map(|i| dword(&ring, 4 * i) & bit::D_OWN == 0).collect();
+        let filled: Vec<bool> = (0..RING as usize)
+            .map(|i| dword(&ring, 4 * i) & bit::D_OWN == 0)
+            .collect();
         let count = filled.iter().filter(|f| **f).count();
         if count == 0 {
             return Ok(());
@@ -784,7 +849,10 @@ impl Nic {
                 &[
                     ("descriptor", slot.to_string()),
                     ("status", format!("0x{status:08x}")),
-                    ("expected", format!("buffer address 0x{expected_addr:x} as written")),
+                    (
+                        "expected",
+                        format!("buffer address 0x{expected_addr:x} as written"),
+                    ),
                     ("got", format!("0x{addr:x}")),
                 ],
             );
@@ -796,12 +864,21 @@ impl Nic {
                     ("descriptor", slot.to_string()),
                     ("status", format!("0x{status:08x}")),
                     ("frame_length_with_fcs", raw_len.to_string()),
-                    ("expected", "OWN 0, FS and LS set, RES clear, length 18-1518 including FCS (DS 9.2.2)".into()),
+                    (
+                        "expected",
+                        "OWN 0, FS and LS set, RES clear, length 18-1518 including FCS (DS 9.2.2)"
+                            .into(),
+                    ),
                 ],
             );
             None
         } else {
-            match read_agreed(&self.rx_bufs, slot * BUF_SIZE, len as u32, &format!("RX buffer {slot}"))? {
+            match read_agreed(
+                &self.rx_bufs,
+                slot * BUF_SIZE,
+                len as u32,
+                &format!("RX buffer {slot}"),
+            )? {
                 Some(f) => Some(f),
                 None => {
                     self.rx_unstable += 1;
@@ -835,7 +912,13 @@ impl Nic {
     fn tx_reclaim(&mut self) -> Result<(), String> {
         while self.tx_clean != self.tx_next {
             let slot = self.tx_clean;
-            let Some(d) = read_agreed(&self.tx_desc, slot * DESC_SIZE, 4, &format!("TX descriptor {slot}"))? else {
+            let Some(d) = read_agreed(
+                &self.tx_desc,
+                slot * DESC_SIZE,
+                4,
+                &format!("TX descriptor {slot}"),
+            )?
+            else {
                 break;
             };
             let status = dword(&d, 0);
@@ -848,7 +931,10 @@ impl Nic {
                     &[
                         ("descriptor", slot.to_string()),
                         ("status", format!("0x{status:08x}")),
-                        ("meaning", "bit25 UNF, bit22 OWC, bit21 LNKF, bit20 EXC (DS 9.2.1)".into()),
+                        (
+                            "meaning",
+                            "bit25 UNF, bit22 OWC, bit21 LNKF, bit20 EXC (DS 9.2.1)".into(),
+                        ),
                     ],
                 );
             }
@@ -864,7 +950,10 @@ impl Nic {
     /// SPEC.md "TX descriptor".
     fn transmit(&mut self, frame: Vec<u8>) -> Result<(), String> {
         if !(MIN_FRAME..=MAX_FRAME).contains(&frame.len()) {
-            return Err(format!("frame is {} bytes; expected 14 to 1514 (no FCS)", frame.len()));
+            return Err(format!(
+                "frame is {} bytes; expected 14 to 1514 (no FCS)",
+                frame.len()
+            ));
         }
         self.maintain()?;
         let mut data = frame;
@@ -932,7 +1021,9 @@ impl Guest for Driver {
 
 impl ethernet::Guest for Driver {
     fn mac_address() -> (u8, u8, u8, u8, u8, u8) {
-        let m = NIC.with(|n| n.borrow().as_ref().map(|nic| nic.mac)).unwrap_or([0; 6]);
+        let m = NIC
+            .with(|n| n.borrow().as_ref().map(|nic| nic.mac))
+            .unwrap_or([0; 6]);
         (m[0], m[1], m[2], m[3], m[4], m[5])
     }
 
@@ -949,7 +1040,10 @@ impl ethernet::Guest for Driver {
                 if n <= 10 || n % 500 == 0 {
                     warn(
                         "link-up: MSR read all-ones; reporting the link down",
-                        &[("tries", REG_TRIES.to_string()), ("occurrence", n.to_string())],
+                        &[
+                            ("tries", REG_TRIES.to_string()),
+                            ("occurrence", n.to_string()),
+                        ],
                     );
                 }
                 false
