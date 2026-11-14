@@ -28,6 +28,9 @@
 #   --qmp SOCKET              open a QEMU monitor (QMP) on this Unix socket, so
 #                             a test can change the VM while it runs (for
 #                             example, set_link to drop the network link)
+#   --nvme-errors CONF        with --nvme: put QEMU's blkdebug layer under the
+#                             disk, configured by CONF, so chosen blocks fail
+#                             with real I/O errors (see tests/block)
 #   --nic MODEL               the network card: e1000e (default, on the root
 #                             bus) or rtl8139 (behind its own PCIe root port,
 #                             and the device under test)
@@ -51,12 +54,13 @@ LOG="$BUILD/serial.log"
 RUN=""
 NETDEV="user,id=net0"
 NVME=""
+NVME_ERRORS=""
 NIC=e1000e
 QMP=""
 SEED=""
 
 usage() {
-	sed -n '4,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+	sed -n '4,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 	exit 2
 }
 
@@ -74,6 +78,7 @@ while [ $# -gt 0 ]; do
 		shift
 		;;
 	--nvme) NVME="${2:?--nvme needs a disk image}"; shift ;;
+	--nvme-errors) NVME_ERRORS="${2:?--nvme-errors needs a blkdebug config}"; shift ;;
 	--nic) NIC="${2:?--nic needs a model}"; shift ;;
 	--qmp) QMP="${2:?--qmp needs a socket path}"; shift ;;
 	--seed)
@@ -123,6 +128,12 @@ if [ -n "$NVME" ]; then
 	[ -r "$NVME" ] && [ -w "$NVME" ] || fail nvme-image "$NVME readable and writable by $(id -un)" "$(ls -l "$NVME")"
 	NVME="$(realpath "$NVME")"
 fi
+if [ -n "$NVME_ERRORS" ]; then
+	[ -n "$NVME" ] || fail args "--nvme-errors only with --nvme" "no --nvme"
+	case "$NVME_ERRORS" in *,*) fail args "--nvme-errors path without commas" "$NVME_ERRORS" ;; esac
+	[ -f "$NVME_ERRORS" ] || fail nvme-errors "$NVME_ERRORS is a blkdebug config file" "missing"
+	NVME_ERRORS="$(realpath "$NVME_ERRORS")"
+fi
 
 APPEND="console=ttyS0 intel_iommu=on loglevel=4 panic=-1 grind.mode=$MODE"
 [ -z "$RUN" ] || APPEND="$APPEND grind.run=$RUN"
@@ -160,9 +171,14 @@ esac
 # refuses a device it cannot reset. Behind its own PCIe root port it gets a
 # secondary bus reset and its own IOMMU group.
 if [ -n "$NVME" ]; then
+	if [ -n "$NVME_ERRORS" ]; then
+		NVME_DRIVE="if=none,id=nvm,format=raw,file.driver=blkdebug,file.config=$NVME_ERRORS,file.image.filename=$NVME"
+	else
+		NVME_DRIVE="file=$NVME,if=none,id=nvm,format=raw"
+	fi
 	QEMU_ARGS+=(
 		-device pcie-root-port,id=rp1,chassis=1
-		-drive "file=$NVME,if=none,id=nvm,format=raw"
+		-drive "$NVME_DRIVE"
 		-device nvme,serial=grind0001,drive=nvm,bus=rp1
 	)
 fi

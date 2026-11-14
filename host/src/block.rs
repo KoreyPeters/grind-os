@@ -56,7 +56,17 @@ pub const RECOVERY_BLOCKS: u32 = 8;
 pub struct Expect {
     pub block_size: u32,
     pub blocks: u64,
+    /// `--block-device-errors`: the disk has blkdebug's bad blocks
+    /// (tests/block), so run the device-errors phase.
+    pub device_errors: bool,
 }
+
+/// Blocks tests/block makes fail with real I/O errors (QEMU's blkdebug):
+/// reads of BAD_READ_LBA always, writes to BAD_WRITE_LBA always, and the
+/// first read of TRANSIENT_LBA only.
+pub const BAD_READ_LBA: u64 = 3000;
+pub const BAD_WRITE_LBA: u64 = 3100;
+pub const TRANSIENT_LBA: u64 = 3200;
 
 /// `count` blocks of a pattern starting at `lba`.
 pub fn pattern(tag: &[u8; 4], lba: u64, count: u32, block_size: u32) -> Vec<u8> {
@@ -270,6 +280,100 @@ pub fn exercise(
     read(store, DATA, "last after the errors", last, 1)?;
     read(store, DATA, "first after the errors", 0, 1)?;
     recovery(store, blk, block_size, "baseline")?;
+
+    if expect.device_errors {
+        device_errors(store, blk, block_size)?;
+        recovery(store, blk, block_size, "device-errors")?;
+    }
+    Ok(())
+}
+
+/// Phase: errors the device really reports (docs/design/robust-block.md).
+/// Bad blocks must give readable errors; a transient error must be retried
+/// to success; the blocks around them must keep working.
+fn device_errors(
+    store: &mut Store<State>,
+    blk: &Block,
+    block_size: u32,
+) -> Result<(), &'static str> {
+    let limit = CALL_LIMIT;
+    emit("block-phase", &[("phase", Value::Str("device-errors"))]);
+    let failing_reads: [(&str, u64, u32); 2] = [
+        ("read of a bad block", BAD_READ_LBA, 1),
+        ("read spanning a bad block", BAD_READ_LBA - 4, 8),
+    ];
+    for (what, lba, count) in failing_reads {
+        set_deadline(store, limit);
+        let r = blk
+            .call_read(&mut *store, lba, count)
+            .map_err(|e| call_failed("read", limit, e))?;
+        let accepted = r
+            .as_ref()
+            .ok()
+            .map(|d| format!("ok with {} bytes", d.len()));
+        expect_error(what, &format!("read({lba}, {count})"), accepted, r.err())?;
+    }
+    set_deadline(store, limit);
+    let data = pattern(BADW, BAD_WRITE_LBA, 1, block_size);
+    let r = blk
+        .call_write(&mut *store, BAD_WRITE_LBA, &data)
+        .map_err(|e| call_failed("write", limit, e))?;
+    let accepted = r.is_ok().then(|| "ok".to_string());
+    expect_error(
+        "write of a bad block",
+        &format!("write({BAD_WRITE_LBA}, 1 block)"),
+        accepted,
+        r.err(),
+    )?;
+
+    // A transient error: the first read fails, a retry succeeds. The call
+    // must return the right data.
+    set_deadline(store, limit);
+    let call = "read of a block that fails once (a transient error)";
+    let got = match blk.call_read(&mut *store, TRANSIENT_LBA, 1) {
+        Err(e) => return Err(call_failed("read", limit, e)),
+        Ok(Err(msg)) => {
+            emit(
+                "block-transient-not-retried",
+                &[
+                    ("call", Value::Str(call)),
+                    (
+                        "expected",
+                        Value::Str("the seed, after a bounded retry (robustness contract)"),
+                    ),
+                    ("got", Value::Str(&format!("an error: {msg}"))),
+                ],
+            );
+            return Err("block-transient-not-retried");
+        }
+        Ok(Ok(d)) => d,
+    };
+    compare(
+        call,
+        TRANSIENT_LBA,
+        1,
+        block_size,
+        &pattern(SEED, TRANSIENT_LBA, 1, block_size),
+        &got,
+    )?;
+
+    // The neighbours still work.
+    for lba in [BAD_READ_LBA + 1, BAD_WRITE_LBA + 1] {
+        set_deadline(store, limit);
+        let got = match blk.call_read(&mut *store, lba, 1) {
+            Err(e) => return Err(call_failed("read", limit, e)),
+            Ok(Err(msg)) => return Err(driver_error("read next to a bad block", &msg)),
+            Ok(Ok(d)) => d,
+        };
+        compare(
+            "read next to a bad block",
+            lba,
+            1,
+            block_size,
+            &pattern(SEED, lba, 1, block_size),
+            &got,
+        )?;
+    }
     Ok(())
 }
 

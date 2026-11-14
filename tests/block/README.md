@@ -48,8 +48,16 @@ off, as `nic-peer` is for the NIC test.
      pattern to blocks 2000-2007, flush, and read it back exactly
      (`block-recovery`). A driver error during a hostile phase is
      logged, not fatal; a failed recovery check fails the run. The
-     phases are being added one at a time; today the recovery check runs
-     once, after the baseline.
+     phases are being added one at a time:
+     - **device errors**: QEMU's `blkdebug` layer under the disk
+       (`vm/run.sh --nvme-errors`, config written by `check.sh`) fails
+       reads of block 3000 and writes to block 3100 with real I/O
+       errors, and the first read of block 3200 only. The controller
+       returns genuine NVMe error completions (SCT 2, SC 0x81 or 0x80,
+       Do Not Retry clear). Reads of and across block 3000 and the write
+       to 3100 must give readable errors; the read of 3200 must succeed
+       after a bounded retry (`block-transient-not-retried` otherwise);
+       the neighbouring blocks must keep working.
 
    Before this run, `guest.sh` runs the driver once with its second DMA
    allocation failing (`--fail-allocation 2`): `start` must return a
@@ -99,6 +107,15 @@ tests/block/check.sh tests/block/modules/target/wasm32-unknown-unknown/release/b
 | `lenient` | `cheat`, but reads outside the disk return data | `block-accepted-invalid` at `read(32768, 1)` |
 | `partial` | `cheat`, but a write past the end keeps the block that fits before failing | `block-mismatch` at the re-read of block 32767: `BADW` instead of `DATA` |
 | `alloc-panic` | unwraps a failed DMA allocation in `start` | `alloc-fail`: a trap, not a readable error |
+
+`cheat` also pretends blocks 3000 and 3100 are bad, so the
+device-errors phase cannot catch it either: it stays the control that
+only the image check can catch.
+
+**Status (2026-11-14):** the NVMe driver gives readable errors for the
+bad blocks but does not retry the transient one
+(`block-transient-not-retried`). It will be reground against the full
+test (docs/design/robust-block.md, step 6).
 
 `cheat`, `lenient` and `partial` share `modules/cheat-common/cheat.rs`.
 `cheat` shows that the image check is independent of anything that ran

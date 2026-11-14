@@ -55,7 +55,8 @@ printf 'BLOCK step=alloc-fail result=%s expected="%s" got="%s"\n' "$alloc" "$all
 # No --allow-unreviewed-deny-list: the device's register and command lists
 # are human-reviewed (rule 10), the same path real hardware takes.
 out="$(/bin/grind-host --device "$BDF" --module "$MODULE" --timeout-ms 15000 \
-	--exercise-block --expect-block-size "$BLOCK_SIZE" --expect-blocks "$BLOCKS" --fault-seed "$SEED" 2>&1)"
+	--exercise-block --expect-block-size "$BLOCK_SIZE" --expect-blocks "$BLOCKS" --fault-seed "$SEED" \
+	--block-device-errors 2>&1)"
 rc=$?
 printf '%s\n' "$out" | sed 's/^/    /'
 last="$(printf '%s\n' "$out" | tail -n 1)"

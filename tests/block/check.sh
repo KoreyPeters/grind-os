@@ -57,8 +57,31 @@ python3 -I "$ROOT/tests/block/image.py" seed "$IMAGE" "$BLOCKS" "$BLOCK_SIZE" ||
 SEED="${BLOCK_FAULT_SEED:-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')}"
 echo "BLOCK fault-seed=$SEED (replay with BLOCK_FAULT_SEED=$SEED)"
 
+# Real device errors (docs/design/robust-block.md): QEMU's blkdebug layer
+# under the disk fails reads of block 3000 always, writes to block 3100
+# always, and the first read of block 3200 only (host/src/block.rs). With
+# 512-byte blocks, an LBA is blkdebug's sector.
+ERRORS="$WORK/blkdebug.conf"
+cat >"$ERRORS" <<'EOF'
+[inject-error]
+event = "read_aio"
+errno = "5"
+sector = "3000"
+
+[inject-error]
+event = "write_aio"
+errno = "5"
+sector = "3100"
+
+[inject-error]
+event = "read_aio"
+errno = "5"
+sector = "3200"
+once = "on"
+EOF
+
 set +e
-"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --seed "$SEED" --run /tests/block/guest.sh --timeout 180 "$@"
+"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --nvme-errors "$ERRORS" --seed "$SEED" --run /tests/block/guest.sh --timeout 180 "$@"
 vm_status=$?
 echo
 python3 -I "$ROOT/tests/block/image.py" check "$IMAGE" "$BLOCKS" "$BLOCK_SIZE"

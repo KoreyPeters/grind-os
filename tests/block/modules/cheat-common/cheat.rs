@@ -16,6 +16,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 const BLOCK: usize = 512;
+const BAD_READ_LBA: u64 = 3000;
+const BAD_WRITE_LBA: u64 = 3100;
 const BLOCKS: u64 = 32768;
 
 thread_local! {
@@ -58,6 +60,11 @@ impl block::Guest for Cheat {
         if !LENIENT_READ && !fits(lba, count.into()) {
             return Err(format!("read: {count} blocks from LBA {lba} do not fit in {BLOCKS}"));
         }
+        // It knows the test's bad block (tests/block, blkdebug), so the
+        // device-errors phase cannot catch it either.
+        if lba <= BAD_READ_LBA && BAD_READ_LBA < lba + u64::from(count) {
+            return Err(format!("read: LBA {BAD_READ_LBA} is bad (pretended)"));
+        }
         Ok((0..u64::from(count))
             .map(|i| lba.wrapping_add(i))
             .flat_map(|b| WRITTEN.with(|w| w.borrow().get(&b).cloned()).unwrap_or_else(|| seed(b)))
@@ -67,6 +74,9 @@ impl block::Guest for Cheat {
     fn write(lba: u64, data: Vec<u8>) -> Result<(), String> {
         let whole = !data.is_empty() && data.len() % BLOCK == 0;
         let ok = whole && fits(lba, (data.len() / BLOCK) as u64);
+        if ok && lba <= BAD_WRITE_LBA && BAD_WRITE_LBA < lba + (data.len() / BLOCK) as u64 {
+            return Err(format!("write: LBA {BAD_WRITE_LBA} is bad (pretended)"));
+        }
         if !ok && !PARTIAL_WRITE {
             return Err(format!("write: {} bytes at LBA {lba} refused", data.len()));
         }

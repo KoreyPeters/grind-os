@@ -166,6 +166,7 @@ fn parse_args() -> Result<Args, String> {
     let mut fault_seed = 1;
     let mut fail_allocation = None;
     let mut exercise = false;
+    let mut device_errors = false;
     let mut block_size = None;
     let mut blocks = None;
     let mut serve = Duration::from_secs(10);
@@ -198,6 +199,7 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--exercise-block" => exercise = true,
+            "--block-device-errors" => device_errors = true,
             "--expect-block-size" => {
                 let v = value("--expect-block-size")?;
                 block_size = Some(
@@ -255,7 +257,11 @@ fn parse_args() -> Result<Args, String> {
         fail_allocation,
         exercise_block: match (exercise, block_size, blocks) {
             (false, None, None) => None,
-            (true, Some(block_size), Some(blocks)) => Some(block::Expect { block_size, blocks }),
+            (true, Some(block_size), Some(blocks)) => Some(block::Expect {
+                block_size,
+                blocks,
+                device_errors,
+            }),
             _ => {
                 return Err(
                     "--exercise-block, --expect-block-size and --expect-blocks go together".into(),
