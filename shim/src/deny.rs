@@ -99,7 +99,7 @@ const fn e82574(
 /// 10.2.2.6 does not list (bits 29:11 are reserved). FLA is denied as a
 /// whole, which covers it.
 ///
-/// Not reviewed by the human yet (rule 10).
+/// Reviewed by the human against the datasheet (rule 10).
 pub static E1000E_82574L: DenyList = DenyList {
     vendor: 0x8086,
     device: 0x10d3,

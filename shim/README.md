@@ -66,9 +66,9 @@ does not list (bits 29:11 are reserved). FLA is denied as a whole register,
 which covers it either way. Denying whole registers rather than single bits
 is deliberate for this reason.
 
-The list stays `reviewed: false` until the human reviews it against the
-datasheet (rule 10). The human flips it, in a commit they sign. No test
-depends on its state: the gate is unit-tested with test-only lists, and the
+The human reviewed the list against the datasheet and set
+`reviewed: true` in their own commit (rule 10). Any change to the entries
+needs a new review. No test depends on the review state: the gate is unit-tested with test-only lists, and the
 `deny-list-gate` portal case accepts either state as long as the host's
 behaviour matches the flag.
 
