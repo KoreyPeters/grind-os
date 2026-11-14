@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Wasm driver for the Intel 82574L (QEMU e1000e). Grindable.
+# Built by harness/grind.sh for wasm32-unknown-unknown.
+[package]
+name = "driver-e1000e"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.63.0"
+
+[profile.release]
+opt-level = "s"
+
+# Its own workspace, separate from the trusted native one.
+[workspace]

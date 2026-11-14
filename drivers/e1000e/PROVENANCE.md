@@ -39,3 +39,9 @@ translated.
   driver is unbound, seen in milestones 2 and 3. Decoded per 10.2.2.2:
   FD = 1, LU = 0, SPEED = 10b (1000 Mb/s), ASDV = 10b. The link is not up
   until the driver sets CTRL.SLU.
+- QEMU 6.2.0 `e1000e`, running this driver: the reset completes within the
+  first 1 ms poll. STATUS.LU sets about 270 ms after CTRL.SLU, and STATUS
+  then reads `0x00080283` (FD, LU, SPEED = 1000 Mb/s, ASDV, and
+  GIO_MASTER_ENABLE back on after the reset). DMA IOVAs start at
+  `0x100000000`, so RDBAH and TDBAH are 1. Frames sent while `start` runs
+  (before RCTL.EN) are not received.

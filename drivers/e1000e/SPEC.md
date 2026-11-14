@@ -19,8 +19,8 @@ jumbo frames, multiple queues, power management, PHY register access
 World `nic` (`portals/wit`): exports `start` and the `ethernet` interface
 (`mac-address`, `link-up`, `transmit`, `receive`). Frames exclude the FCS.
 
-> The `ethernet` interface is a proposal awaiting the human's approval. If
-> it changes, this section changes with it.
+The host (`grind-host --serve-ping`) calls these one at a time after
+`start` and answers ARP and ping itself; the driver only moves frames.
 
 ## Registers used (BAR0 offsets)
 
