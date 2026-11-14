@@ -7,6 +7,7 @@
 //!            [--timeout-ms N] [--dma-limit-mib N] [--trace]
 //!            [--allow-unreviewed-deny-list]
 //!            [--serve-ping <ipv4> [--serve-ms N] [--expect-link-flaps N]]
+//!            [--fault-seed N] [--fail-allocation N]
 //!            [--exercise-block --expect-block-size N --expect-blocks N]
 //! ```
 //!
@@ -43,6 +44,7 @@ use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
 mod block;
+mod faults;
 mod net;
 
 /// World `driver`: the portals plus `start`.
@@ -147,6 +149,8 @@ struct Args {
     exercise_block: Option<block::Expect>,
     serve: Duration,
     expect_link_flaps: u64,
+    fault_seed: u64,
+    fail_allocation: Option<u32>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -159,6 +163,8 @@ fn parse_args() -> Result<Args, String> {
     let mut allow_unreviewed = false;
     let mut serve_ping = None;
     let mut expect_link_flaps = 0;
+    let mut fault_seed = 1;
+    let mut fail_allocation = None;
     let mut exercise = false;
     let mut block_size = None;
     let mut blocks = None;
@@ -206,6 +212,19 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| format!("--expect-blocks {v}: not a number"))?,
                 );
             }
+            "--fault-seed" => {
+                let v = value("--fault-seed")?;
+                fault_seed = v
+                    .parse()
+                    .map_err(|_| format!("--fault-seed {v}: not a number"))?;
+            }
+            "--fail-allocation" => {
+                let v = value("--fail-allocation")?;
+                fail_allocation = Some(
+                    v.parse()
+                        .map_err(|_| format!("--fail-allocation {v}: not a number"))?,
+                );
+            }
             "--expect-link-flaps" => {
                 let v = value("--expect-link-flaps")?;
                 expect_link_flaps = v
@@ -232,6 +251,8 @@ fn parse_args() -> Result<Args, String> {
         serve_ping,
         serve,
         expect_link_flaps,
+        fault_seed,
+        fail_allocation,
         exercise_block: match (exercise, block_size, blocks) {
             (false, None, None) => None,
             (true, Some(block_size), Some(blocks)) => Some(block::Expect { block_size, blocks }),
@@ -255,6 +276,8 @@ struct State {
     limits: StoreLimits,
     trace: bool,
     started: Instant,
+    /// Injected device faults (docs/design/robust-nic.md).
+    faults: faults::Faults,
 }
 
 impl mmio::Host for State {
@@ -263,19 +286,34 @@ impl mmio::Host for State {
     }
 
     fn read8(&mut self, offset: u32) -> wasmtime::Result<Result<u8, mmio::Error>> {
-        let r = self.device.window().read8(offset);
+        let mut r = self.device.window().read8(offset);
+        if r.is_ok() {
+            if let Some(v) = self.faults.register_read("read8", offset, 1) {
+                r = Ok(v as u8);
+            }
+        }
         self.trace_read("read8", offset, r.as_ref().ok().map(|v| u64::from(*v)));
         mmio_result("read8", offset, None, r)
     }
 
     fn read16(&mut self, offset: u32) -> wasmtime::Result<Result<u16, mmio::Error>> {
-        let r = self.device.window().read16(offset);
+        let mut r = self.device.window().read16(offset);
+        if r.is_ok() {
+            if let Some(v) = self.faults.register_read("read16", offset, 2) {
+                r = Ok(v as u16);
+            }
+        }
         self.trace_read("read16", offset, r.as_ref().ok().map(|v| u64::from(*v)));
         mmio_result("read16", offset, None, r)
     }
 
     fn read32(&mut self, offset: u32) -> wasmtime::Result<Result<u32, mmio::Error>> {
-        let r = self.device.window().read32(offset);
+        let mut r = self.device.window().read32(offset);
+        if r.is_ok() {
+            if let Some(v) = self.faults.register_read("read32", offset, 4) {
+                r = Ok(v);
+            }
+        }
         self.trace_read("read32", offset, r.as_ref().ok().map(|v| u64::from(*v)));
         mmio_result("read32", offset, None, r)
     }
@@ -391,6 +429,9 @@ fn dma_error(op: &str, e: DmaError) -> wasmtime::Result<dma::Error> {
 
 impl dma::Host for State {
     fn allocate(&mut self, size: u32) -> wasmtime::Result<Result<Resource<DmaBuffer>, dma::Error>> {
+        if self.faults.allocation("allocate", size) {
+            return Ok(Err(dma_error("allocate", DmaError::OutOfMemory)?));
+        }
         let r = self.device.dma().allocate(size);
         self.dma_buffer("allocate", r)
     }
@@ -399,6 +440,9 @@ impl dma::Host for State {
         &mut self,
         size: u32,
     ) -> wasmtime::Result<Result<Resource<DmaBuffer>, dma::Error>> {
+        if self.faults.allocation("allocate32", size) {
+            return Ok(Err(dma_error("allocate32", DmaError::OutOfMemory)?));
+        }
         let r = self.device.dma().allocate32(size);
         self.dma_buffer("allocate32", r)
     }
@@ -445,8 +489,13 @@ impl dma::HostBuffer for State {
         offset: u32,
         len: u32,
     ) -> wasmtime::Result<Result<Vec<u8>, dma::Error>> {
-        match self.table.get(&buf)?.read(offset, len) {
-            Ok(v) => Ok(Ok(v)),
+        let b = self.table.get(&buf)?;
+        let iova = b.iova();
+        match b.read(offset, len) {
+            Ok(mut v) => {
+                self.faults.device_data(iova, offset, &mut v);
+                Ok(Ok(v))
+            }
             Err(e) => Ok(Err(dma_error("read", e)?)),
         }
     }
@@ -771,6 +820,7 @@ fn main() -> ExitCode {
         limits: StoreLimitsBuilder::new().memory_size(MAX_MEMORY).build(),
         trace: args.trace,
         started: Instant::now(),
+        faults: faults::Faults::new(args.fault_seed, args.fail_allocation),
     };
     let mut store = Store::new(&engine, state);
     store.limiter(|s| &mut s.limits);
@@ -827,6 +877,20 @@ fn main() -> ExitCode {
     };
     let failure: Option<&'static str> = match started {
         Err(e) => Some(call_failed("start", args.timeout, e)),
+        Ok(Err(msg)) if msg.trim().is_empty() => {
+            emit(
+                "driver-error-unreadable",
+                &[
+                    ("call", Value::Str("start")),
+                    (
+                        "expected",
+                        Value::Str("an error saying what was attempted, expected and got (rule 3)"),
+                    ),
+                    ("got", Value::Str("an empty error")),
+                ],
+            );
+            Some("driver-error-unreadable")
+        }
         Ok(Err(msg)) => {
             emit(
                 "driver-error",
@@ -1130,6 +1194,11 @@ fn serve(store: &mut Store<State>, nic: &Nic, opts: &ServeOptions) -> Result<(),
                     done = true;
                     peer_complete = complete;
                 }
+                net::Control::Faults {
+                    ms,
+                    kinds,
+                    per_mille,
+                } => store.data_mut().faults.open(ms, kinds, per_mille),
             }
             continue;
         }
@@ -1186,6 +1255,15 @@ fn serve(store: &mut Store<State>, nic: &Nic, opts: &ServeOptions) -> Result<(),
             ("frames_malformed", Value::U64(tally.get("malformed"))),
             ("driver_errors", Value::U64(tally.get("driver-error"))),
             ("link_drops", Value::U64(link_drops)),
+            (
+                "faults_registers",
+                Value::U64(store.data().faults.injected_registers),
+            ),
+            (
+                "faults_device_data",
+                Value::U64(store.data().faults.injected_device_data),
+            ),
+            ("faults_slow", Value::U64(store.data().faults.injected_slow)),
             ("dma_bytes_after_start", Value::U64(dma_after_start)),
             ("dma_bytes_at_end", Value::U64(dma_at_end)),
             ("log_cap_per_kind", Value::U64(LOG_CAP)),

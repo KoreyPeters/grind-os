@@ -22,6 +22,11 @@ harness/grind.sh e1000e                    # builds the driver and runs this
 
 1. `check.sh` builds `grind-host` (static) and `nic-peer`, and puts the
    host, `guest.sh` and the driver into the initramfs.
+
+   Before the main run, `guest.sh` runs the driver once with its second
+   DMA allocation failing (`--fail-allocation 2`): `start` must return a
+   readable error, not trap or hang (step `alloc-fail`; not exercised,
+   and noted, if `start` allocates fewer than two buffers).
 2. `nic-peer` starts first. It reserves the UDP ports for the wire, then
    sends ARP who-has 10.0.2.15 every 500 ms while the VM boots.
 3. In the VM, `guest.sh` runs the driver under
@@ -63,7 +68,14 @@ harness/grind.sh e1000e                    # builds the driver and runs this
    `link-up` every 100 ms, must see the link go down at least 3 times
    (`--expect-link-flaps 3`, else `link-flaps-unseen`) and up at the end
    (else `link-stuck-down`).
-8. The peer sends the host a "done" control frame, which ends serving.
+8. **Device faults** (robustness contract). The peer asks the host,
+   with a control frame, to open three 1.5 s fault windows in turn:
+   register reads returning all-ones (20%), DMA reads with a byte changed
+   (10%), and both plus slowed calls (10%) (`host/src/faults.rs`, seeded,
+   every fault logged as `fault-injected`). Traffic keeps flowing during
+   each window, unjudged; a recovery check follows each. Then the bulk
+   step runs again (`final-bulk`).
+9. The peer sends the host a "done" control frame, which ends serving.
    It says whether the timeline completed; if the peer stopped at a
    failed step, the host reports `peer-ended-early` (the failing step is
    in the peer's log) rather than judging steps that never ran.
@@ -92,7 +104,9 @@ test must fail on it, which shows it cannot pass without a working driver.
 `modules/mute-error` returns an empty error from `receive`, and
 `modules/leaky` allocates a DMA buffer on every `receive`, and
 `modules/oversized` hands up a 1515-byte frame: grind-host must fail
-them with `driver-error-unreadable`, `dma-growth` and `frame-invalid`,
+them with `driver-error-unreadable`, `dma-growth` and `frame-invalid`.
+`modules/alloc-panic` unwraps a failed allocation in `start` and must
+fail the `alloc-fail` step (a trap),
 the host's side of the robustness contract (`docs/design/robust-nic.md`):
 
 ```sh
@@ -123,3 +137,20 @@ link as soon as the recovery pings passed. That was too soon for the
 host's 100 ms polling (and for the e1000e's auto-negotiation), so a
 correct driver failed with `link-flaps-unseen`: a test bug, fixed by
 holding the link up 5 s.
+
+**Status of the drivers against the full timeline (2026-11-14).** Both
+the e1000e and RTL8139 drivers pass every phase up to the third fault
+window and its recovery check, which both fail; both pass `alloc-fail`.
+They were written against the earlier, normal-path test and will be
+reground against this one (docs/design/robust-nic.md, step 6). What
+happened:
+
+- e1000e: one corrupted read made a descriptor the card had not yet
+  filled look done (status 0xeb, length 0). The driver dropped the frame
+  but still recycled the slot, setting RDT to it; the card's head then
+  equalled its tail (an empty ring) and the card stopped receiving, while
+  the driver waited on the next slot. One bad read deadlocked receive for
+  good: no IOMMU faults, a driver-logic wedge.
+- RTL8139: its interrupt status read as all-ones (0xffff); after the
+  window it answered 13 recovery pings and then stopped.
+

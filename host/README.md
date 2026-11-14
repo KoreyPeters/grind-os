@@ -52,7 +52,18 @@ grind-host --device <pci-address> --module <driver.wasm>
    `--expect-link-flaps` (`link-flaps-unseen`) or the link not up at the
    end (`link-stuck-down`). If the peer's "done" says it stopped early at
    a failed step, the host reports `peer-ended-early` instead of judging
-   steps that never ran. Whether frames were
+   steps that never ran.
+
+   **Fault injection** (`src/faults.rs`): a control frame from the peer
+   opens a fault window (length, kinds, rate). During it, some register
+   reads return all-ones, some DMA buffer reads come back with one byte
+   changed, and some calls are slowed by 2 ms; the host closes the window
+   itself. `--fail-allocation N` fails the driver's Nth DMA allocation.
+   Faults come from a xorshift64 generator seeded by `--fault-seed`
+   (default 1); every one is logged (`fault-injected`, the first 10 of
+   each kind in full) and counted in `serve-end`. Only what the driver
+   sees changes: writes and anything reaching the device are untouched,
+   so rule 10 holds. Whether frames were
    answered, and whether the driver recovered after each hostile phase,
    is for the test's peer to judge (`tests/nic`).
 5. **Exercise** (only with `--exercise-block`). The device must take NVMe

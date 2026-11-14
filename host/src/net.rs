@@ -33,6 +33,9 @@ pub enum Control {
     /// The peer's timeline is over: stop serving. `complete` is false if
     /// the peer stopped early because a step failed.
     Done { complete: bool },
+    /// Open a device-fault window (host/src/faults.rs): `ms` long, the
+    /// `kinds` bits, at `per_mille` of the calls they apply to.
+    Faults { ms: u32, kinds: u8, per_mille: u16 },
 }
 
 impl Control {
@@ -40,13 +43,15 @@ impl Control {
         match self {
             Control::Done { complete: true } => "done",
             Control::Done { complete: false } => "done-early",
+            Control::Faults { .. } => "faults",
         }
     }
 }
 
 /// The control message in `frame`, if it is one: EtherType 0x88B5, then
-/// `CONTROL_MAGIC`, then one op byte (1 = done, then 1 byte: 1 if the
-/// timeline completed, 0 if it stopped early).
+/// `CONTROL_MAGIC`, then one op byte: 1 = done, then 1 byte (1 if the
+/// timeline completed, 0 if it stopped early); 2 = faults, then the window
+/// in ms (u32), the kinds (u8) and the rate per mille (u16), big-endian.
 pub fn control(frame: &[u8]) -> Option<Control> {
     if frame.len() < ETH_HEADER + CONTROL_MAGIC.len() + 1
         || u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_CONTROL
@@ -58,6 +63,14 @@ pub fn control(frame: &[u8]) -> Option<Control> {
         1 => Some(Control::Done {
             complete: frame.get(ETH_HEADER + CONTROL_MAGIC.len() + 1) == Some(&1),
         }),
+        2 => {
+            let a = frame.get(ETH_HEADER + CONTROL_MAGIC.len() + 1..ETH_HEADER + CONTROL_MAGIC.len() + 8)?;
+            Some(Control::Faults {
+                ms: u32::from_be_bytes([a[0], a[1], a[2], a[3]]),
+                kinds: a[4],
+                per_mille: u16::from_be_bytes([a[5], a[6]]),
+            })
+        }
         _ => None,
     }
 }
@@ -277,6 +290,16 @@ mod tests {
         ipv4[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
         assert_eq!(control(&ipv4), None);
         assert_eq!(control(&f[..20]), None, "too short");
+        let mut faults = f[..22].to_vec();
+        faults.push(2);
+        faults.extend_from_slice(&1500u32.to_be_bytes());
+        faults.push(3);
+        faults.extend_from_slice(&200u16.to_be_bytes());
+        assert_eq!(
+            control(&faults),
+            Some(Control::Faults { ms: 1500, kinds: 3, per_mille: 200 })
+        );
+        assert_eq!(control(&faults[..faults.len() - 1]), None, "truncated");
     }
 
     use super::*;

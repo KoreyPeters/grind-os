@@ -75,6 +75,7 @@ const MAX_PRINTED: usize = 60;
 const ETHERTYPE_CONTROL: u16 = 0x88B5;
 const CONTROL_MAGIC: &[u8; 8] = b"GRINDCTL";
 const CONTROL_DONE: u8 = 1;
+const CONTROL_FAULTS: u8 = 2;
 
 fn fmt_mac(m: &[u8]) -> String {
     m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
@@ -430,60 +431,9 @@ fn run(args: &Args) -> Result<(), ()> {
     }
     // 3. Bulk: large pings, one at a time, until the first failure.
     if ok && args.bulk > 0 {
-        let expected = format!(
-            "{} echo replies, each with the same {BULK_MIN}-{} data bytes as its request, within {} ms each",
-            args.bulk,
-            BULK_MIN + BULK_SPAN - 1,
-            PING_WAIT.as_millis()
-        );
-        let begun = Instant::now();
-        let mut bytes = 0usize;
-        for i in 0..args.bulk {
-            let seq = args.pings + 1 + i;
-            let len = bulk_len(seq);
-            let data = bulk_data(seq, len);
-            let sent = Instant::now();
-            wire.send(&echo_request(seq, &data));
-            let verdict = loop {
-                let left = PING_WAIT.saturating_sub(sent.elapsed());
-                if left.is_zero() {
-                    break Err("no reply".to_string());
-                }
-                let Some(f) = wire.recv(left) else { continue };
-                if let Some(r) = check_echo_reply(&f, seq, &data) {
-                    break r;
-                }
-            };
-            if let Err(why) = verdict {
-                fail(
-                    "bulk",
-                    &expected,
-                    &format!(
-                        "ping {} of {} (seq {seq}, {len} data bytes) failed after {} replies ({bytes} data bytes each way): {why}",
-                        i + 1,
-                        args.bulk,
-                        i
-                    ),
-                );
-                ok = false;
-                break;
-            }
-            bytes += len;
-        }
-        if ok {
-            step(
-                "bulk",
-                true,
-                &expected,
-                &format!(
-                    "{} replies, {bytes} data bytes each way, in {} ms",
-                    args.bulk,
-                    begun.elapsed().as_millis()
-                ),
-            );
-        }
+        ok = bulk(&mut wire, "bulk", args.pings, args.bulk);
     }
-    // 3. A flood, then hostile frames.
+    // 4. A flood, then hostile frames.
     let mut seq = args.pings + args.bulk;
     if ok {
         ok = flood(&mut wire, &mut seq);
@@ -492,12 +442,22 @@ fn run(args: &Args) -> Result<(), ()> {
         ok = hostile(&mut wire, &mut seq);
     }
 
-    // 4. Link flaps, through QEMU's monitor.
+    // 5. Link flaps, through QEMU's monitor.
     if ok {
         if let Some(path) = &args.qmp {
             ok = link_flaps(&mut wire, path, &mut seq);
         }
     }
+
+    // 6. Device-fault windows in the host, then the bulk step again.
+    if ok {
+        ok = fault_windows(&mut wire, &mut seq);
+    }
+    if ok && args.bulk > 0 {
+        ok = bulk(&mut wire, "final-bulk", seq, args.bulk);
+        seq += args.bulk;
+    }
+    let _ = seq;
 
     // The timeline is over: tell the host to stop serving.
     wire.send(&control_frame(CONTROL_DONE, &[ok as u8]));
@@ -613,6 +573,83 @@ fn recovery(wire: &mut Wire, after: &str, seq: &mut u16) -> bool {
         }
     }
     step(&name, true, &expected, &format!("first reply after {} ms ({tries} tries), then {} more", first.as_millis(), RECOVER_PINGS - 1));
+    true
+}
+
+/// `count` large pings, one at a time, sequence numbers from `after + 1`,
+/// until the first failure.
+fn bulk(wire: &mut Wire, name: &str, after: u16, count: u16) -> bool {
+    let expected = format!(
+        "{count} echo replies, each with the same {BULK_MIN}-{} data bytes as its request, within {} ms each",
+        BULK_MIN + BULK_SPAN - 1,
+        PING_WAIT.as_millis()
+    );
+    let begun = Instant::now();
+    let mut bytes = 0usize;
+    for i in 0..count {
+        let seq = after + 1 + i;
+        let len = bulk_len(seq);
+        if let Err(why) = ping_once(wire, seq, &bulk_data(seq, len), PING_WAIT) {
+            step(
+                name,
+                false,
+                &expected,
+                &format!(
+                    "ping {} of {count} (seq {seq}, {len} data bytes) failed after {i} replies ({bytes} data bytes each way): {why}",
+                    i + 1
+                ),
+            );
+            return false;
+        }
+        bytes += len;
+    }
+    step(name, true, &expected, &format!("{count} replies, {bytes} data bytes each way, in {} ms", begun.elapsed().as_millis()));
+    true
+}
+
+/// Device-fault windows (host/src/faults.rs): kinds, rate per mille, name.
+const FAULT_WINDOWS: [(u8, u16, &str); 3] = [
+    (1, 200, "registers"),   // some register reads return all-ones
+    (2, 100, "device-data"), // some DMA reads come back with a byte changed
+    (7, 100, "all"),         // both, and some calls slowed
+];
+const FAULT_WINDOW: Duration = Duration::from_millis(1500);
+/// Pings sent during a fault window keep traffic flowing; they are not
+/// judged.
+const FAULT_PING_EVERY: Duration = Duration::from_millis(20);
+
+/// For each fault window: ask the host to open it, keep traffic flowing
+/// while it lasts (unjudged), then a recovery check.
+fn fault_windows(wire: &mut Wire, seq: &mut u16) -> bool {
+    for (kinds, per_mille, name) in FAULT_WINDOWS {
+        let mut arg = (FAULT_WINDOW.as_millis() as u32).to_be_bytes().to_vec();
+        arg.push(kinds);
+        arg.extend_from_slice(&per_mille.to_be_bytes());
+        wire.send(&control_frame(CONTROL_FAULTS, &arg));
+        let begun = Instant::now();
+        let (mut sent, mut answered) = (0u32, 0u32);
+        let data: Vec<u8> = (0..PING_DATA as u8).collect();
+        while begun.elapsed() < FAULT_WINDOW {
+            *seq += 1;
+            sent += 1;
+            if ping_once(wire, *seq, &data, FAULT_PING_EVERY).is_ok() {
+                answered += 1;
+            }
+        }
+        drain(wire, Duration::from_millis(200));
+        step(
+            &format!("faults-{name}"),
+            true,
+            &format!(
+                "a {} ms window of injected device faults ({name}, {per_mille} per mille), traffic kept flowing",
+                FAULT_WINDOW.as_millis()
+            ),
+            &format!("{sent} pings during the window, {answered} answered (not judged)"),
+        );
+        if !recovery(wire, &format!("faults-{name}"), seq) {
+            return false;
+        }
+    }
     true
 }
 
