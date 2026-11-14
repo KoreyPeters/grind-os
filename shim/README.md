@@ -84,9 +84,30 @@ emulator: `/sys/class/dmi/id/sys_vendor` must read exactly `QEMU`. On real
 hardware the flag is refused, and the refusal names the vendor it found.
 `device-open` logs the value as `dmi_sys_vendor`.
 
-Limit: DMI describes the machine, not the device. A real device passed
-through to a QEMU guest would pass this check, so a reviewed list is still
-required before passing real hardware through.
+DMI describes the machine, not the device: a real device passed through
+to a QEMU guest would pass that check. So the device must also be one
+QEMU emulates (issue #12): its vendor and device IDs and its subsystem
+IDs (`/sys/bus/pci/devices/<bdf>/subsystem_vendor`, `subsystem_device`)
+must exactly match an entry of `EMULATED_DEVICES` in `src/deny.rs`:
+
+| Device | IDs | Subsystem |
+| --- | --- | --- |
+| QEMU e1000e (82574L) | 8086:10d3 | 8086:0000 |
+| QEMU rtl8139 | 10ec:8139 | 1af4:1100 |
+| QEMU NVMe | 1b36:0010 | 1af4:1100 |
+
+1af4:1100 is the subsystem QEMU gives devices that set none of their own
+(Red Hat's vendor ID, QEMU's subsystem ID); real hardware does not carry
+it. A real card carries its maker's or its OEM's subsystem (an OptiPlex
+NIC, Dell's 1028), so it is refused, and the refusal names the IDs it
+found. Unreadable subsystem IDs are refused too. `device-open` logs them
+as `subsystem`; in the test VM they read as in the table.
+
+Limit: QEMU can be told to give a passed-through device any subsystem IDs
+(vfio-pci's `x-pci-sub-vendor-id`, `x-pci-sub-device-id`). That defeats
+the check on purpose; it guards against mistakes, not against someone
+set on running an unreviewed list on real hardware. A reviewed list is
+still required before passing real hardware through.
 
 Writes are the only thing filtered: reads are allowed everywhere in BAR0.
 
@@ -285,6 +306,12 @@ BAR are never exposed, because the I/O BAR's `IOADDR`/`IODATA` pair reaches
 every register. Config space is never exposed either.
 
 ## Sources
+
+- **QEMU 6.2.0** (Debian 1:6.2+dfsg-2ubuntu6.31), observed 2026-11-14:
+  QMP `query-pci` on a q35 machine with `-device e1000e`, `-device
+  rtl8139` and `-device nvme`, for the subsystem IDs in
+  `EMULATED_DEVICES` (issue #12). Facts only; no QEMU code was used.
+  Confirmed in the test VM, where `device-open` logs the same values.
 
 - VFIO and PCI constants (including `PCI_BASE_ADDRESS_0`, added for the
   register BAR, and `VFIO_IOMMU_GET_INFO` with its IOVA-range capability,

@@ -383,6 +383,52 @@ pub const DMI_SYS_VENDOR: &str = "/sys/class/dmi/id/sys_vendor";
 /// is an unreviewed list honoured. QEMU's q35 machine reports "QEMU".
 const EMULATOR_SYS_VENDORS: &[&str] = &["QEMU"];
 
+/// A device QEMU emulates, as the guest sees it: its PCI IDs and the
+/// subsystem IDs QEMU gives it.
+#[derive(Debug)]
+pub struct EmulatedDevice {
+    pub vendor: u16,
+    pub device: u16,
+    pub subsystem_vendor: u16,
+    pub subsystem_device: u16,
+    pub model: &'static str,
+}
+
+/// Where the subsystem IDs in [`EMULATED_DEVICES`] come from.
+pub const EMULATED_DEVICES_SOURCE: &str =
+    "QEMU 6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.31), QMP query-pci on a q35 machine \
+     with -device e1000e, rtl8139 and nvme, observed 2026-11-14";
+
+/// The emulated devices an unreviewed list may be used with (issue #12).
+/// 1af4:1100 is the subsystem QEMU gives devices that set none of their
+/// own (Red Hat's vendor ID and QEMU's subsystem ID); real hardware does
+/// not carry it. 1b36 is Red Hat's vendor ID for QEMU's own devices. The
+/// e1000e sets subsystem 8086:0000, a subsystem device ID real cards do
+/// not use. Source: [`EMULATED_DEVICES_SOURCE`].
+pub static EMULATED_DEVICES: &[EmulatedDevice] = &[
+    EmulatedDevice {
+        vendor: 0x8086,
+        device: 0x10d3,
+        subsystem_vendor: 0x8086,
+        subsystem_device: 0x0000,
+        model: "QEMU e1000e (82574L)",
+    },
+    EmulatedDevice {
+        vendor: 0x10ec,
+        device: 0x8139,
+        subsystem_vendor: 0x1af4,
+        subsystem_device: 0x1100,
+        model: "QEMU rtl8139",
+    },
+    EmulatedDevice {
+        vendor: 0x1b36,
+        device: 0x0010,
+        subsystem_vendor: 0x1af4,
+        subsystem_device: 0x1100,
+        model: "QEMU NVM Express controller",
+    },
+];
+
 /// The machine's DMI system vendor, trimmed, if it can be read.
 pub fn sys_vendor() -> Option<String> {
     std::fs::read_to_string(DMI_SYS_VENDOR)
@@ -394,25 +440,42 @@ pub fn sys_vendor() -> Option<String> {
 ///
 /// - A device with no list is refused.
 /// - A reviewed list is admitted.
-/// - An unreviewed list is refused unless `allow_unreviewed` is set *and*
-///   the DMI system vendor (`sys_vendor`) names an emulator. The flag alone
-///   is not enough: on real hardware it is refused.
+/// - An unreviewed list is refused unless `allow_unreviewed` is set, the
+///   DMI system vendor (`sys_vendor`) names an emulator, *and* the device
+///   itself is one QEMU emulates: its IDs and subsystem IDs (`subsystem`,
+///   None if unreadable) exactly match an entry of [`EMULATED_DEVICES`].
+///   DMI identifies the machine, so a real device passed through to a
+///   QEMU guest passes the DMI check; its subsystem IDs refuse it.
 ///
-/// Limit: DMI identifies the machine, not the device. A real device passed
-/// through to a QEMU guest would pass this check.
+/// Limit: QEMU can be told to give a passed-through device any subsystem
+/// IDs (vfio-pci's x-pci-sub-vendor-id and x-pci-sub-device-id). Doing so
+/// defeats this check deliberately; it guards against mistakes, not
+/// against someone determined to run an unreviewed list on hardware.
 pub fn admit(
     vendor: u16,
     device: u16,
+    subsystem: Option<(u16, u16)>,
     allow_unreviewed: bool,
     sys_vendor: Option<&str>,
 ) -> Result<&'static WriteList, Refusal> {
-    gate(ALL, vendor, device, allow_unreviewed, sys_vendor)
+    gate(
+        ALL,
+        EMULATED_DEVICES,
+        vendor,
+        device,
+        subsystem,
+        allow_unreviewed,
+        sys_vendor,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gate(
     lists: &[&'static WriteList],
+    emulated: &[EmulatedDevice],
     vendor: u16,
     device: u16,
+    subsystem: Option<(u16, u16)>,
     allow_unreviewed: bool,
     sys_vendor: Option<&str>,
 ) -> Result<&'static WriteList, Refusal> {
@@ -439,7 +502,9 @@ fn gate(
         });
     }
     match sys_vendor.map(str::trim) {
-        Some(v) if EMULATOR_SYS_VENDORS.contains(&v) => Ok(list),
+        Some(v) if EMULATOR_SYS_VENDORS.contains(&v) => {
+            emulated_device(emulated, vendor, device, subsystem, list)
+        }
         other => Err(Refusal {
             expected: format!(
                 "an emulator (DMI sys_vendor one of {}) before honouring \
@@ -453,6 +518,53 @@ fn gate(
             },
         }),
     }
+}
+
+/// The last condition for an unreviewed list: the device is one QEMU
+/// emulates, IDs and subsystem IDs exactly (issue #12).
+fn emulated_device(
+    emulated: &[EmulatedDevice],
+    vendor: u16,
+    device: u16,
+    subsystem: Option<(u16, u16)>,
+    list: &'static WriteList,
+) -> Result<&'static WriteList, Refusal> {
+    let known = emulated
+        .iter()
+        .map(|e| {
+            format!(
+                "{:04x}:{:04x} subsystem {:04x}:{:04x} ({})",
+                e.vendor, e.device, e.subsystem_vendor, e.subsystem_device, e.model
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let expected = format!(
+        "a device QEMU emulates (one of: {known}) before honouring \
+         --allow-unreviewed-deny-list for {}",
+        list.model
+    );
+    let Some((sv, sd)) = subsystem else {
+        return Err(Refusal {
+            expected,
+            got: format!(
+                "{vendor:04x}:{device:04x} with unreadable subsystem IDs; \
+                 the unreviewed list is refused (rule 10)"
+            ),
+        });
+    };
+    if emulated.iter().any(|e| {
+        (e.vendor, e.device, e.subsystem_vendor, e.subsystem_device) == (vendor, device, sv, sd)
+    }) {
+        return Ok(list);
+    }
+    Err(Refusal {
+        expected,
+        got: format!(
+            "{vendor:04x}:{device:04x} subsystem {sv:04x}:{sd:04x}: not an emulated device \
+             (a real device passed through?); the unreviewed list is refused (rule 10)"
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -756,6 +868,24 @@ mod tests {
     static GATE_LISTS: &[&WriteList] = &[&UNREVIEWED, &REVIEWED];
 
     const QEMU: Option<&str> = Some("QEMU");
+    /// The test devices' subsystem, matching TEST_EMULATED.
+    const EMU_SUB: Option<(u16, u16)> = Some((0x1af4, 0x1100));
+    static TEST_EMULATED: &[EmulatedDevice] = &[
+        EmulatedDevice {
+            vendor: 0xfffe,
+            device: 0x0001,
+            subsystem_vendor: 0x1af4,
+            subsystem_device: 0x1100,
+            model: "test emulated 1",
+        },
+        EmulatedDevice {
+            vendor: 0xfffe,
+            device: 0x0003,
+            subsystem_vendor: 0x1af4,
+            subsystem_device: 0x1100,
+            model: "test emulated 3",
+        },
+    ];
     const DELL: Option<&str> = Some("Dell Inc.");
 
     static UNREVIEWED_COMMANDS: crate::nvme::CommandList = crate::nvme::CommandList {
@@ -778,11 +908,11 @@ mod tests {
     fn gate_needs_the_command_list_reviewed_too() {
         let lists: &[&WriteList] = &[&REVIEWED_REGS_ONLY];
         for sv in [QEMU, DELL, None] {
-            let r = gate(lists, 0xfffe, 0x0003, false, sv).unwrap_err();
+            let r = gate(lists, TEST_EMULATED, 0xfffe, 0x0003, EMU_SUB, false, sv).unwrap_err();
             assert!(r.expected.contains("and command list"), "{r:?}");
         }
-        assert!(gate(lists, 0xfffe, 0x0003, true, QEMU).is_ok());
-        assert!(gate(lists, 0xfffe, 0x0003, true, DELL).is_err());
+        assert!(gate(lists, TEST_EMULATED, 0xfffe, 0x0003, EMU_SUB, true, QEMU).is_ok());
+        assert!(gate(lists, TEST_EMULATED, 0xfffe, 0x0003, EMU_SUB, true, DELL).is_err());
         assert!(QEMU_NVME.fully_reviewed(), "the shipped NVMe lists");
     }
 
@@ -790,7 +920,16 @@ mod tests {
     fn gate_refuses_devices_without_a_list() {
         for allow in [false, true] {
             for sv in [QEMU, DELL, None] {
-                let r = gate(GATE_LISTS, 0xfffe, 0x0003, allow, sv).unwrap_err();
+                let r = gate(
+                    GATE_LISTS,
+                    TEST_EMULATED,
+                    0xfffe,
+                    0x0003,
+                    EMU_SUB,
+                    allow,
+                    sv,
+                )
+                .unwrap_err();
                 assert!(r.expected.contains("fffe:0003"), "{r:?}");
             }
         }
@@ -799,7 +938,16 @@ mod tests {
     #[test]
     fn gate_refuses_unreviewed_lists_without_the_flag() {
         for sv in [QEMU, DELL, None] {
-            let r = gate(GATE_LISTS, 0xfffe, 0x0001, false, sv).unwrap_err();
+            let r = gate(
+                GATE_LISTS,
+                TEST_EMULATED,
+                0xfffe,
+                0x0001,
+                EMU_SUB,
+                false,
+                sv,
+            )
+            .unwrap_err();
             assert!(r.got.contains("not reviewed"), "{r:?}");
         }
     }
@@ -807,26 +955,140 @@ mod tests {
     #[test]
     fn gate_honours_the_flag_only_under_an_emulator() {
         assert_eq!(
-            gate(GATE_LISTS, 0xfffe, 0x0001, true, QEMU).unwrap().model,
+            gate(
+                GATE_LISTS,
+                TEST_EMULATED,
+                0xfffe,
+                0x0001,
+                EMU_SUB,
+                true,
+                QEMU
+            )
+            .unwrap()
+            .model,
             "test unreviewed"
         );
         // sysfs values end in a newline.
-        assert!(gate(GATE_LISTS, 0xfffe, 0x0001, true, Some("QEMU\n")).is_ok());
+        assert!(gate(
+            GATE_LISTS,
+            TEST_EMULATED,
+            0xfffe,
+            0x0001,
+            EMU_SUB,
+            true,
+            Some("QEMU\n")
+        )
+        .is_ok());
 
-        let r = gate(GATE_LISTS, 0xfffe, 0x0001, true, DELL).unwrap_err();
+        let r = gate(
+            GATE_LISTS,
+            TEST_EMULATED,
+            0xfffe,
+            0x0001,
+            EMU_SUB,
+            true,
+            DELL,
+        )
+        .unwrap_err();
         assert!(
             r.got.contains("\"Dell Inc.\"") && r.got.contains("not an emulator"),
             "{r:?}"
         );
-        let r = gate(GATE_LISTS, 0xfffe, 0x0001, true, None).unwrap_err();
+        let r = gate(
+            GATE_LISTS,
+            TEST_EMULATED,
+            0xfffe,
+            0x0001,
+            EMU_SUB,
+            true,
+            None,
+        )
+        .unwrap_err();
         assert!(r.got.contains("unreadable"), "{r:?}");
         // Exact match only: no prefixes, no case folding.
         for sv in ["qemu", "QEMU-ish", "", "Standard PC (Q35 + ICH9, 2009)"] {
             assert!(
-                gate(GATE_LISTS, 0xfffe, 0x0001, true, Some(sv)).is_err(),
+                gate(
+                    GATE_LISTS,
+                    TEST_EMULATED,
+                    0xfffe,
+                    0x0001,
+                    EMU_SUB,
+                    true,
+                    Some(sv)
+                )
+                .is_err(),
                 "{sv:?}"
             );
         }
+    }
+
+    #[test]
+    fn gate_honours_the_flag_only_for_an_emulated_device() {
+        let g = |sub| gate(GATE_LISTS, TEST_EMULATED, 0xfffe, 0x0001, sub, true, QEMU);
+        assert!(g(EMU_SUB).is_ok());
+        // A real device passed through to a QEMU guest: right IDs, its own
+        // subsystem (here Dell's).
+        let r = g(Some((0x1028, 0x07a1))).unwrap_err();
+        assert!(
+            r.got.contains("fffe:0001 subsystem 1028:07a1") && r.got.contains("not an emulated"),
+            "{r:?}"
+        );
+        assert!(r.expected.contains("1af4:1100"), "{r:?}");
+        // Exact match only: either half of the subsystem wrong is refused.
+        assert!(g(Some((0x1af4, 0x1101))).is_err());
+        assert!(g(Some((0x1af5, 0x1100))).is_err());
+        let r = g(None).unwrap_err();
+        assert!(r.got.contains("unreadable subsystem"), "{r:?}");
+        // The subsystem must belong to this device's entry, not any entry.
+        let r = gate(
+            GATE_LISTS,
+            &TEST_EMULATED[1..],
+            0xfffe,
+            0x0001,
+            EMU_SUB,
+            true,
+            QEMU,
+        );
+        assert!(r.is_err(), "{r:?}");
+        // DMI still comes first: an emulated device on a non-emulator.
+        assert!(gate(
+            GATE_LISTS,
+            TEST_EMULATED,
+            0xfffe,
+            0x0001,
+            EMU_SUB,
+            true,
+            DELL
+        )
+        .is_err());
+        // Reviewed lists need none of this.
+        assert!(gate(GATE_LISTS, TEST_EMULATED, 0xfffe, 0x0002, None, false, DELL).is_ok());
+    }
+
+    #[test]
+    fn shipped_emulated_devices_are_qemus() {
+        let find = |v, d| {
+            EMULATED_DEVICES
+                .iter()
+                .find(|e| (e.vendor, e.device) == (v, d))
+                .unwrap()
+        };
+        let e = find(0x8086, 0x10d3);
+        assert_eq!((e.subsystem_vendor, e.subsystem_device), (0x8086, 0x0000));
+        for (v, d) in [(0x10ec, 0x8139), (0x1b36, 0x0010)] {
+            let e = find(v, d);
+            assert_eq!((e.subsystem_vendor, e.subsystem_device), (0x1af4, 0x1100));
+        }
+        // A real 82574L with an OEM subsystem is refused even under QEMU.
+        let r = emulated_device(
+            EMULATED_DEVICES,
+            0x8086,
+            0x10d3,
+            Some((0x8086, 0xa01f)),
+            &TEST_LIST,
+        );
+        assert!(r.is_err());
     }
 
     #[test]
@@ -834,7 +1096,17 @@ mod tests {
         for allow in [false, true] {
             for sv in [QEMU, DELL, None] {
                 assert_eq!(
-                    gate(GATE_LISTS, 0xfffe, 0x0002, allow, sv).unwrap().model,
+                    gate(
+                        GATE_LISTS,
+                        TEST_EMULATED,
+                        0xfffe,
+                        0x0002,
+                        EMU_SUB,
+                        allow,
+                        sv
+                    )
+                    .unwrap()
+                    .model,
                     "test reviewed"
                 );
             }

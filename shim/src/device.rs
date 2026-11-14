@@ -101,8 +101,9 @@ impl Device {
     /// already be bound to vfio-pci.
     ///
     /// Refuses devices with no write list, and devices whose list has not
-    /// been reviewed unless `allow_unreviewed` is set and the machine's DMI
-    /// system vendor names an emulator (see `deny::admit`).
+    /// been reviewed unless `allow_unreviewed` is set, the machine's DMI
+    /// system vendor names an emulator, and the device's IDs and subsystem
+    /// IDs are those of a device QEMU emulates (see `deny::admit`).
     /// DMA allocations are limited to `dma_limit` bytes in total.
     pub fn open(bdf: &str, allow_unreviewed: bool, dma_limit: u64) -> Result<Device, OpenError> {
         let sys = format!("/sys/bus/pci/devices/{bdf}");
@@ -111,8 +112,19 @@ impl Device {
 
         // Rule 10: no reviewed write list, no access.
         let sys_vendor = deny::sys_vendor();
-        let deny = deny::admit(vendor, device_id, allow_unreviewed, sys_vendor.as_deref())
-            .map_err(|r| fail("deny-list", r.expected, r.got))?;
+        // Unreadable subsystem IDs are passed as None; the gate refuses an
+        // unreviewed list then, and a reviewed one does not need them.
+        let subsystem = sysfs_hex(&format!("{sys}/subsystem_vendor"))
+            .ok()
+            .zip(sysfs_hex(&format!("{sys}/subsystem_device")).ok());
+        let deny = deny::admit(
+            vendor,
+            device_id,
+            subsystem,
+            allow_unreviewed,
+            sys_vendor.as_deref(),
+        )
+        .map_err(|r| fail("deny-list", r.expected, r.got))?;
 
         // Container and group.
         let link = format!("{sys}/iommu_group");
@@ -314,6 +326,14 @@ impl Device {
                 (
                     "dmi_sys_vendor",
                     Value::Str(sys_vendor.as_deref().unwrap_or("unreadable")),
+                ),
+                (
+                    "subsystem",
+                    Value::Str(
+                        &subsystem
+                            .map(|(v, d)| format!("{v:04x}:{d:04x}"))
+                            .unwrap_or_else(|| "unreadable".into()),
+                    ),
                 ),
                 ("dma_limit", Value::Hex(dma_limit)),
                 ("reset", Value::Str("VFIO_DEVICE_RESET ok")),
