@@ -157,12 +157,11 @@ host's 100 ms polling (and for the e1000e's auto-negotiation), so a
 correct driver failed with `link-flaps-unseen`: a test bug, fixed by
 holding the link up 5 s.
 
-**Status of the drivers against the full timeline (2026-11-14).** Both
-the e1000e and RTL8139 drivers pass every phase up to the third fault
-window and its recovery check, which both fail; both pass `alloc-fail`.
-They were written against the earlier, normal-path test and will be
-reground against this one (docs/design/robust-nic.md, step 6). What
-happened:
+**Status (2026-11-14).** Both NIC drivers pass the full timeline,
+including the device-gone window, with random fault seeds (b7bf2f4,
+0ae4ac4). The drivers first written against the earlier, normal-path
+test failed it; fresh sessions reground them (8 and 4 harness runs,
+logged in each driver's PROVENANCE.md). What the earlier drivers did:
 
 - e1000e: one corrupted read made a descriptor the card had not yet
   filled look done (status 0xeb, length 0). The driver dropped the frame
