@@ -1206,6 +1206,19 @@ fn serve(store: &mut Store<State>, nic: &Nic, opts: &ServeOptions) -> Result<(),
         );
         return Err("dma-growth");
     }
+    if !link_up {
+        emit(
+            "link-stuck-down",
+            &[
+                (
+                    "expected",
+                    Value::Str("link-up true at the end (robustness contract: link up again within 5 s of returning)"),
+                ),
+                ("got", Value::Str("false")),
+            ],
+        );
+        return Err("link-stuck-down");
+    }
     if link_drops < opts.expect_link_flaps {
         emit(
             "link-flaps-unseen",

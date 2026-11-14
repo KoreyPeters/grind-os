@@ -13,7 +13,12 @@
 BDF="$1"
 MODULE=/drivers/driver.wasm
 IP=10.0.2.15
-SERVE_MS=15000
+# An upper bound: the peer ends serving with a control frame when its
+# timeline is done.
+SERVE_MS=60000
+# The peer drops the link this many times (tests/nic/peer); the host fails
+# the run if the driver reports fewer.
+LINK_FLAPS=3
 
 clean() { printf '%s' "$*" | tr '\n"' "  "; }
 expected="grind-host exits 0 after serving $IP for $SERVE_MS ms"
@@ -26,7 +31,7 @@ fi
 # No --allow-unreviewed-deny-list: the driver must pass with the device's
 # human-reviewed list (rule 10), the same path real hardware takes.
 out="$(/bin/grind-host --device "$BDF" --module "$MODULE" \
-	--timeout-ms 15000 --serve-ping "$IP" --serve-ms "$SERVE_MS" 2>&1)"
+	--timeout-ms 15000 --serve-ping "$IP" --serve-ms "$SERVE_MS" --expect-link-flaps "$LINK_FLAPS" 2>&1)"
 rc=$?
 printf '%s\n' "$out" | sed 's/^/    /'
 last="$(printf '%s\n' "$out" | tail -n 1)"

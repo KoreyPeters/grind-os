@@ -15,8 +15,16 @@
 //!    use many times over, so ring wrap-around is tested, not just the first
 //!    few slots.
 //!
+//! 3. With `--qmp SOCKET` (QEMU's monitor), drops the link three times
+//!    (`set_link`): while it is down, pings must go unanswered; after it
+//!    comes back, a recovery check (20 pings, the first answered within
+//!    5 s, the rest within 2 s each) must pass. This forces the NIC
+//!    robustness contract's link-loss items (docs/design/robust-nic.md).
+//! 4. Sends the host a "done" control frame.
+//!
 //! ```text
 //! nic-peer --ports-file FILE [--stop-file FILE] [--deadline-s N] [--pings N] [--bulk N]
+//!          [--qmp SOCKET]
 //! ```
 //!
 //! When the stop file appears (the VM has powered off), the peer stops
@@ -31,7 +39,8 @@
 //!
 //! Written from RFC 826, 791, 792 and 1071. Std only.
 
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::unix::net::UnixStream;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -302,12 +311,13 @@ struct Args {
     deadline: Duration,
     pings: u16,
     bulk: u16,
+    qmp: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
-    let (mut ports_file, mut stop_file, mut deadline, mut pings, mut bulk) =
-        (None, None, Duration::from_secs(120), 3u16, 300u16);
+    let (mut ports_file, mut stop_file, mut deadline, mut pings, mut bulk, mut qmp) =
+        (None, None, Duration::from_secs(120), 3u16, 300u16, None);
     while let Some(a) = args.next() {
         let mut value = |n: &str| args.next().ok_or_else(|| format!("{n} needs a value"));
         match a.as_str() {
@@ -321,6 +331,7 @@ fn parse_args() -> Result<Args, String> {
                 let v = value("--pings")?;
                 pings = v.parse().map_err(|_| format!("--pings {v}: not a number"))?;
             }
+            "--qmp" => qmp = Some(value("--qmp")?),
             "--bulk" => {
                 let v = value("--bulk")?;
                 bulk = v.parse().map_err(|_| format!("--bulk {v}: not a number"))?;
@@ -331,7 +342,7 @@ fn parse_args() -> Result<Args, String> {
     if u32::from(pings) + u32::from(bulk) > u32::from(u16::MAX) {
         return Err(format!("--pings {pings} plus --bulk {bulk}: more than 65535 sequence numbers"));
     }
-    Ok(Args { ports_file: ports_file.ok_or("--ports-file is required")?, stop_file, deadline, pings, bulk })
+    Ok(Args { ports_file: ports_file.ok_or("--ports-file is required")?, stop_file, deadline, pings, bulk, qmp })
 }
 
 fn run(args: &Args) -> Result<(), ()> {
@@ -467,12 +478,174 @@ fn run(args: &Args) -> Result<(), ()> {
             );
         }
     }
+    // 4. Link flaps, through QEMU's monitor.
+    let mut seq = args.pings + args.bulk;
+    if ok {
+        if let Some(path) = &args.qmp {
+            ok = link_flaps(&mut wire, path, &mut seq);
+        }
+    }
+
     // The timeline is over: tell the host to stop serving.
     wire.send(&control_frame(CONTROL_DONE, &[]));
     if wire.seen > wire.printed {
         println!("    ({} more frames not shown)", wire.seen - wire.printed);
     }
     if ok { Ok(()) } else { Err(()) }
+}
+
+/// Link flaps: how many, how long the link stays down each time (long
+/// enough for the contract's "link-up false within 1 s" to be seen by the
+/// host's 100 ms polling), and the pings sent meanwhile.
+const FLAPS: u32 = 3;
+const LINK_DOWN_FOR: Duration = Duration::from_secs(2);
+const DOWN_PINGS: u32 = 3;
+/// After raising the link, keep it up at least this long (the recovery
+/// check runs inside it): the contract gives a driver 5 s to report the
+/// link up again, and the host must see each up before the next drop.
+const LINK_UP_HOLD: Duration = Duration::from_secs(5);
+/// Recovery check: this many pings, the first answered within
+/// RECOVER_FIRST (retried every RECOVER_RETRY), the rest within PING_WAIT.
+const RECOVER_PINGS: u32 = 20;
+const RECOVER_FIRST: Duration = Duration::from_secs(5);
+const RECOVER_RETRY: Duration = Duration::from_millis(500);
+
+/// A minimal QMP client: one command at a time, events skipped.
+struct Qmp {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl Qmp {
+    fn connect(path: &str) -> Result<Qmp, String> {
+        let stream = UnixStream::connect(path).map_err(|e| format!("connect to {path}: {e}"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+        let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        let mut q = Qmp { stream, reader };
+        let mut greeting = String::new();
+        q.reader.read_line(&mut greeting).map_err(|e| format!("QMP greeting: {e}"))?;
+        if !greeting.contains("\"QMP\"") {
+            return Err(format!("QMP greeting: got {:?}", greeting.trim()));
+        }
+        q.command(r#"{"execute":"qmp_capabilities"}"#)?;
+        Ok(q)
+    }
+
+    /// Send one command; Ok on `"return"`, Err with QEMU's reply otherwise.
+    fn command(&mut self, json: &str) -> Result<(), String> {
+        writeln!(self.stream, "{json}").map_err(|e| format!("QMP write: {e}"))?;
+        loop {
+            let mut line = String::new();
+            let n = self.reader.read_line(&mut line).map_err(|e| format!("QMP read: {e}"))?;
+            if n == 0 {
+                return Err("QMP: the monitor closed the connection".into());
+            }
+            if line.contains("\"event\"") {
+                continue;
+            }
+            return if line.contains("\"return\"") { Ok(()) } else { Err(format!("QMP {json}: {}", line.trim())) };
+        }
+    }
+
+    fn set_link(&mut self, up: bool) -> Result<(), String> {
+        self.command(&format!(r#"{{"execute":"set_link","arguments":{{"name":"net0","up":{up}}}}}"#))
+    }
+}
+
+/// Send echo request `seq` with `data` and wait up to `wait` for its exact
+/// reply. Ok with the round-trip time.
+fn ping_once(wire: &mut Wire, seq: u16, data: &[u8], wait: Duration) -> Result<Duration, String> {
+    let sent = Instant::now();
+    wire.send(&echo_request(seq, data));
+    loop {
+        let left = wait.saturating_sub(sent.elapsed());
+        if left.is_zero() {
+            return Err("no reply".into());
+        }
+        let Some(f) = wire.recv(left) else { continue };
+        if let Some(r) = check_echo_reply(&f, seq, data) {
+            return r.map(|()| sent.elapsed());
+        }
+    }
+}
+
+/// The recovery check after a hostile phase: RECOVER_PINGS pings, the
+/// first answered within RECOVER_FIRST, every other within PING_WAIT.
+fn recovery(wire: &mut Wire, after: &str, seq: &mut u16) -> bool {
+    let name = format!("recover-after-{after}");
+    let expected = format!(
+        "{RECOVER_PINGS} echo replies: the first within {} ms, the rest within {} ms each",
+        RECOVER_FIRST.as_millis(),
+        PING_WAIT.as_millis()
+    );
+    let data: Vec<u8> = (0..PING_DATA as u8).collect();
+    let begun = Instant::now();
+    let mut tries = 0;
+    let first = loop {
+        if begun.elapsed() >= RECOVER_FIRST {
+            step(&name, false, &expected, &format!("no reply within {} ms ({tries} tries)", RECOVER_FIRST.as_millis()));
+            return false;
+        }
+        *seq += 1;
+        tries += 1;
+        if ping_once(wire, *seq, &data, RECOVER_RETRY).is_ok() {
+            break begun.elapsed();
+        }
+    };
+    for i in 2..=RECOVER_PINGS {
+        *seq += 1;
+        if let Err(why) = ping_once(wire, *seq, &data, PING_WAIT) {
+            step(&name, false, &expected, &format!("first reply after {} ms, then ping {i} (seq {seq}) failed: {why}", first.as_millis()));
+            return false;
+        }
+    }
+    step(&name, true, &expected, &format!("first reply after {} ms ({tries} tries), then {} more", first.as_millis(), RECOVER_PINGS - 1));
+    true
+}
+
+/// Drop the link FLAPS times; while it is down, pings must go unanswered;
+/// after each, a recovery check.
+fn link_flaps(wire: &mut Wire, qmp_path: &str, seq: &mut u16) -> bool {
+    let mut qmp = match Qmp::connect(qmp_path) {
+        Ok(q) => q,
+        Err(e) => {
+            step("link-flap", false, "a QMP connection to QEMU's monitor", &e);
+            return false;
+        }
+    };
+    let data: Vec<u8> = (0..PING_DATA as u8).collect();
+    for k in 1..=FLAPS {
+        let name = format!("link-down-{k}");
+        let expected = format!(
+            "the link down for {} ms (QMP set_link), and no reply to {DOWN_PINGS} pings meanwhile",
+            LINK_DOWN_FOR.as_millis()
+        );
+        if let Err(e) = qmp.set_link(false) {
+            step(&name, false, &expected, &e);
+            return false;
+        }
+        let down_at = Instant::now();
+        for _ in 0..DOWN_PINGS {
+            *seq += 1;
+            if ping_once(wire, *seq, &data, LINK_DOWN_FOR / DOWN_PINGS).is_ok() {
+                let _ = qmp.set_link(true);
+                step(&name, false, &expected, &format!("seq {seq} was answered while the link was down: the test cannot drop the link"));
+                return false;
+            }
+        }
+        std::thread::sleep(LINK_DOWN_FOR.saturating_sub(down_at.elapsed()));
+        if let Err(e) = qmp.set_link(true) {
+            step(&name, false, &expected, &format!("raising the link again: {e}"));
+            return false;
+        }
+        let up_at = Instant::now();
+        step(&name, true, &expected, &format!("down for {} ms, {DOWN_PINGS} pings unanswered", down_at.elapsed().as_millis()));
+        if !recovery(wire, &format!("link-flap-{k}"), seq) {
+            return false;
+        }
+        std::thread::sleep(LINK_UP_HOLD.saturating_sub(up_at.elapsed()));
+    }
+    true
 }
 
 /// Data length of bulk ping `seq`: varies so frames land at shifting offsets.

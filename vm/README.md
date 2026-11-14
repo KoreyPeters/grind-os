@@ -54,6 +54,10 @@ NVMe controller, it sits behind its own PCIe root port, because on the
 root bus it has no reset method. `--nvme` and `--nic rtl8139` each choose
 the device under test, so they cannot be combined.
 
+`--qmp SOCKET` opens QEMU's monitor (QMP) on a Unix socket, so a test can
+change the VM while it runs: `tests/nic` uses `set_link` on `net0` to
+drop and raise the network link.
+
 ## Prerequisites
 
 - `qemu-system-x86_64`, `curl`, `dpkg-deb`, `depmod`/`modprobe` (kmod), `cpio`, `gzip`.

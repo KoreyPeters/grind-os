@@ -37,6 +37,17 @@ harness/grind.sh e1000e                    # builds the driver and runs this
    9 times), so wrap-around is tested, not just the first few slots. The
    step stops at the first failure and names the ping, its size, and how
    much traffic had already passed.
+6. **Link flaps** (robustness contract, `docs/design/robust-nic.md`).
+   Through QEMU's monitor (`vm/run.sh --qmp`, QMP `set_link`), the peer
+   drops the link three times for 2 s. While it is down, 3 pings must go
+   unanswered (otherwise the test is not really dropping it). After each,
+   a **recovery check**: 20 pings, the first answered within 5 s, the
+   rest within 2 s each. The link then stays up at least 5 s, the time
+   the contract gives a driver to report it up again. The host, polling
+   `link-up` every 100 ms, must see the link go down at least 3 times
+   (`--expect-link-flaps 3`, else `link-flaps-unseen`) and up at the end
+   (else `link-stuck-down`).
+7. The peer sends the host a "done" control frame, which ends serving.
 
 **Pass** requires all of:
 
@@ -79,3 +90,16 @@ have under the old test; `bulk` failed at ping 8, after 8,813 bytes,
 where the ring first wraps (`no reply`; the driver's own log named a bad
 receive header at ring offset 1356). The e1000e driver and both RTL8139
 drivers (C+ and C mode) pass the bulk step.
+
+The link check was checked against a mutant of the RTL8139 driver whose
+`link-up` always returns true: every ping and recovery passed, and the
+host failed it with `link-flaps-unseen` ("0 times"). The e1000e and
+RTL8139 drivers pass all three flaps; the e1000e reports the link up
+about 0.6 s after it returns (QEMU's auto-negotiation delay), the RTL8139
+within one 100 ms poll.
+
+While building this, the first version of the flap phase re-dropped the
+link as soon as the recovery pings passed. That was too soon for the
+host's 100 ms polling (and for the e1000e's auto-negotiation), so a
+correct driver failed with `link-flaps-unseen`: a test bug, fixed by
+holding the link up 5 s.

@@ -49,8 +49,10 @@ mkdir -p "$WORK"
 PORTS="$WORK/ports"
 PEER_LOG="$WORK/peer.log"
 STOP="$WORK/vm-exited"
-rm -f "$PORTS" "$STOP"
-"$PEER_BIN" --ports-file "$PORTS" --stop-file "$STOP" --deadline-s 150 >"$PEER_LOG" 2>&1 &
+# QEMU's monitor, through which the peer drops and raises the link.
+QMP="$WORK/qmp.sock"
+rm -f "$PORTS" "$STOP" "$QMP"
+"$PEER_BIN" --ports-file "$PORTS" --stop-file "$STOP" --deadline-s 150 --qmp "$QMP" >"$PEER_LOG" 2>&1 &
 peer=$!
 trap 'kill "$peer" 2>/dev/null || true' EXIT
 
@@ -62,7 +64,7 @@ done
 read -r peer_port qemu_port <"$PORTS"
 
 set +e
-"$ROOT/vm/run.sh" --check --run /tests/nic/guest.sh --net-udp "$peer_port:$qemu_port" --timeout 180 "$@"
+"$ROOT/vm/run.sh" --check --run /tests/nic/guest.sh --net-udp "$peer_port:$qemu_port" --qmp "$QMP" --timeout 180 "$@"
 vm_status=$?
 
 # The peer normally finishes during the serve window. If it is still
