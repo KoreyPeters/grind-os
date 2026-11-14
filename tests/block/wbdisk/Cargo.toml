@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "wbdisk"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "A write-back disk for the block test: serves an image over NBD, keeping writes in memory until a flush"
+publish = false
+
+# Standard library only.
+[dependencies]

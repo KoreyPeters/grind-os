@@ -59,7 +59,21 @@ pub struct Expect {
     /// `--block-device-errors`: the disk has blkdebug's bad blocks
     /// (tests/block), so run the device-errors phase.
     pub device_errors: bool,
+    /// `--block-power-loss`: end with the power-loss phase; tests/block's
+    /// director cuts the power at its marker.
+    pub power_loss: bool,
 }
+
+/// The power-loss phase: blocks written and flushed before the cut
+/// (PWRA), and blocks written after the flush, before the cut (PWRB).
+pub const PWRA: &[u8; 4] = b"PWRA";
+pub const PWRB: &[u8; 4] = b"PWRB";
+pub const POWER_FLUSHED_LBA: u64 = 6000;
+pub const POWER_UNFLUSHED_LBA: u64 = 6100;
+pub const POWER_BLOCKS: u32 = 16;
+/// How long the host waits for the power cut before reporting that it
+/// never came.
+const POWER_CUT_WAIT_MS: u64 = 10_000;
 
 /// Blocks tests/block makes fail with real I/O errors (QEMU's blkdebug):
 /// reads of BAD_READ_LBA always, writes to BAD_WRITE_LBA always, and the
@@ -310,7 +324,77 @@ pub fn exercise(
         device_errors(store, blk, block_size)?;
         recovery(store, blk, block_size, "device-errors")?;
     }
+    if expect.power_loss {
+        power_loss(store, blk, block_size)?;
+    }
     Ok(())
+}
+
+/// Phase, always last: power loss after a flush (docs/design/robust-block.md).
+/// Write PWRA and flush, write PWRB without flushing, then print the
+/// marker and wait: tests/block's director kills the write-back disk
+/// (losing what was not flushed) and stops the VM. tests/block/image.py
+/// then requires PWRA everywhere it was written, and old or new contents
+/// (SEED or PWRB) where PWRB was. This host never reports on the phase
+/// itself; if the power is still on after POWER_CUT_WAIT_MS, it fails.
+fn power_loss(store: &mut Store<State>, blk: &Block, block_size: u32) -> Result<(), &'static str> {
+    let limit = CALL_LIMIT;
+    emit(
+        "block-phase",
+        &[("phase", Value::Str("power-loss-prepare"))],
+    );
+    for (tag, lba, then_flush) in [
+        (PWRA, POWER_FLUSHED_LBA, true),
+        (PWRB, POWER_UNFLUSHED_LBA, false),
+    ] {
+        set_deadline(store, limit);
+        match blk.call_write(
+            &mut *store,
+            lba,
+            &pattern(tag, lba, POWER_BLOCKS, block_size),
+        ) {
+            Err(e) => return Err(call_failed("write", limit, e)),
+            Ok(Err(msg)) => return Err(driver_error("write before the power loss", &msg)),
+            Ok(Ok(())) => {}
+        }
+        if then_flush {
+            set_deadline(store, limit);
+            match blk.call_flush(&mut *store) {
+                Err(e) => return Err(call_failed("flush", limit, e)),
+                Ok(Err(msg)) => return Err(driver_error("flush before the power loss", &msg)),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+    emit(
+        "block-phase",
+        &[
+            ("phase", Value::Str("power-loss")),
+            (
+                "flushed",
+                Value::Str(&format!("{POWER_FLUSHED_LBA}+{POWER_BLOCKS}")),
+            ),
+            (
+                "unflushed",
+                Value::Str(&format!("{POWER_UNFLUSHED_LBA}+{POWER_BLOCKS}")),
+            ),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(POWER_CUT_WAIT_MS));
+    emit(
+        "block-power-not-cut",
+        &[
+            (
+                "expected",
+                Value::Str("tests/block's director cuts the power at the power-loss marker"),
+            ),
+            (
+                "got",
+                Value::Str(&format!("still running {POWER_CUT_WAIT_MS} ms later")),
+            ),
+        ],
+    );
+    Err("block-power-not-cut")
 }
 
 /// Blocks the faulty-read phases read: never written, so they hold the seed.

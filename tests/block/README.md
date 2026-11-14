@@ -67,6 +67,20 @@ off, as `nic-peer` is for the NIC test.
        completes later must not confuse it (the recovery check after the
        phase). `guest.sh` streams the host's output live, flushing every
        line, so the director acts on time.
+     - **power loss after flush** (always last): the host writes blocks
+       6000-6015 (`PWRA`) and flushes, writes 6100-6115 (`PWRB`) without
+       flushing, prints a marker and waits; the director cuts the power.
+       The disk is served by `wbdisk/` (a write-back disk: QEMU's NVMe
+       storage comes over NBD, `vm/run.sh --nvme-nbd`, and writes stay in
+       wbdisk's memory until a flush), so killing wbdisk loses exactly
+       what a real disk's volatile cache would. The image check then
+       requires `PWRA` in all of 6000-6015, and in 6100-6115 each block's
+       old (`SEED`) or new (`PWRB`) contents, nothing else.
+       Since the run ends with the cut, the VM never reports a result:
+       `check.sh` judges from the serial log (both pre-runs passed, the
+       host reached the power-loss marker without failing, the director
+       cut the power) and from the image. If the run fails before the cut,
+       the power-loss blocks are not expected (`image.py --no-power-loss`).
      - **device errors**: QEMU's `blkdebug` layer under the disk
        (`vm/run.sh --nvme-errors`, config written by `check.sh`) fails
        reads of block 3000 and writes to block 3100 with real I/O
@@ -131,6 +145,14 @@ tests/block/check.sh tests/block/modules/target/wasm32-unknown-unknown/release/b
 | `lenient` | `cheat`, but reads outside the disk return data | `block-accepted-invalid` at `read(32768, 1)` |
 | `partial` | `cheat`, but a write past the end keeps the block that fits before failing | `block-mismatch` at the re-read of block 32767: `BADW` instead of `DATA` |
 | `alloc-panic` | unwraps a failed DMA allocation in `start` | `alloc-fail`: a trap, not a readable error |
+
+Power loss was checked with the NVMe driver (with the device-error
+phases switched off, since it fails them; see Status): all 16 flushed
+blocks held `PWRA`, and 0 of 16 unflushed blocks survived the cut, as a
+volatile cache should lose them. A copy whose `flush` returns ok without
+sending the NVMe Flush left the disk with 0 flushes: 322 blocks wrong
+after the cut. image.py was also checked offline: 5 of 16 unflushed
+blocks kept passes; one byte changed in an unflushed block fails.
 
 `cheat` also pretends blocks 3000 and 3100 are bad, so the
 device-errors phase cannot catch it either: it stays the control that

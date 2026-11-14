@@ -79,7 +79,7 @@ printf 'BLOCK step=identify-nonsense result=%s expected="%s" got="%s"\n' "$ident
 {
 	/bin/grind-host --device "$BDF" --module "$MODULE" --timeout-ms 15000 \
 		--exercise-block --expect-block-size "$BLOCK_SIZE" --expect-blocks "$BLOCKS" --fault-seed "$SEED" \
-		--block-device-errors 2>&1
+		--block-device-errors --block-power-loss 2>&1
 	echo "$?" >/tmp/host.rc
 } | tee /tmp/host.out | awk '{ print "    " $0; fflush() }'
 rc="$(cat /tmp/host.rc)"

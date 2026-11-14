@@ -3,7 +3,7 @@
 it after the VM has powered off.
 
     image.py seed  IMAGE BLOCKS BLOCK_SIZE
-    image.py check IMAGE BLOCKS BLOCK_SIZE
+    image.py check IMAGE BLOCKS BLOCK_SIZE [--no-power-loss]
 
 Patterns, in 16-byte records: record r of block lba is the 4-byte tag
 (b"SEED", b"DATA", b"RCVR" for the recovery checks' blocks, or b"BADW" for
@@ -30,6 +30,12 @@ LONG_BLOCKS = 256
 # Recovery checks write the RCVR pattern here (host/src/block.rs).
 RECOVERY_LBA = 2000
 RECOVERY_BLOCKS = 8
+# The power-loss phase: written and flushed before the cut (must be PWRA),
+# and written after the flush (each block SEED or PWRB: a power cut may
+# keep or lose an unflushed write, but never mangle it).
+POWER_FLUSHED_LBA = 6000
+POWER_UNFLUSHED_LBA = 6100
+POWER_BLOCKS = 16
 
 
 def block(tag, lba, size):
@@ -51,14 +57,22 @@ def seed(path, blocks, size):
             f.write(block(b"SEED", lba, size))
 
 
-def check(path, blocks, size):
+def check(path, blocks, size, power_loss=True):
     data = written(blocks)
     rcvr = recovery()
+    # --no-power-loss: the run never reached the power cut, so those blocks
+    # were never written and must still hold the seed.
+    flushed = set(range(POWER_FLUSHED_LBA, POWER_FLUSHED_LBA + POWER_BLOCKS)) if power_loss else set()
+    unflushed = set(range(POWER_UNFLUSHED_LBA, POWER_UNFLUSHED_LBA + POWER_BLOCKS)) if power_loss else set()
+    kept_unflushed = 0
     expected = (
         f"{len(data)} written blocks hold the DATA pattern (0, {blocks - 1}, "
         f"{RUN_LBA}-{RUN_LBA + RUN_BLOCKS - 1}, {LONG_LBA}-{LONG_LBA + LONG_BLOCKS - 1}); "
         f"{len(rcvr)} recovery blocks ({RECOVERY_LBA}-{RECOVERY_LBA + RECOVERY_BLOCKS - 1}) hold RCVR; "
-        f"the other {blocks - len(data) - len(rcvr)} hold the SEED pattern"
+        + (f"{POWER_BLOCKS} blocks flushed before the power cut ({POWER_FLUSHED_LBA}-) hold PWRA; "
+           f"{POWER_BLOCKS} written after it ({POWER_UNFLUSHED_LBA}-) hold SEED or PWRB; "
+           if power_loss else "no power cut (the run ended before it); ")
+        + f"the other {blocks - len(data) - len(rcvr) - len(flushed) - len(unflushed)} hold the SEED pattern"
     )
     bad = []
     with open(path, "rb") as f:
@@ -67,16 +81,27 @@ def check(path, blocks, size):
         got = f"image is {len(image)} bytes, expected {blocks * size}"
     else:
         for lba in range(blocks):
-            tag = b"RCVR" if lba in rcvr else b"DATA" if lba in data else b"SEED"
             have = image[lba * size:(lba + 1) * size]
+            if lba in unflushed:
+                if have == block(b"PWRB", lba, size):
+                    kept_unflushed += 1
+                    continue
+                if have == block(b"SEED", lba, size):
+                    continue
+                bad.append(f"block {lba} (written after the flush): neither its old nor its new contents, first record {have[:16].hex()}")
+                continue
+            tag = b"RCVR" if lba in rcvr else b"DATA" if lba in data else b"PWRA" if lba in flushed else b"SEED"
             if have != block(tag, lba, size):
                 what = "seed still there" if have == block(b"SEED", lba, size) else \
                     "data pattern" if have == block(b"DATA", lba, size) else \
                     "BADW: a write that had to fail reached the disk" if have[:4] == b"BADW" else \
                     f"other bytes, first record {have[:16].hex()}"
-                role = 'recovery' if lba in rcvr else 'written' if lba in data else 'untouched'
+                role = 'recovery' if lba in rcvr else 'written' if lba in data else \
+                    'flushed before the power cut' if lba in flushed else 'untouched'
                 bad.append(f"block {lba} ({role}): {what}")
-        got = "all blocks as expected" if not bad else \
+        got = ((f"all blocks as expected ({kept_unflushed} of {POWER_BLOCKS} unflushed blocks survived the power cut)"
+                if power_loss else "all blocks as expected") if not bad else None)
+        got = got or \
             f"{len(bad)} blocks wrong; first: " + "; ".join(bad[:5])
     result = "pass" if not bad and len(image) == blocks * size else "fail"
     print(f'BLOCK step=image result={result} expected="{expected}" got="{got}"')
@@ -84,14 +109,16 @@ def check(path, blocks, size):
 
 
 def main():
-    if len(sys.argv) != 5 or sys.argv[1] not in ("seed", "check"):
+    no_power_loss = "--no-power-loss" in sys.argv
+    argv = [a for a in sys.argv if a != "--no-power-loss"]
+    if len(argv) != 5 or argv[1] not in ("seed", "check"):
         print(__doc__, file=sys.stderr)
         return 2
-    path, blocks, size = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-    if sys.argv[1] == "seed":
+    path, blocks, size = argv[2], int(argv[3]), int(argv[4])
+    if argv[1] == "seed":
         seed(path, blocks, size)
         return 0
-    return 0 if check(path, blocks, size) else 1
+    return 0 if check(path, blocks, size, power_loss=not no_power_loss) else 1
 
 
 if __name__ == "__main__":

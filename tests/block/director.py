@@ -9,7 +9,12 @@ VM through QEMU's monitor (QMP) at those moments:
 
 - `{"event":"block-phase","phase":"slow-device"}`: throttle the NVMe disk
   to 1 I/O per second (`block_set_io_throttle` on drive `nvm`);
-- `{"event":"block-phase-end","phase":"slow-device"}`: lift the throttle.
+- `{"event":"block-phase-end","phase":"slow-device"}`: lift the throttle;
+- `{"event":"block-phase","phase":"power-loss"}`: cut the power: kill the
+  write-back disk (wbdisk, whose PID is WBDISK_PID) with SIGKILL, losing
+  every write since the last flush, then stop QEMU (QMP `quit`).
+
+    director.py LOG QMP_SOCKET [WBDISK_PID]
 
 Prints `BLOCK director ...` lines saying what it did and when. Runs until
 killed (tests/block/check.sh kills it when the VM is done).
@@ -17,6 +22,7 @@ killed (tests/block/check.sh kills it when the VM is done).
 
 import json
 import os
+import signal
 import socket
 import sys
 import time
@@ -78,10 +84,11 @@ def follow(path):
 
 
 def main(argv):
-    if len(argv) != 3:
+    if len(argv) not in (3, 4):
         print(__doc__, file=sys.stderr)
         return 2
     log, qmp_path = argv[1], argv[2]
+    wbdisk = int(argv[3]) if len(argv) == 4 else None
     qmp = None
     for line in follow(log):
         if '"event":"block-phase"' in line and '"phase":"slow-device"' in line:
@@ -91,6 +98,22 @@ def main(argv):
                 say(f"throttled the disk to {THROTTLE_IOPS} I/O per second")
             except Exception as e:  # report, never hide (rule 3)
                 say(f"FAILED to throttle the disk: {e}")
+        elif '"event":"block-phase"' in line and '"phase":"power-loss"' in line:
+            if wbdisk is None:
+                say("FAILED to cut the power: no write-back disk PID given")
+                continue
+            try:
+                os.kill(wbdisk, signal.SIGKILL)
+                say(f"cut the power: killed the write-back disk (pid {wbdisk})")
+            except Exception as e:
+                say(f"FAILED to kill the write-back disk: {e}")
+            try:
+                qmp = qmp or Qmp(qmp_path)
+                qmp.command("quit")
+            except Exception:
+                pass  # QEMU closes the monitor as it quits
+            say("stopped QEMU")
+            return 0
         elif '"event":"block-phase-end"' in line and '"phase":"slow-device"' in line:
             try:
                 qmp = qmp or Qmp(qmp_path)

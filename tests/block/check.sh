@@ -41,6 +41,8 @@ shift
 RUSTFLAGS="-C target-feature=+crt-static" \
 	cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" -p grind-host --target "$TARGET" ||
 	fail build-host "cargo build -p grind-host succeeds" "exit $?"
+cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" -p wbdisk ||
+	fail build-wbdisk "cargo build -p wbdisk succeeds" "exit $?"
 
 mkdir -p "$WORK"
 rm -f "$IMAGE"
@@ -80,34 +82,85 @@ sector = "3200"
 once = "on"
 EOF
 
+# Sockets go in a short temporary directory (a Unix socket path must be
+# under 108 bytes): QEMU's monitor, and the write-back disk.
+SOCKS="$(mktemp -d /tmp/grind-block.XXXXXX)"
+QMP="$SOCKS/qmp.sock"
+NBD="$SOCKS/nbd.sock"
+
+# The write-back disk (wbdisk) serves the image to QEMU over NBD, keeping
+# writes in memory until a flush, so the power-loss phase loses exactly
+# what a real disk's volatile cache would.
+WBDISK_BIN="$ROOT/target/release/wbdisk"
+"$WBDISK_BIN" "$IMAGE" "$NBD" 2>"$WORK/wbdisk.log" &
+wbdisk=$!
+for _ in $(seq 50); do [ -S "$NBD" ] && break; sleep 0.1; done
+[ -S "$NBD" ] || fail wbdisk "wbdisk listens on $NBD within 5 s" "$(cat "$WORK/wbdisk.log")"
+
 # The director (director.py) follows the serial log for the host's phase
 # markers and acts through QEMU's monitor: it throttles the disk during the
-# slow-device phase. The old log is removed first, so it never acts on a
-# previous run's markers. The monitor socket is in a short temporary
-# directory (a Unix socket path must be under 108 bytes).
+# slow-device phase and cuts the power at the power-loss marker (killing
+# wbdisk, then stopping QEMU). The old log is removed first, so it never
+# acts on a previous run's markers.
 SERIAL="$ROOT/vm/build/serial.log"
-QMP_DIR="$(mktemp -d /tmp/grind-qmp.XXXXXX)"
-QMP="$QMP_DIR/qmp.sock"
 rm -f "$SERIAL"
-python3 -I "$ROOT/tests/block/director.py" "$SERIAL" "$QMP" >"$WORK/director.log" 2>&1 &
+python3 -I "$ROOT/tests/block/director.py" "$SERIAL" "$QMP" "$wbdisk" >"$WORK/director.log" 2>&1 &
 director=$!
-trap 'kill "$director" 2>/dev/null || true; rm -rf "$QMP_DIR"' EXIT
+trap 'kill "$director" "$wbdisk" 2>/dev/null || true; rm -rf "$SOCKS"' EXIT
 
 set +e
-"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --nvme-errors "$ERRORS" --seed "$SEED" --qmp "$QMP" --run /tests/block/guest.sh --timeout 180 "$@"
+"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --nvme-nbd "$NBD" --nvme-errors "$ERRORS" --seed "$SEED" \
+	--qmp "$QMP" --run /tests/block/guest.sh --timeout 180 "$@"
 vm_status=$?
-kill "$director" 2>/dev/null
+kill "$director" "$wbdisk" 2>/dev/null
+wait "$wbdisk" 2>/dev/null
 echo
 cat "$WORK/director.log"
-python3 -I "$ROOT/tests/block/image.py" check "$IMAGE" "$BLOCKS" "$BLOCK_SIZE"
+echo "write-back disk (log: $WORK/wbdisk.log): $(grep -c 'flush wrote' "$WORK/wbdisk.log") flushes"
+
+# The run ends with the power cut, so the VM never reports a result and
+# run.sh's exit status is not the verdict. Judge from the serial log (lines
+# matched anywhere, not at the start: a kernel message can share a line):
+# both pre-runs passed, the host reached the power-loss marker without
+# failing first, and the director cut the power there.
+log() { tr -d '\r' <"$SERIAL"; }
+host_ok=1
+for step in alloc-fail identify-nonsense; do
+	if ! log | grep -aqE "BLOCK step=$step result=pass"; then
+		host_ok=0
+		printf 'BLOCK step=%s result=fail expected="%s" got="%s"\n' "$step" "the $step pre-run passes" \
+			"$(log | grep -aoE "BLOCK step=$step .*" | head -n 1 | cut -c1-200)"
+	fi
+done
+if log | grep -aqE 'BLOCK step=host '; then
+	# The host finished on its own: it failed before the power cut.
+	host_ok=0
+	log | grep -aoE 'BLOCK step=host .*' | head -n 1
+elif ! log | grep -aqF '"event":"block-phase","phase":"power-loss"'; then
+	host_ok=0
+	printf 'BLOCK step=host result=fail expected="%s" got="%s"\n' "the host reaches the power-loss phase" \
+		"no power-loss marker; vm exit $vm_status (log: $SERIAL)"
+elif ! grep -qF 'cut the power' "$WORK/director.log"; then
+	host_ok=0
+	printf 'BLOCK step=host result=fail expected="%s" got="%s"\n' "the director cuts the power at the marker" \
+		"$(tr '\n' ' ' <"$WORK/director.log")"
+else
+	printf 'BLOCK step=host result=pass expected="%s" got="%s"\n' \
+		"every phase passes, up to the power cut" "power cut at the power-loss marker"
+fi
+
+# Without the power cut, the power-loss blocks were never written.
+cut=""
+grep -qF 'cut the power' "$WORK/director.log" || cut=--no-power-loss
+python3 -I "$ROOT/tests/block/image.py" check "$IMAGE" "$BLOCKS" "$BLOCK_SIZE" $cut
 image_status=$?
 set -e
 
-if [ "$vm_status" -eq 0 ] && [ "$image_status" -eq 0 ]; then
+if [ "$host_ok" -eq 1 ] && [ "$image_status" -eq 0 ]; then
 	echo "BLOCK result=pass"
 	exit 0
 fi
 printf 'BLOCK step=summary result=fail expected="%s" got="%s"\n' \
-	"VM run exits 0 and the image check passes" "vm exit $vm_status, image check exit $image_status"
+	"every phase passes up to the power cut, and the image check passes" "host $([ "$host_ok" -eq 1 ] && echo pass || echo fail), image check exit $image_status"
 echo "BLOCK result=fail"
 exit 1

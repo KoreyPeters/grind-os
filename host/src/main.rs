@@ -169,6 +169,7 @@ fn parse_args() -> Result<Args, String> {
     let mut fault_identify = false;
     let mut exercise = false;
     let mut device_errors = false;
+    let mut power_loss = false;
     let mut block_size = None;
     let mut blocks = None;
     let mut serve = Duration::from_secs(10);
@@ -202,6 +203,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--exercise-block" => exercise = true,
             "--block-device-errors" => device_errors = true,
+            "--block-power-loss" => power_loss = true,
             "--expect-block-size" => {
                 let v = value("--expect-block-size")?;
                 block_size = Some(
@@ -265,6 +267,7 @@ fn parse_args() -> Result<Args, String> {
                 block_size,
                 blocks,
                 device_errors,
+                power_loss,
             }),
             _ => {
                 return Err(
