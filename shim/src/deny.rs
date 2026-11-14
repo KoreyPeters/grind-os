@@ -166,14 +166,40 @@ fn find(lists: &[&'static DenyList], vendor: u16, device: u16) -> Option<&'stati
 #[derive(Debug, PartialEq)]
 pub struct Refusal {
     pub expected: String,
-    pub got: &'static str,
+    pub got: String,
+}
+
+/// Where the machine's DMI system vendor is read from.
+pub const DMI_SYS_VENDOR: &str = "/sys/class/dmi/id/sys_vendor";
+
+/// DMI system vendors that identify an emulator. Only under one of these
+/// is an unreviewed list honoured. QEMU's q35 machine reports "QEMU".
+const EMULATOR_SYS_VENDORS: &[&str] = &["QEMU"];
+
+/// The machine's DMI system vendor, trimmed, if it can be read.
+pub fn sys_vendor() -> Option<String> {
+    std::fs::read_to_string(DMI_SYS_VENDOR)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Rule 10's gate: the device's deny list, if the device may be opened.
-/// A device with no list is refused. A list the human has not reviewed is
-/// refused unless `allow_unreviewed` (emulated devices only).
-pub fn admit(vendor: u16, device: u16, allow_unreviewed: bool) -> Result<&'static DenyList, Refusal> {
-    gate(ALL, vendor, device, allow_unreviewed)
+///
+/// - A device with no list is refused.
+/// - A reviewed list is admitted.
+/// - An unreviewed list is refused unless `allow_unreviewed` is set *and*
+///   the DMI system vendor (`sys_vendor`) names an emulator. The flag alone
+///   is not enough: on real hardware it is refused.
+///
+/// Limit: DMI identifies the machine, not the device. A real device passed
+/// through to a QEMU guest would pass this check.
+pub fn admit(
+    vendor: u16,
+    device: u16,
+    allow_unreviewed: bool,
+    sys_vendor: Option<&str>,
+) -> Result<&'static DenyList, Refusal> {
+    gate(ALL, vendor, device, allow_unreviewed, sys_vendor)
 }
 
 fn gate(
@@ -181,18 +207,36 @@ fn gate(
     vendor: u16,
     device: u16,
     allow_unreviewed: bool,
+    sys_vendor: Option<&str>,
 ) -> Result<&'static DenyList, Refusal> {
     let list = find(lists, vendor, device).ok_or_else(|| Refusal {
         expected: format!("a deny list for {vendor:04x}:{device:04x}"),
-        got: "none; the shim refuses devices without one (rule 10)",
+        got: "none; the shim refuses devices without one (rule 10)".into(),
     })?;
-    if !list.reviewed && !allow_unreviewed {
+    if list.reviewed {
+        return Ok(list);
+    }
+    if !allow_unreviewed {
         return Err(Refusal {
             expected: format!("a human-reviewed deny list for {}", list.model),
-            got: "the list is not reviewed yet (rule 10); allowed only for emulated devices",
+            got: "the list is not reviewed yet (rule 10); allowed only for emulated devices".into(),
         });
     }
-    Ok(list)
+    match sys_vendor.map(str::trim) {
+        Some(v) if EMULATOR_SYS_VENDORS.contains(&v) => Ok(list),
+        other => Err(Refusal {
+            expected: format!(
+                "an emulator (DMI sys_vendor one of {}) before honouring \
+                 --allow-unreviewed-deny-list for {}",
+                EMULATOR_SYS_VENDORS.join(", "),
+                list.model
+            ),
+            got: match other {
+                Some(v) => format!("DMI sys_vendor {v:?}: not an emulator; the unreviewed list is refused (rule 10)"),
+                None => format!("{DMI_SYS_VENDOR} unreadable; the unreviewed list is refused (rule 10)"),
+            },
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -296,25 +340,49 @@ mod tests {
     };
     static GATE_LISTS: &[&DenyList] = &[&UNREVIEWED, &REVIEWED];
 
+    const QEMU: Option<&str> = Some("QEMU");
+    const DELL: Option<&str> = Some("Dell Inc.");
+
     #[test]
     fn gate_refuses_devices_without_a_list() {
         for allow in [false, true] {
-            let r = gate(GATE_LISTS, 0xfffe, 0x0003, allow).unwrap_err();
-            assert!(r.expected.contains("fffe:0003"), "{r:?}");
+            for sv in [QEMU, DELL, None] {
+                let r = gate(GATE_LISTS, 0xfffe, 0x0003, allow, sv).unwrap_err();
+                assert!(r.expected.contains("fffe:0003"), "{r:?}");
+            }
         }
     }
 
     #[test]
-    fn gate_refuses_unreviewed_lists_unless_allowed() {
-        let r = gate(GATE_LISTS, 0xfffe, 0x0001, false).unwrap_err();
-        assert!(r.got.contains("not reviewed"), "{r:?}");
-        assert_eq!(gate(GATE_LISTS, 0xfffe, 0x0001, true).unwrap().model, "test unreviewed");
+    fn gate_refuses_unreviewed_lists_without_the_flag() {
+        for sv in [QEMU, DELL, None] {
+            let r = gate(GATE_LISTS, 0xfffe, 0x0001, false, sv).unwrap_err();
+            assert!(r.got.contains("not reviewed"), "{r:?}");
+        }
     }
 
     #[test]
-    fn gate_admits_reviewed_lists() {
+    fn gate_honours_the_flag_only_under_an_emulator() {
+        assert_eq!(gate(GATE_LISTS, 0xfffe, 0x0001, true, QEMU).unwrap().model, "test unreviewed");
+        // sysfs values end in a newline.
+        assert!(gate(GATE_LISTS, 0xfffe, 0x0001, true, Some("QEMU\n")).is_ok());
+
+        let r = gate(GATE_LISTS, 0xfffe, 0x0001, true, DELL).unwrap_err();
+        assert!(r.got.contains("\"Dell Inc.\"") && r.got.contains("not an emulator"), "{r:?}");
+        let r = gate(GATE_LISTS, 0xfffe, 0x0001, true, None).unwrap_err();
+        assert!(r.got.contains("unreadable"), "{r:?}");
+        // Exact match only: no prefixes, no case folding.
+        for sv in ["qemu", "QEMU-ish", "", "Standard PC (Q35 + ICH9, 2009)"] {
+            assert!(gate(GATE_LISTS, 0xfffe, 0x0001, true, Some(sv)).is_err(), "{sv:?}");
+        }
+    }
+
+    #[test]
+    fn gate_admits_reviewed_lists_anywhere() {
         for allow in [false, true] {
-            assert_eq!(gate(GATE_LISTS, 0xfffe, 0x0002, allow).unwrap().model, "test reviewed");
+            for sv in [QEMU, DELL, None] {
+                assert_eq!(gate(GATE_LISTS, 0xfffe, 0x0002, allow, sv).unwrap().model, "test reviewed");
+            }
         }
     }
 

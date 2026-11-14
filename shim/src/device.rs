@@ -85,7 +85,8 @@ impl Device {
     /// already be bound to vfio-pci.
     ///
     /// Refuses devices with no deny list, and devices whose deny list has not
-    /// been reviewed unless `allow_unreviewed` (for emulated devices only).
+    /// been reviewed unless `allow_unreviewed` is set and the machine's DMI
+    /// system vendor names an emulator (see `deny::admit`).
     /// DMA allocations are limited to `dma_limit` bytes in total.
     pub fn open(bdf: &str, allow_unreviewed: bool, dma_limit: u64) -> Result<Device, OpenError> {
         let sys = format!("/sys/bus/pci/devices/{bdf}");
@@ -93,7 +94,8 @@ impl Device {
         let device_id = sysfs_hex(&format!("{sys}/device"))?;
 
         // Rule 10: no reviewed deny list, no access.
-        let deny = deny::admit(vendor, device_id, allow_unreviewed)
+        let sys_vendor = deny::sys_vendor();
+        let deny = deny::admit(vendor, device_id, allow_unreviewed, sys_vendor.as_deref())
             .map_err(|r| fail("deny-list", r.expected, r.got))?;
 
         // Container and group.
@@ -211,6 +213,10 @@ impl Device {
                 ("bar0_size", Value::Hex(bar0.size)),
                 ("deny_entries", Value::U64(deny.entries.len() as u64)),
                 ("deny_reviewed", Value::Bool(deny.reviewed)),
+                (
+                    "dmi_sys_vendor",
+                    Value::Str(sys_vendor.as_deref().unwrap_or("unreadable")),
+                ),
                 ("dma_limit", Value::Hex(dma_limit)),
             ],
         );

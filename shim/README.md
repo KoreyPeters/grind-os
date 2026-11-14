@@ -25,8 +25,15 @@ No crate dependencies. `unsafe` is limited to the ioctl wrappers in
 
 `src/deny.rs` holds one list per supported device model. A device with no
 list cannot be opened. A list that is not yet human-reviewed is refused
-unless the caller passes `allow_unreviewed`, which is meant for emulated
-devices only (`grind-host --allow-unreviewed-deny-list`).
+unless the caller passes `allow_unreviewed`
+(`grind-host --allow-unreviewed-deny-list`) *and* the machine is an
+emulator: `/sys/class/dmi/id/sys_vendor` must read exactly `QEMU`. On real
+hardware the flag is refused, and the refusal names the vendor it found.
+`device-open` logs the value as `dmi_sys_vendor`.
+
+Limit: DMI describes the machine, not the device. A real device passed
+through to a QEMU guest would pass this check, so a reviewed list is still
+required before passing real hardware through.
 
 Writes are the only thing filtered: reads are allowed everywhere in BAR0.
 Every entry must cite the datasheet section it comes from.

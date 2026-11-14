@@ -73,6 +73,11 @@ fi
 printf 'PORTALS step=deny-list-gate result=%s expected="%s" got="%s"\n' "$result" \
 	"$(clean "$expected")" "$(clean "$got")"
 
+# The shim reads the DMI system vendor that gates --allow-unreviewed-deny-list
+# (rule 10). In the test VM it must be QEMU. The refusal on real hardware is
+# unit-tested in shim/src/deny.rs; it cannot be reached here because the VM
+# is an emulator and its only device has a reviewed list.
+run_case emulator-detected 0 '"dmi_sys_vendor":"QEMU"' read-status $EMU
 run_case denied-write 1 '"event":"mmio-denied","attempted":"write32","offset":"0x102c"' denied-write $EMU
 
 exit "$failed"

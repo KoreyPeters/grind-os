@@ -9,7 +9,7 @@ grind-host --device <pci-address> --module <driver.wasm>
            [--timeout-ms N]           default 10000
            [--dma-limit-mib N]        default 64
            [--trace]                  log every register access and DMA allocation
-           [--allow-unreviewed-deny-list]   emulated devices only (rule 10)
+           [--allow-unreviewed-deny-list]   emulators only: refused unless DMI sys_vendor is QEMU (rule 10)
            [--serve-ping <ipv4>]      NIC drivers: answer ARP and ping (world nic)
            [--serve-ms N]             how long to serve, default 10000
 ```
