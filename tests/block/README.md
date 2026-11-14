@@ -162,8 +162,8 @@ tests/block/check.sh tests/block/modules/target/wasm32-unknown-unknown/release/b
 | `partial` | `cheat`, but a write past the end keeps the block that fits before failing | `block-mismatch` at the re-read of block 32767: `BADW` instead of `DATA` |
 | `alloc-panic` | unwraps a failed DMA allocation in `start` | `alloc-fail`: a trap, not a readable error |
 
-Power loss was checked with the NVMe driver (with the device-error
-phases switched off, since it fails them; see Status): all 16 flushed
+Power loss was checked with the NVMe driver (as first written, with
+the device-error phases switched off, since it failed them; see Status): all 16 flushed
 blocks held `PWRA`, and 0 of 16 unflushed blocks survived the cut, as a
 volatile cache should lose them. A copy whose `flush` returns ok without
 sending the NVMe Flush left the disk with 0 flushes: 322 blocks wrong
@@ -174,16 +174,12 @@ blocks kept passes; one byte changed in an unflushed block fails.
 device-errors phase cannot catch it either: it stays the control that
 only the image check can catch.
 
-**Status (2026-11-14):** the NVMe driver refuses impossible Identify
-data, survives completion nonsense (937 corrupted completions, no wrong
-answers) and the device going away, and gives readable errors for the
-bad blocks and for reads of the throttled disk. It fails two items:
-it does not retry the transient error, and after the slow-device phase
-the completions of commands it gave up on arrive late and it rejects
-the next command ("expected one 16-byte completion, got 4") instead of
-discarding them
-(`block-transient-not-retried`). It will be reground against the full
-test (docs/design/robust-block.md, step 6).
+**Status (2026-11-14):** the NVMe driver as first written failed two
+items: it did not retry the transient error, and after the slow-device
+phase it took the late completions of commands it had given up on for
+the next command's. Reground against the full test
+(docs/design/robust-block.md, step 6), it passes every phase; the
+mutation score (`harness/mutants.sh nvme`) rose from 3/8 to 9/20.
 
 `cheat`, `lenient` and `partial` share `modules/cheat-common/cheat.rs`.
 `cheat` shows that the image check is independent of anything that ran

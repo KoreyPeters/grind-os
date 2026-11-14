@@ -97,3 +97,9 @@ drivers did, a fresh session regrinds it, recording each failing run.
    4. the throttle window;
    5. the power-loss phase;
    6. the mutation score, then regrinding the NVMe driver.
+
+**Done 2026-11-14.** All six steps are in. The reground NVMe driver
+passes; the mutation score rose from 3/8 to 9/20, and the survivors
+change only logging, polling pauses or limits QEMU never reaches, apart
+from two small gaps (the queue counts the device grants and the I/O
+queue size).
