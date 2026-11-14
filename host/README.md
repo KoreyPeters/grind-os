@@ -12,6 +12,8 @@ grind-host --device <pci-address> --module <driver.wasm>
            [--allow-unreviewed-deny-list]   emulators only: refused unless DMI sys_vendor is QEMU (rule 10)
            [--serve-ping <ipv4>]      NIC drivers: answer ARP and ping (world nic)
            [--serve-ms N]             how long to serve, default 10000
+           [--exercise-block --expect-block-size N --expect-blocks N]
+                                      block drivers: read, write, flush, read back (world block-driver)
 ```
 
 1. **Module checks, before the device is touched.** The module must be a core
@@ -38,7 +40,16 @@ grind-host --device <pci-address> --module <driver.wasm>
    Serving ends in a pass if nothing failed. Whether the pings were
    actually answered on the wire is for the test's peer to judge
    (`tests/nic`).
-5. **Teardown.** The host calls `Device::quiesce` to turn bus mastering
+5. **Exercise** (only with `--exercise-block`). The device must take NVMe
+   commands and the driver must target world `block-driver`. The host
+   checks `block-size` and `capacity` against the expected values, then
+   reads the first block, the last block and a 40-block run and compares
+   them with the seed pattern, writes the data pattern there, flushes, and
+   reads it back (`src/block.rs`). Each call has 1 s. A wrong answer is
+   `block-mismatch` (or `block-geometry`), logged with the first bad byte.
+   Whether the data really reached the disk is for the test to judge from
+   the image (`tests/block`).
+6. **Teardown.** The host calls `Device::quiesce` to turn bus mastering
    off, and only then drops the driver's DMA buffers (unmapping them).
 
 Output is JSON lines on stdout. The last line is always
@@ -48,7 +59,7 @@ Wasm backtrace with function names.
 | Exit | Meaning |
 | --- | --- |
 | 0 | `start` returned ok, no denied write was attempted and no command was refused |
-| 1 | the driver failed (`driver-error`, `trap`, `timeout`, `link-down`, `deny-list-violation`, `command-refused`), or bus mastering could not be cleared at the end (`quiesce`) |
+| 1 | the driver failed (`driver-error`, `trap`, `timeout`, `link-down`, `block-geometry`, `block-mismatch`, `deny-list-violation`, `command-refused`), or bus mastering could not be cleared at the end (`quiesce`) |
 | 2 | the run could not start: arguments, module rejected, device not opened |
 
 Dependencies are pinned exactly: `wasmtime` 50.0.1 (no WASI, no default

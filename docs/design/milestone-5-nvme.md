@@ -219,10 +219,13 @@ An independent oracle, like `nic-peer`: the **disk image itself**.
    seed pattern (each block's bytes derived from its LBA).
 2. In the VM, `grind-host --exercise-block` calls the driver's exports:
    - block size and capacity match the image;
-   - reads of the first block, the last block and a 16-block run return the
+   - reads of the first block, the last block and a 40-block run return the
      seed exactly;
-   - writes of a new pattern to the first block, the last block and a
-     16-block run, then flush, then read back exactly.
+   - writes of a new pattern to the first block, the last block and the
+     40-block run, then flush, then read back exactly.
+
+   As built, the run is 40 blocks rather than 16: more than one command
+   can carry, so the driver must split it.
 3. After the VM powers off, `check.sh` reads the image file: the written
    ranges hold the new pattern, and **every other block still holds the
    seed**. This catches a driver that fakes reads from memory, misses the
@@ -243,8 +246,10 @@ Negative controls (each must fail, with a readable reason):
 | writes an SQ tail or CQ head doorbell directly | `mmio-denied` |
 | writes CC | `mmio-denied` |
 
-The portal-level controls are built in `tests/portals` (see its README);
-the block test adds the in-memory fake.
+The portal-level controls are built in `tests/portals` (see its README).
+The block test adds two: the in-memory `fake`, and a `cheat` that
+synthesizes the seed and keeps writes in memory, so every in-VM check
+passes and only the image check catches it (see `tests/block/README.md`).
 
 ## VM changes
 

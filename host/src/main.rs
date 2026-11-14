@@ -7,7 +7,13 @@
 //!            [--timeout-ms N] [--dma-limit-mib N] [--trace]
 //!            [--allow-unreviewed-deny-list]
 //!            [--serve-ping <ipv4> [--serve-ms N]]
+//!            [--exercise-block --expect-block-size N --expect-blocks N]
 //! ```
+//!
+//! With `--exercise-block`, the device must take NVMe commands and the
+//! module must target world `block-driver`. After `start` succeeds, the
+//! host reads, writes, flushes and reads back through the driver's `block`
+//! exports and checks every answer (see `block.rs`).
 //!
 //! The world depends on the device and the options. For an NVMe controller
 //! the module targets world `nvme-driver`, which adds the `nvme` portal;
@@ -36,6 +42,7 @@ use std::time::{Duration, Instant};
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
+mod block;
 mod net;
 
 /// World `driver`: the portals plus `start`.
@@ -82,6 +89,23 @@ mod nvme_world {
 use driver_world::grind::portals::{clock, dma, log, mmio};
 use driver_world::Driver;
 use nic_world::Nic;
+/// World `block-driver`: `nvme-driver` plus the `block` exports.
+mod block_world {
+    wasmtime::component::bindgen!({
+        path: "../portals/wit",
+        world: "block-driver",
+        imports: { default: trappable },
+        with: {
+            "grind:portals/mmio": crate::driver_world::grind::portals::mmio,
+            "grind:portals/dma": crate::driver_world::grind::portals::dma,
+            "grind:portals/clock": crate::driver_world::grind::portals::clock,
+            "grind:portals/log": crate::driver_world::grind::portals::log,
+            "grind:portals/nvme": crate::nvme_world::grind::portals::nvme,
+        },
+    });
+}
+
+use block_world::BlockDriver;
 use nvme_world::grind::portals::nvme;
 use nvme_world::NvmeDriver;
 use std::net::Ipv4Addr;
@@ -119,6 +143,8 @@ struct Args {
     trace: bool,
     allow_unreviewed: bool,
     serve_ping: Option<Ipv4Addr>,
+    /// `--exercise-block`, with the geometry the test expects.
+    exercise_block: Option<block::Expect>,
     serve: Duration,
 }
 
@@ -131,6 +157,9 @@ fn parse_args() -> Result<Args, String> {
     let mut trace = false;
     let mut allow_unreviewed = false;
     let mut serve_ping = None;
+    let mut exercise = false;
+    let mut block_size = None;
+    let mut blocks = None;
     let mut serve = Duration::from_secs(10);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -160,6 +189,21 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| format!("--serve-ping {v}: not an IPv4 address"))?,
                 );
             }
+            "--exercise-block" => exercise = true,
+            "--expect-block-size" => {
+                let v = value("--expect-block-size")?;
+                block_size = Some(
+                    v.parse::<u32>()
+                        .map_err(|_| format!("--expect-block-size {v}: not a number"))?,
+                );
+            }
+            "--expect-blocks" => {
+                let v = value("--expect-blocks")?;
+                blocks = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| format!("--expect-blocks {v}: not a number"))?,
+                );
+            }
             "--serve-ms" => {
                 let v = value("--serve-ms")?;
                 serve = Duration::from_millis(
@@ -179,6 +223,15 @@ fn parse_args() -> Result<Args, String> {
         allow_unreviewed,
         serve_ping,
         serve,
+        exercise_block: match (exercise, block_size, blocks) {
+            (false, None, None) => None,
+            (true, Some(block_size), Some(blocks)) => Some(block::Expect { block_size, blocks }),
+            _ => {
+                return Err(
+                    "--exercise-block, --expect-block-size and --expect-blocks go together".into(),
+                )
+            }
+        },
     })
 }
 
@@ -600,22 +653,32 @@ fn main() -> ExitCode {
     };
 
     // 3. Which world: the nvme portal exists only for a device that takes
-    //    commands, and such a device has no other world yet.
-    let world = match (device.takes_commands(), args.serve_ping.is_some()) {
-        (false, false) => World::Driver,
-        (false, true) => World::Nic,
-        (true, false) => World::NvmeDriver,
-        (true, true) => {
-            // Close the device first, so the result line stays last.
+    //    commands. Setup errors from here on close the device first, so the
+    //    result line stays last.
+    let commands = device.takes_commands();
+    let world = match (
+        commands,
+        args.serve_ping.is_some(),
+        args.exercise_block.is_some(),
+    ) {
+        (false, false, false) => World::Driver,
+        (false, true, false) => World::Nic,
+        (true, false, false) => World::NvmeDriver,
+        (true, false, true) => World::BlockDriver,
+        _ => {
             drop(device);
             return setup_error(
                 "world",
-                "--serve-ping only with a network device",
-                &format!("{} takes NVMe commands", args.device),
+                "--serve-ping only with a network device; --exercise-block only with a device that takes NVMe commands",
+                &format!(
+                    "{} {}",
+                    args.device,
+                    if commands { "takes NVMe commands" } else { "takes no commands" }
+                ),
             );
         }
     };
-    if imports_nvme(&bytes) && world != World::NvmeDriver {
+    if imports_nvme(&bytes) && !matches!(world, World::NvmeDriver | World::BlockDriver) {
         drop(device);
         return setup_error(
             "module-imports",
@@ -631,9 +694,13 @@ fn main() -> ExitCode {
     let mut linker: Linker<State> = Linker::new(&engine);
     let linked = match world {
         World::NvmeDriver => NvmeDriver::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s),
+        World::BlockDriver => {
+            BlockDriver::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
+        }
         _ => Driver::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s),
     };
     if let Err(e) = linked {
+        drop(device);
         return setup_error("linker", "portals added to the linker", &format!("{e:#}"));
     }
     let state = State {
@@ -662,10 +729,14 @@ fn main() -> ExitCode {
         World::NvmeDriver => {
             NvmeDriver::instantiate(&mut store, &component, &linker).map(Instance::NvmeDriver)
         }
+        World::BlockDriver => {
+            BlockDriver::instantiate(&mut store, &component, &linker).map(Instance::Block)
+        }
     };
     let instance = match instance {
         Ok(i) => i,
         Err(e) => {
+            drop(store);
             return setup_error(
                 "instantiate",
                 &format!(
@@ -690,6 +761,7 @@ fn main() -> ExitCode {
         Instance::Driver(d) => d.call_start(&mut store),
         Instance::Nic(n) => n.call_start(&mut store),
         Instance::NvmeDriver(n) => n.call_start(&mut store),
+        Instance::Block(b) => b.call_start(&mut store),
     };
     let failure: Option<&'static str> = match started {
         Err(e) => Some(call_failed("start", args.timeout, e)),
@@ -706,6 +778,10 @@ fn main() -> ExitCode {
         }
         Ok(Ok(())) => match (&instance, args.serve_ping) {
             (Instance::Nic(nic), Some(ip)) => serve(&mut store, nic, ip, args.serve).err(),
+            (Instance::Block(b), _) => {
+                let expect = args.exercise_block.as_ref().expect("world BlockDriver");
+                block::exercise(&mut store, b.grind_portals_block(), expect).err()
+            }
             _ => None,
         },
     };
@@ -740,6 +816,7 @@ enum Instance {
     Driver(Driver),
     Nic(Nic),
     NvmeDriver(NvmeDriver),
+    Block(BlockDriver),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -747,6 +824,7 @@ enum World {
     Driver,
     Nic,
     NvmeDriver,
+    BlockDriver,
 }
 
 impl World {
@@ -755,6 +833,7 @@ impl World {
             World::Driver => "driver",
             World::Nic => "nic",
             World::NvmeDriver => "nvme-driver",
+            World::BlockDriver => "block-driver",
         }
     }
 }

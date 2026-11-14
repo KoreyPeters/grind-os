@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""The block test's disk image: create it with the seed pattern, and check
+it after the VM has powered off.
+
+    image.py seed  IMAGE BLOCKS BLOCK_SIZE
+    image.py check IMAGE BLOCKS BLOCK_SIZE
+
+Patterns, in 16-byte records: record r of block lba is the 4-byte tag
+(b"SEED" or b"DATA"), lba as a little-endian u64, then r as a little-endian
+u32. This file computes them on its own, apart from grind-host's block.rs,
+so the image check does not trust anything that ran in the VM.
+
+`check` expects the data pattern in the blocks the host writes (the first
+block, the last block, and RUN_BLOCKS blocks from RUN_LBA) and the seed
+pattern in every other block. It prints
+    BLOCK step=image result=pass|fail expected="..." got="..."
+and exits 0 only on pass.
+"""
+
+import struct
+import sys
+
+RUN_LBA = 1000
+RUN_BLOCKS = 40
+
+
+def block(tag, lba, size):
+    return b"".join(tag + struct.pack("<QI", lba, r) for r in range(size // 16))
+
+
+def written(blocks):
+    return {0, blocks - 1} | set(range(RUN_LBA, RUN_LBA + RUN_BLOCKS))
+
+
+def seed(path, blocks, size):
+    with open(path, "wb") as f:
+        for lba in range(blocks):
+            f.write(block(b"SEED", lba, size))
+
+
+def check(path, blocks, size):
+    data = written(blocks)
+    expected = (
+        f"{len(data)} written blocks hold the DATA pattern (0, {blocks - 1}, "
+        f"{RUN_LBA}-{RUN_LBA + RUN_BLOCKS - 1}); the other {blocks - len(data)} hold the SEED pattern"
+    )
+    bad = []
+    with open(path, "rb") as f:
+        image = f.read()
+    if len(image) != blocks * size:
+        got = f"image is {len(image)} bytes, expected {blocks * size}"
+    else:
+        for lba in range(blocks):
+            tag = b"DATA" if lba in data else b"SEED"
+            have = image[lba * size:(lba + 1) * size]
+            if have != block(tag, lba, size):
+                what = "seed still there" if have == block(b"SEED", lba, size) else \
+                    "data pattern" if have == block(b"DATA", lba, size) else \
+                    f"other bytes, first record {have[:16].hex()}"
+                bad.append(f"block {lba} ({'written' if lba in data else 'untouched'}): {what}")
+        got = "all blocks as expected" if not bad else \
+            f"{len(bad)} blocks wrong; first: " + "; ".join(bad[:5])
+    result = "pass" if not bad and len(image) == blocks * size else "fail"
+    print(f'BLOCK step=image result={result} expected="{expected}" got="{got}"')
+    return result == "pass"
+
+
+def main():
+    if len(sys.argv) != 5 or sys.argv[1] not in ("seed", "check"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    path, blocks, size = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+    if sys.argv[1] == "seed":
+        seed(path, blocks, size)
+        return 0
+    return 0 if check(path, blocks, size) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
