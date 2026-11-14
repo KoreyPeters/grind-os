@@ -147,17 +147,23 @@ OWN | (EOR on last) | 2048, and `rx_next` advances.
 
 ## `start` sequence
 
-1. Probe: read TCR; `0xFFFFFFFF` means the device is not responding.
-   Check HWVERID is C+ (DS 6.8).
-2. Reset: CR = RST; poll CR until RST = 0 (DS 6.5).
+1. Probe: read TCR; all-ones on every one of 4 reads means the device is
+   not responding. Check HWVERID is C+ (DS 6.8).
+2. Reset: CR = RST; poll CR until RST = 0 (DS 6.5). A CR read of all-ones
+   does not count as "RST clear".
 3. Read MAC from IDR0-5 (DS 6); reject zero or multicast addresses.
-4. IMR = 0, ISR = 0xFFFF (DS 6.6, 6.7).
-5. Allocate and fill the rings: RX descriptors OWN with buffers; TX
-   descriptors all zero except EOR on the last (host-owned); a separate
-   all-zero high-priority ring.
+4. Allocate the five DMA buffers (RX ring, RX buffers, TX ring, TX
+   buffers, high-priority TX ring). These are the only allocations the
+   driver ever makes; if one fails, `start` returns the portal's error
+   naming the buffer, and the buffers already allocated are dropped.
+5. `program` (also used to rebuild the device, see "Robustness
+   contract"): IMR = 0, ISR = 0xFFFF (DS 6.6, 6.7); fill the rings: RX
+   descriptors OWN with buffers; TX descriptors all zero except EOR on the
+   last (host-owned); the all-zero high-priority ring; ring indexes to 0.
 6. C+CR = C+Tx | C+Rx | DAC (DS 6.33).
 7. CR = RE | TE (DS 6.5, 6.33 order).
 8. TNPDS, THPDS, RDSAR (DS 6, 6.34); TCR, RCR (DS 6.8, 6.9); MAR = 0.
+   Read CR, C+CR and RCR back.
 9. Wait (up to 5 s, **assumed**) for MSR.LINKB = 0 (DS 6.13). Log MSR,
    BMSR, BMCR, CR, C+CR, TCR, RCR.
 
@@ -177,3 +183,76 @@ in step 3.
   descriptors relies on EOR (9.2).
 - The C+ "programming guide" the datasheet refers to (9.1, 9.2) is not
   available; this spec is built without it.
+
+## Robustness contract (`portals/wit` `interface ethernet`, docs/design/robust-nic.md)
+
+Principles, from the contract and the host's fault injection
+(`host/src/faults.rs`, read for what the test does, not as a device
+fact): a single read of a register or of DMA memory the device writes is
+never trusted; one bad value must not leave the driver out of step with
+the device; the driver notices when the device has lost its
+configuration or stops making progress and rebuilds it itself; every
+wait is bounded.
+
+**Reading registers.** Every register the driver decides on (TCR at
+probe, CR during reset and health checks, C+CR, RCR, ISR, MSR) is read
+with up to 4 tries, and the first value that is not all-ones is taken.
+None of these registers is expected to read all-ones in normal
+operation: each has reserved bits (CR bits 7-5, DS 6.5; ISR bits 12-9,
+DS 6.7; TCR bit 31, DS 6.8; RCR bits 31-28, DS 6.9; MSR bit 5, DS 6.13),
+and C+CR bit 8 is "always 0" (DS 6.33). The datasheet does not say what
+reserved bits read; that they never all read 1 at once is **assumed**
+(observed: CR `0x0d`, ISR `0x0015` at most, TCR `0x77800700`, RCR
+`0x0000e40a`, MSR `0xd0`). All-ones on every try means "the device may be gone",
+never "every status bit is set". ISR bits are cleared (write 1, DS 6.7)
+only from a value that was not all-ones.
+
+**Reading device-written memory.** An RX descriptor (16 bytes), a TX
+descriptor's status dword and a received frame's bytes are each read
+until two reads agree (at most three). If no two agree, nothing is
+consumed and the next call reads again; a frame whose bytes never agree
+in 4 calls is dropped, with a warning, and its descriptor handed back.
+Only after an agreed read is a descriptor treated as done (OWN = 0,
+DS 9.2.1, 9.2.2). An agreed RX descriptor is then validated: the buffer
+address (dwords 2-3) must be the one the driver wrote, FS and LS set, RES
+clear, Frame_Length - 4 within 14-1514 (DS 9.2.2); anything else is
+logged and dropped, and lengths are never used to index before this
+check. Re-arming rewrites the whole descriptor (dwords 1-3, then dword 0
+with OWN), so a bad value cannot survive in the ring.
+
+**Staying in step with the RX ring.** The device fills descriptors in
+ring order from where it stopped (DS 9.2), so when the driver's next
+descriptor is still the device's, no other descriptor should be done.
+Every 20 ms while idle **(assumed interval)**, the driver reads the whole
+ring (agreed reads); if any descriptor is done, the two have fallen out
+of step (for example, a bad read once made the driver skip one), and the
+driver moves its index to the oldest done descriptor: the first, going
+forward from its own index, whose predecessor is not done. Logged as
+"RX ring out of step with the device; resynchronised".
+
+**Health check and rebuild.** At most every 200 ms **(assumed)**, at the
+start of `receive` and `transmit`, CR, C+CR and RCR are compared with
+what was written (RE and TE set, DS 6.5; C+Tx, C+Rx, DAC, DS 6.33; the
+RCR value, DS 6.9), and ISR error bits are logged (rate limited) and
+cleared. If the device answers but its configuration is lost, or it
+answers again after reading all-ones, the driver **rebuilds** it without
+the host calling `start`: software reset (DS 6.5: "resets the system
+buffer pointer to the initial value", so the device starts again at the
+first descriptor) and `program` again with the same DMA buffers. Frames
+in the rings are lost. Rebuilds are at most one per 500 ms
+**(assumed)**; meanwhile calls return an error saying a rebuild is
+pending.
+
+**Each contract item:**
+
+| Condition | How the driver meets it |
+| --- | --- |
+| Link goes down | `link-up` reads MSR.LINKB (DS 6.13) on every call, so it reports down on the first poll after the device does. `transmit` keeps queueing; if the device holds the descriptors, the ring fills and `transmit` returns "transmit ring full". No call waits for the link. |
+| Link comes back | Nothing in the driver depends on the link: rings and configuration are kept, and the device resumes on the next TPPoll (DS 6.32). Observed: frames flow on the first ping after the link returns. A transmit stall (descriptors still the device's for 1.5 s, **assumed**) triggers a rebuild. |
+| Receive overflow | Frames the device cannot place are lost by the device (RDU/FOVW, DS 6.7, logged and cleared). The driver keeps handing descriptors back as it consumes them, and the resync above catches any lost step, so reception continues as soon as the host polls again. |
+| Hostile frames | Only frames with FS, LS, RES clear and 14-1514 bytes after the FCS are returned (DS 9.2.2); the rest are dropped and their descriptors handed back whole, so later receives are unaffected. Frames to transmit outside 14-1514 bytes are refused with an error. |
+| Transmit ring full | `transmit` returns "transmit ring full: oldest pending descriptor N ... ms without progress" immediately, after writing TPPoll.NPQ again (DS 6.32). Never waits. |
+| Device reads all-ones | Registers: 4 tries, then all-ones is believed and treated as "device not responding": `receive` and `transmit` return an error saying so, `link-up` returns false, and the reset wait gives up after 100 ms. When the registers answer again, the device is rebuilt. Every wait in the driver has a deadline (reset 100 ms, link at `start` 5 s), and no loop runs more than 32 descriptors. |
+| Device writes nonsense into DMA memory | Agreed reads, then validation of status, length and buffer address before use; the frame's bytes are agreed too, so a changed byte is never handed up. Indexes come only from the driver's own counters, never from device memory. |
+| DMA allocation fails | `start` returns an error naming the buffer, its size and the portal error; buffers allocated so far are dropped. |
+| Over a run | No `unwrap` or indexing on device-supplied values (lengths are checked first; descriptors are read at fixed sizes); no allocation after `start` (a rebuild reuses the buffers); every error string names what was attempted, expected and got. Repeated warnings are rate limited (first 10 of each kind, then one in 500, each with its occurrence count). |

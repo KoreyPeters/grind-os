@@ -123,3 +123,96 @@ The bulk step was checked with a mutant of that driver whose ring wrap
 was 8192 + 16: it passed ARP and the three small pings and failed `bulk`
 at ping 8, where the ring first wraps, with its own log naming a bad
 receive header at ring offset 1356.
+
+## Robustness grind log (2026-11-14)
+
+Regrinding against the strengthened NIC test (robustness contract,
+`docs/design/robust-nic.md`). Sources used, in addition to those above:
+the same RTL8139C(L)+ datasheet (newly cited: 6.5 RST resets the buffer
+pointers, 6.6, 6.7 ISR bits including RDU and FOVW, 6.13 MSR reserved
+bits, 6.32 TPPoll, 6.33 C+CR bit 8, 9.2 fill order); and, as trusted
+project files read only, `portals/wit/portals.wit` (ethernet contract),
+`docs/design/robust-nic.md`, `tests/nic/README.md`, `host/README.md`,
+`host/src/faults.rs` (what the injected faults do) and `shim/README.md`
+(RTL8139 deny list). No other RTL8139 driver, no QEMU source, no web.
+
+The worktree's path is so long that the QMP socket path
+(`<root>/target/nic-test/qmp.sock`) exceeds the 108-byte Unix socket
+limit, so QEMU refuses to start (run 1). Runs 2-4 were made through a
+short symlink to the same worktree (`/tmp/rg8139`); no file in the
+repository was changed for this.
+
+### Run 1: `harness/runs/rtl8139/20261114T183954Z`: fail (environment)
+
+- Failing step: `arp`, "the VM powered off; no ARP reply after 1
+  requests". `output.log`: QEMU `-qmp unix:...qmp.sock ... is too long.
+  Path must be less than 108 bytes`.
+- Diagnosis: not the driver; the path length (above).
+- Change: none; ran through a short symlink. Local builds before: 0.
+
+### Run 2: `harness/runs/rtl8139/20261114T184434Z`: fail
+
+- Unchanged driver. Every phase passed up to `faults-device-data`; then
+  `recover-after-faults-device-data` failed: "first reply after 0 ms,
+  then ping 13 (seq 3413) failed: no reply" (host:
+  `peer-ended-early`). In this run the register window passed (1603 of
+  1603 pings answered), and so the README's "ISR read 0xffff" was a
+  symptom, not the cause: the driver logged ISR = 0xffff as every error
+  bit set and wrote those bits back, which did no harm in QEMU.
+- Diagnosis, from the driver's own log in the device-data window:
+  "dropped received frame, descriptor 25, status 0x6c000800, length
+  2048". 0x6c000800 is the armed command 0x80000800 (OWN, buffer size
+  2048) with its top byte changed by an injected fault: the device had
+  not filled descriptor 25, but one corrupted read made it look done.
+  The driver re-armed it and moved to 26. The device then filled 25
+  while the driver waited on 26: the two were permanently one slot out
+  of step, and each lap of the 32-slot ring the frame in the skipped
+  slot was lost (or handed up late). With one ping at a time, a lost
+  request is a failed recovery ping, here the 13th. Other single reads
+  were also trusted: corrupted RX buffers were handed up (the
+  host counted 40 `frame-malformed`, against 17 from the hostile phase
+  alone in the passing runs; those it logged in the window are ICMP
+  checksum failures), and TX status
+  reads showed impossible error bits (`0x70e20062`).
+- Change (driver redesign; see SPEC.md "Robustness contract"):
+  descriptors and frame bytes are used only when two reads agree;
+  registers are read up to 4 times before all-ones is believed; the RX
+  ring is scanned when idle and the index resynchronised to the oldest
+  done descriptor if the driver and device are out of step; a 200 ms
+  health check of CR, C+CR and RCR, with a rebuild (software reset and
+  reprogram, same buffers) if the configuration is lost, the device
+  comes back after reading all-ones, or TX makes no progress for 1.5 s;
+  RX descriptors re-armed whole and their buffer address checked;
+  repeated warnings rate limited. Local builds before run 3: 1 (clean).
+
+### Run 3: `harness/runs/rtl8139/20261114T184846Z`: pass
+
+- Every step passed, including all three fault windows (every ping
+  during the device-data and combined windows answered: 1168 of 1168,
+  452 of 452) and `final-bulk`. Host: 0 violations, 0 driver errors,
+  1480 device-data and 13 register faults injected, DMA 143360 bytes
+  from `start` to the end.
+- `frame-malformed`: 17, all before the first fault window (the
+  hostile frames); none from corrupted reads.
+- Driver log: 10 "RX descriptor reads disagree" (the agreed read caught
+  the corruption and retried), 8 "dropped received frame" (the
+  oversized hostile frames, 1519 and 1604 bytes with FCS), 2 ISR
+  warnings. No resync and no rebuild was needed: the agreed reads kept
+  the driver in step. Only 13 register faults hit, because registers
+  are now read only every 200 ms (and in `link-up`); so the all-ones and
+  rebuild paths were not exercised by this test run.
+- Local builds before: 0.
+
+### Run 4: `harness/runs/rtl8139/20261114T184945Z`: pass
+
+- Confirmation, same driver: same result (1484 device-data and 13
+  register faults, 0 driver errors, same driver warnings).
+
+### Observations of device behaviour (robustness runs)
+
+- During the bulk and flood phases ISR reads `0x0015` (ROK, RDU, TOK)
+  repeatedly even while descriptors are being handed back: RDU alone
+  is not a sign of a stall, so the driver only logs it.
+- During the three link flaps no rebuild was triggered: CR kept RE and
+  TE, C+CR and RCR kept their values, and TX descriptors kept
+  completing (no 1.5 s stall) with the link down.
