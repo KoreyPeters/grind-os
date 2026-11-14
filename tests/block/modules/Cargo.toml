@@ -4,7 +4,7 @@
 # controls: tests/block/check.sh must fail on each of them.
 [workspace]
 resolver = "2"
-members = ["fake", "cheat", "lenient", "partial"]
+members = ["fake", "cheat", "lenient", "partial", "alloc-panic"]
 
 [workspace.dependencies]
 wit-bindgen = "=0.63.0"

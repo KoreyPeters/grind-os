@@ -52,8 +52,13 @@ python3 -I "$ROOT/tests/block/image.py" seed "$IMAGE" "$BLOCKS" "$BLOCK_SIZE" ||
 	--add "$ROOT/tests/block/guest.sh=/tests/block/guest.sh" \
 	--add "$DRIVER=/drivers/driver.wasm"
 
+# The seed for the host's injected faults: random each run unless
+# BLOCK_FAULT_SEED is set, and printed so a failure can be replayed.
+SEED="${BLOCK_FAULT_SEED:-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')}"
+echo "BLOCK fault-seed=$SEED (replay with BLOCK_FAULT_SEED=$SEED)"
+
 set +e
-"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --run /tests/block/guest.sh --timeout 180 "$@"
+"$ROOT/vm/run.sh" --check --nvme "$IMAGE" --seed "$SEED" --run /tests/block/guest.sh --timeout 180 "$@"
 vm_status=$?
 echo
 python3 -I "$ROOT/tests/block/image.py" check "$IMAGE" "$BLOCKS" "$BLOCK_SIZE"

@@ -43,6 +43,19 @@ off, as `nic-peer` is for the NIC test.
 
    The runs are more than one command can carry (8 KiB, no PRP lists): the
    40-block run needs 3 commands, the 256-block run 16.
+   - **robustness** (`docs/design/robust-block.md`): hostile phases
+     follow, each ended by a **recovery check**: write the `RCVR`
+     pattern to blocks 2000-2007, flush, and read it back exactly
+     (`block-recovery`). A driver error during a hostile phase is
+     logged, not fatal; a failed recovery check fails the run. The
+     phases are being added one at a time; today the recovery check runs
+     once, after the baseline.
+
+   Before this run, `guest.sh` runs the driver once with its second DMA
+   allocation failing (`--fail-allocation 2`): `start` must return a
+   readable error, not trap or hang (`alloc-fail`). The run's fault seed
+   is random, printed as `BLOCK fault-seed=N (replay with
+   BLOCK_FAULT_SEED=N)`, and passed to the host.
 4. After the VM powers off, `image.py check` reads the image file: the 298
    written blocks must hold the data pattern and the other 32470 the seed.
    A refused write that reached the disk anyway shows up as `BADW` in
@@ -85,6 +98,7 @@ tests/block/check.sh tests/block/modules/target/wasm32-unknown-unknown/release/b
 | `cheat` | never touches the device but knows the test: synthesizes the seed, keeps writes in memory, follows the error contract | every check in the VM passes; **only the image check fails** (298 blocks: seed still there) |
 | `lenient` | `cheat`, but reads outside the disk return data | `block-accepted-invalid` at `read(32768, 1)` |
 | `partial` | `cheat`, but a write past the end keeps the block that fits before failing | `block-mismatch` at the re-read of block 32767: `BADW` instead of `DATA` |
+| `alloc-panic` | unwraps a failed DMA allocation in `start` | `alloc-fail`: a trap, not a readable error |
 
 `cheat`, `lenient` and `partial` share `modules/cheat-common/cheat.rs`.
 `cheat` shows that the image check is independent of anything that ran

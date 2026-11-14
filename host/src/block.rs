@@ -46,6 +46,11 @@ pub const LONG_LBA: u64 = 8192;
 pub const LONG_BLOCKS: u32 = 256;
 /// The block a short write must not touch.
 pub const SHORT_WRITE_LBA: u64 = 5;
+/// Recovery checks (after every hostile phase) write and read back the
+/// RCVR pattern here; the image check expects it at the end.
+pub const RCVR: &[u8; 4] = b"RCVR";
+pub const RECOVERY_LBA: u64 = 2000;
+pub const RECOVERY_BLOCKS: u32 = 8;
 
 /// What the test expects of the disk.
 pub struct Expect {
@@ -264,6 +269,68 @@ pub fn exercise(
     // Still working, and the write across the end wrote nothing.
     read(store, DATA, "last after the errors", last, 1)?;
     read(store, DATA, "first after the errors", 0, 1)?;
+    recovery(store, blk, block_size, "baseline")?;
+    Ok(())
+}
+
+/// The recovery check after a hostile phase (docs/design/robust-block.md):
+/// write the RCVR pattern to RECOVERY_BLOCKS blocks from RECOVERY_LBA,
+/// flush, and read it back exactly. Each call gets the usual limit; a
+/// driver still reporting errors here has not recovered.
+fn recovery(
+    store: &mut Store<State>,
+    blk: &Block,
+    block_size: u32,
+    after: &str,
+) -> Result<(), &'static str> {
+    let limit = CALL_LIMIT;
+    let want = pattern(RCVR, RECOVERY_LBA, RECOVERY_BLOCKS, block_size);
+    let fail = |what: &str, got: &str| {
+        emit(
+            "block-recovery",
+            &[
+                ("after", Value::Str(after)),
+                ("result", Value::Str("fail")),
+                (
+                    "expected",
+                    Value::Str(&format!(
+                        "write, flush and read back {RECOVERY_BLOCKS} blocks from LBA {RECOVERY_LBA} exactly"
+                    )),
+                ),
+                ("got", Value::Str(&format!("{what}: {got}"))),
+            ],
+        );
+        "block-recovery"
+    };
+    set_deadline(store, limit);
+    match blk.call_write(&mut *store, RECOVERY_LBA, &want) {
+        Err(e) => return Err(call_failed("write", limit, e)),
+        Ok(Err(msg)) => return Err(fail("write", &msg)),
+        Ok(Ok(())) => {}
+    }
+    set_deadline(store, limit);
+    match blk.call_flush(&mut *store) {
+        Err(e) => return Err(call_failed("flush", limit, e)),
+        Ok(Err(msg)) => return Err(fail("flush", &msg)),
+        Ok(Ok(())) => {}
+    }
+    set_deadline(store, limit);
+    let got = match blk.call_read(&mut *store, RECOVERY_LBA, RECOVERY_BLOCKS) {
+        Err(e) => return Err(call_failed("read", limit, e)),
+        Ok(Err(msg)) => return Err(fail("read", &msg)),
+        Ok(Ok(d)) => d,
+    };
+    if got != want {
+        let at = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(0);
+        return Err(fail(
+            "read back",
+            &format!("{} bytes, first difference at byte {at}", got.len()),
+        ));
+    }
+    emit(
+        "block-recovery",
+        &[("after", Value::Str(after)), ("result", Value::Str("pass"))],
+    );
     Ok(())
 }
 

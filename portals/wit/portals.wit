@@ -210,6 +210,33 @@ world nvme-driver {
 ///
 /// Every error string says what was attempted, what was expected and what
 /// happened (rule 3). After returning an error, the driver keeps working.
+///
+/// Robustness contract (docs/design/robust-block.md). tests/block forces
+/// each of these in every run, and a driver's SPEC.md says how it meets
+/// each:
+///
+/// - The device reports an error for a command (a bad block): that call
+///   returns a readable error naming the block range; other blocks keep
+///   working.
+/// - A transient error is retried a bounded number of times; the call
+///   succeeds if a retry does.
+/// - Anything the device returns (completion entries, Identify data) is
+///   validated before use: a bad value means a readable error, never a
+///   wrong answer, a trap or a hang.
+/// - A slow device: every call returns within the call limit or fails
+///   readably.
+/// - The device gone (registers all-ones, the nvme portal failing), then
+///   back: calls fail readably meanwhile, and the driver recovers without
+///   `start` being called again.
+/// - After `flush` succeeds, a power loss keeps everything written before
+///   it; a block written after it holds its old or its new contents,
+///   nothing else.
+/// - DMA allocation failing makes `start` return a readable error.
+/// - Over a run: no trap, no timeout, no growth in DMA memory after
+///   `start`.
+///
+/// Not covered: a device that returns wrong data with a success status;
+/// no driver can tell without checksums the device does not offer.
 interface block {
     /// Bytes per logical block.
     block-size: func() -> u32;
