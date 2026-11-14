@@ -21,7 +21,7 @@ host's JSON log indented underneath.
 | `wasi-rejected` | imports `wasi_snapshot_preview1::proc_exit` | exit 2, import named, device untouched |
 | `timeout` | spins forever, 1 s limit | exit 1, `timeout` |
 | `trap` | panics | exit 1, `trap` with backtrace |
-| `unreviewed-refused` | no `--allow-unreviewed-deny-list` | exit 2 at `device-deny-list` |
+| `deny-list-gate` | `read-status` without `--allow-unreviewed-deny-list` | follows the list's `reviewed` flag: exit 2 at `device-deny-list` while unreviewed, exit 0 with `deny_reviewed: true` once reviewed (the gate is unit-tested in `shim/src/deny.rs` for both states) |
 | `denied-write` | writes NVM word 0 through EEWR (0x102C), then "handles" the `denied` error | exit 1, `mmio-denied` logged, `deny-list-violation` |
 
 The modules in `modules/` are trusted test fixtures, not drivers. Two of
@@ -29,4 +29,4 @@ them use `unsafe` on purpose: `wasi-import` declares a foreign import, and
 none of them are subject to the driver rules.
 
 **Status:** all eight cases pass on QEMU 4.2.1 and 6.2.0. The e1000e deny list is
-written but not yet human-reviewed (see `shim/README.md`).
+awaiting human review (see `shim/README.md`); the cases pass in either state.

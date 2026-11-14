@@ -51,7 +51,28 @@ run_case dma 0 '"status":"pass"' dma $EMU
 run_case wasi-rejected 2 'import wasi_snapshot_preview1::proc_exit is not a portal' wasi-import $EMU
 run_case timeout 1 '"reason":"timeout"' spin $EMU --timeout-ms 1000
 run_case trap 1 '"reason":"trap"' trap $EMU
-run_case unreviewed-refused 2 '"step":"device-deny-list"' read-status
+
+# deny-list-gate: without --allow-unreviewed-deny-list, the host must follow
+# the list's reviewed flag: refuse at device-deny-list while the list is
+# unreviewed, and open the device (deny_reviewed true) once the human has
+# reviewed it (rule 10). The gate logic itself is unit-tested in the shim
+# (deny.rs) with test-only lists in both states.
+expected="unreviewed list: exit 2 at device-deny-list; reviewed list: exit 0 with deny_reviewed true"
+out="$("$HOST" --device "$BDF" --module "$DIR/read-status.wasm" 2>&1)"
+rc=$?
+printf '%s\n' "$out" | sed 's/^/    /'
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qF '"step":"device-deny-list"' &&
+	printf '%s' "$out" | grep -qF 'not reviewed yet'; then
+	result=pass got="exit 2; refused, list not reviewed"
+elif [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF '"deny_reviewed":true'; then
+	result=pass got="exit 0; opened, list reviewed"
+else
+	result=fail got="exit $rc; last line: $(printf '%s\n' "$out" | tail -n 1)"
+	failed=1
+fi
+printf 'PORTALS step=deny-list-gate result=%s expected="%s" got="%s"\n' "$result" \
+	"$(clean "$expected")" "$(clean "$got")"
+
 run_case denied-write 1 '"event":"mmio-denied","attempted":"write32","offset":"0x102c"' denied-write $EMU
 
 exit "$failed"

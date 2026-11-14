@@ -92,21 +92,9 @@ impl Device {
         let vendor = sysfs_hex(&format!("{sys}/vendor"))?;
         let device_id = sysfs_hex(&format!("{sys}/device"))?;
 
-        // Rule 10: no deny list, no access.
-        let deny = deny::for_device(vendor, device_id).ok_or_else(|| {
-            fail(
-                "deny-list",
-                format!("a deny list for {vendor:04x}:{device_id:04x}"),
-                "none; the shim refuses devices without one (rule 10)",
-            )
-        })?;
-        if !deny.reviewed && !allow_unreviewed {
-            return Err(fail(
-                "deny-list",
-                format!("a human-reviewed deny list for {}", deny.model),
-                "the list is not reviewed yet (rule 10); allowed only for emulated devices",
-            ));
-        }
+        // Rule 10: no reviewed deny list, no access.
+        let deny = deny::admit(vendor, device_id, allow_unreviewed)
+            .map_err(|r| fail("deny-list", r.expected, r.got))?;
 
         // Container and group.
         let link = format!("{sys}/iommu_group");

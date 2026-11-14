@@ -53,11 +53,24 @@ them and they only read NVM or are volatile:
 - CTRL_EXT (0x18): `EE_RST` only re-reads the NVM.
 - MDIC (0x20).
 - EXTCNF_CTRL (0xF00): MDIO ownership.
+- POEMB (0xF10): PHY link and pause bits. Bit 7 (`Auto_update`, 10.2.12.1)
+  disables Flash updates from the shadow RAM. It cannot write the Flash
+  itself: an update needs a write to the shadow RAM (3.3.6.1). That write
+  goes through the EEPROM interface, where bit-banging is not supported for
+  the shadow RAM and EEWR is denied.
 - FLOL (0x1050): RAM power gating; its other bits are loaded *from* NVM.
 - SWSM (0x5B50): a semaphore.
 
+Section 3.3.6.1 mentions a `FLUPD` bit "in the FLA register" that 10.2.2.6
+does not list (bits 29:11 are reserved). FLA is denied as a whole register,
+which covers it either way. Denying whole registers rather than single bits
+is deliberate for this reason.
+
 The list stays `reviewed: false` until the human reviews it against the
-datasheet (rule 10).
+datasheet (rule 10). The human flips it, in a commit they sign. No test
+depends on its state: the gate is unit-tested with test-only lists, and the
+`deny-list-gate` portal case accepts either state as long as the host's
+behaviour matches the flag.
 
 **Sources.** Intel no longer serves the datasheet publicly; its URLs return
 403 or 404.

@@ -85,9 +85,19 @@ const fn e82574(
 ///
 /// Checked and deliberately allowed: EERD (0x14, a write only starts a
 /// word read), CTRL_EXT (0x18, EE_RST only re-reads the NVM), MDIC (0x20),
-/// EXTCNF_CTRL (0xF00, MDIO ownership), FLOL (0x1050, RAM power gating;
-/// other bits are loaded from NVM, not written to it), SWSM (0x5B50,
-/// semaphore).
+/// EXTCNF_CTRL (0xF00, MDIO ownership), POEMB (0xF10, see below), FLOL
+/// (0x1050, RAM power gating; other bits are loaded from NVM, not written
+/// to it), SWSM (0x5B50, semaphore).
+///
+/// POEMB (10.2.12.1) bit 7 "Auto_update" disables the Flash update from the
+/// shadow RAM. Changing it cannot write the Flash: an update needs a write
+/// to the shadow RAM (3.3.6.1), which goes through the EEPROM interface;
+/// bit-banging is not supported for the shadow RAM, and EEWR is denied.
+/// Bits 0-6, 8 and 9 are PHY link and pause settings a driver may need.
+///
+/// Section 3.3.6.1 also mentions a FLUPD bit "in the FLA register" that
+/// 10.2.2.6 does not list (bits 29:11 are reserved). FLA is denied as a
+/// whole, which covers it.
 ///
 /// Not reviewed by the human yet (rule 10).
 pub static E1000E_82574L: DenyList = DenyList {
@@ -142,9 +152,47 @@ static ALL: &[&DenyList] = &[&E1000E_82574L];
 
 /// The deny list for a PCI vendor and device ID, if the shim supports it.
 pub fn for_device(vendor: u16, device: u16) -> Option<&'static DenyList> {
-    ALL.iter()
+    find(ALL, vendor, device)
+}
+
+fn find(lists: &[&'static DenyList], vendor: u16, device: u16) -> Option<&'static DenyList> {
+    lists
+        .iter()
         .copied()
         .find(|l| l.vendor == vendor && l.device == device)
+}
+
+/// Why the shim refuses to open a device (rule 10).
+#[derive(Debug, PartialEq)]
+pub struct Refusal {
+    pub expected: String,
+    pub got: &'static str,
+}
+
+/// Rule 10's gate: the device's deny list, if the device may be opened.
+/// A device with no list is refused. A list the human has not reviewed is
+/// refused unless `allow_unreviewed` (emulated devices only).
+pub fn admit(vendor: u16, device: u16, allow_unreviewed: bool) -> Result<&'static DenyList, Refusal> {
+    gate(ALL, vendor, device, allow_unreviewed)
+}
+
+fn gate(
+    lists: &[&'static DenyList],
+    vendor: u16,
+    device: u16,
+    allow_unreviewed: bool,
+) -> Result<&'static DenyList, Refusal> {
+    let list = find(lists, vendor, device).ok_or_else(|| Refusal {
+        expected: format!("a deny list for {vendor:04x}:{device:04x}"),
+        got: "none; the shim refuses devices without one (rule 10)",
+    })?;
+    if !list.reviewed && !allow_unreviewed {
+        return Err(Refusal {
+            expected: format!("a human-reviewed deny list for {}", list.model),
+            got: "the list is not reviewed yet (rule 10); allowed only for emulated devices",
+        });
+    }
+    Ok(list)
 }
 
 #[cfg(test)]
@@ -225,14 +273,49 @@ mod tests {
                 "0x{offset:x} denied"
             );
         }
-        // Registers a driver needs: control, status, NVM word reads, PHY access, semaphore.
-        for offset in [0x0, 0x8, 0x14, 0x18, 0x20, 0xF00, 0x1050, 0x5B50] {
+        // Registers a driver needs: control, status, NVM word reads, PHY
+        // access, MDIO ownership, PHY OEM bits, RAM power gating, semaphore.
+        for offset in [0x0, 0x8, 0x14, 0x18, 0x20, 0xF00, 0xF10, 0x1050, 0x5B50] {
             assert!(l.check_write(offset, 4).is_none(), "0x{offset:x} allowed");
         }
-        assert!(
-            !l.reviewed,
-            "only the human marks a list reviewed (rule 10)"
-        );
+    }
+
+    static UNREVIEWED: DenyList = DenyList {
+        vendor: 0xfffe,
+        device: 0x0001,
+        model: "test unreviewed",
+        reviewed: false,
+        entries: &[],
+    };
+    static REVIEWED: DenyList = DenyList {
+        vendor: 0xfffe,
+        device: 0x0002,
+        model: "test reviewed",
+        reviewed: true,
+        entries: &[],
+    };
+    static GATE_LISTS: &[&DenyList] = &[&UNREVIEWED, &REVIEWED];
+
+    #[test]
+    fn gate_refuses_devices_without_a_list() {
+        for allow in [false, true] {
+            let r = gate(GATE_LISTS, 0xfffe, 0x0003, allow).unwrap_err();
+            assert!(r.expected.contains("fffe:0003"), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn gate_refuses_unreviewed_lists_unless_allowed() {
+        let r = gate(GATE_LISTS, 0xfffe, 0x0001, false).unwrap_err();
+        assert!(r.got.contains("not reviewed"), "{r:?}");
+        assert_eq!(gate(GATE_LISTS, 0xfffe, 0x0001, true).unwrap().model, "test unreviewed");
+    }
+
+    #[test]
+    fn gate_admits_reviewed_lists() {
+        for allow in [false, true] {
+            assert_eq!(gate(GATE_LISTS, 0xfffe, 0x0002, allow).unwrap().model, "test reviewed");
+        }
     }
 
     #[test]
