@@ -64,6 +64,21 @@ missing="$(cd "$DIR" && find . -path ./target -prune -o -type f \
 if [ -z "$missing" ]; then check spdx pass "every source file has an AGPL-3.0-or-later SPDX header" "all do"
 else check spdx fail "every source file has an AGPL-3.0-or-later SPDX header" "missing in: $missing"; fi
 
+# Rule 1: while grinding, only drivers/<name>/ may change. Any uncommitted
+# or untracked change elsewhere in the repository (trusted code, tests,
+# this harness) fails the grind. Ignored files (target/, harness/runs/)
+# don't count.
+if outside="$(git -C "$ROOT" status --porcelain --untracked-files=all -- . ":(exclude)drivers/$NAME" 2>&1)"; then
+	if [ -z "$outside" ]; then
+		check trusted-unchanged pass "no changes outside drivers/$NAME (rule 1)" "none"
+	else
+		check trusted-unchanged fail "no changes outside drivers/$NAME (rule 1)" \
+			"$(printf '%s\n' "$outside" | sed 's/^ *//' | paste -sd ';' - | sed 's/;/; /g')"
+	fi
+else
+	check trusted-unchanged fail "git status succeeds in $ROOT (rule 1)" "$outside"
+fi
+
 # Rule 2: no unsafe in driver source.
 hits="$(grep -rnw --include='*.rs' unsafe "$DIR" --exclude-dir=target || true)"
 if [ -z "$hits" ]; then check no-unsafe pass "no 'unsafe' in drivers/$NAME" "none"

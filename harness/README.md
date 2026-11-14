@@ -9,7 +9,12 @@ harness/grind.sh e1000e
 One grind iteration: check the rules, build the driver, run its
 conformance test, keep the evidence. Trusted.
 
-1. **Rule checks** on `drivers/<name>/`:
+1. **Rule checks:**
+   - nothing outside `drivers/<name>/` has changed (rule 1): any
+     uncommitted or untracked change elsewhere in the repository, including
+     trusted code, tests and this harness, fails the grind and is listed.
+     Ignored files (`target/`, `harness/runs/`) don't count. Changes
+     already committed are not checked; review those in history;
    - `SPEC.md` and `PROVENANCE.md` exist (rules 6, 7);
    - every `.rs`, `.toml`, `.md`, `.sh` and `.wit` file has the SPDX header
      (rule 8);
