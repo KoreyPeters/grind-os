@@ -119,24 +119,27 @@ cat "$WORK/director.log"
 echo "write-back disk (log: $WORK/wbdisk.log): $(grep -c 'flush wrote' "$WORK/wbdisk.log") flushes"
 
 # The run ends with the power cut, so the VM never reports a result and
-# run.sh's exit status is not the verdict. Judge from the serial log (lines
-# matched anywhere, not at the start: a kernel message can share a line):
+# run.sh's exit status is not the verdict. Judge from the serial log:
 # both pre-runs passed, the host reached the power-loss marker without
 # failing first, and the director cut the power there.
-log() { tr -d '\r' <"$SERIAL"; }
+# One cleaned copy, searched as a file: piping the log into grep -q under
+# pipefail fails falsely on a large log (grep stops early, tr gets SIGPIPE).
+tr -d '\r' <"$SERIAL" >"$WORK/serial.txt"
+log_has() { grep -aqE "$1" "$WORK/serial.txt"; }
+log_line() { grep -aoE "$1.*" "$WORK/serial.txt" | head -n 1 | cut -c1-200; }
 host_ok=1
 for step in alloc-fail identify-nonsense; do
-	if ! log | grep -aqE "BLOCK step=$step result=pass"; then
+	if ! log_has "BLOCK step=$step result=pass"; then
 		host_ok=0
 		printf 'BLOCK step=%s result=fail expected="%s" got="%s"\n' "$step" "the $step pre-run passes" \
-			"$(log | grep -aoE "BLOCK step=$step .*" | head -n 1 | cut -c1-200)"
+			"$(log_line "BLOCK step=$step ")"
 	fi
 done
-if log | grep -aqE 'BLOCK step=host '; then
+if log_has 'BLOCK step=host '; then
 	# The host finished on its own: it failed before the power cut.
 	host_ok=0
-	log | grep -aoE 'BLOCK step=host .*' | head -n 1
-elif ! log | grep -aqF '"event":"block-phase","phase":"power-loss"'; then
+	log_line 'BLOCK step=host '
+elif ! log_has '"event":"block-phase","phase":"power-loss"'; then
 	host_ok=0
 	printf 'BLOCK step=host result=fail expected="%s" got="%s"\n' "the host reaches the power-loss phase" \
 		"no power-loss marker; vm exit $vm_status (log: $SERIAL)"

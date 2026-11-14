@@ -61,15 +61,24 @@ off, as `nic-peer` is for the NIC test.
      - **slow device**: the host prints a phase marker; `director.py`,
        outside the VM, follows the serial log and throttles the disk to
        1 I/O per second through QEMU's monitor (`block_set_io_throttle`),
-       then lifts it at the end marker. Every call must still return
-       within the limit; reads may fail readably, never return wrong
-       data; and a command the driver gave up on but the device
-       completes later must not confuse it (the recovery check after the
-       phase). `guest.sh` streams the host's output live, flushing every
-       line, so the director acts on time.
+       then lifts it at the end marker. The serial console can lag by
+       seconds, so the host does not trust the timing: after the marker
+       it reads one block at a time until a read takes at least 400 ms
+       (`block-throttle-seen`; none within 15 s is
+       `block-throttle-not-applied`), and after the end marker until one
+       takes at most 100 ms (`block-throttle-not-lifted`). Every call must
+       still return within the limit; reads may fail readably, never
+       return wrong data; and a command the driver gave up on but the
+       device completes later must not confuse it (the recovery check
+       after the phase). `guest.sh` streams the host's output live,
+       flushing every line, so the director acts as soon as it can.
+       Checked: with the director throttling to 0 (no limit) the run
+       fails `block-throttle-not-applied`.
      - **power loss after flush** (always last): the host writes blocks
        6000-6015 (`PWRA`) and flushes, writes 6100-6115 (`PWRB`) without
-       flushing, prints a marker and waits; the director cuts the power.
+       flushing, prints a marker and waits up to 60 s for the director to
+       cut the power (`block-power-not-cut` otherwise; 10 s was too short
+       when the serial console lagged behind a burst of fault log lines).
        The disk is served by `wbdisk/` (a write-back disk: QEMU's NVMe
        storage comes over NBD, `vm/run.sh --nvme-nbd`, and writes stay in
        wbdisk's memory until a flush), so killing wbdisk loses exactly
@@ -79,7 +88,10 @@ off, as `nic-peer` is for the NIC test.
        Since the run ends with the cut, the VM never reports a result:
        `check.sh` judges from the serial log (both pre-runs passed, the
        host reached the power-loss marker without failing, the director
-       cut the power) and from the image. If the run fails before the cut,
+       cut the power) and from the image. It copies the log to a file and
+       greps that: piping it into `grep -q` under `pipefail` failed
+       whenever grep exited early and the writer got SIGPIPE, which
+       looked like a failed pre-run. If the run fails before the cut,
        the power-loss blocks are not expected (`image.py --no-power-loss`).
      - **device errors**: QEMU's `blkdebug` layer under the disk
        (`vm/run.sh --nvme-errors`, config written by `check.sh`) fails

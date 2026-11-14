@@ -71,16 +71,24 @@ def say(what):
 
 
 def follow(path):
-    """Yield lines appended to `path`, starting from its beginning."""
+    """Yield whole lines appended to `path`, starting from its beginning.
+
+    QEMU is still writing the file, so at its end readline() can return
+    part of a line, with the rest coming on a later call. A marker split
+    that way would be missed, so pieces are joined until the newline."""
     while not os.path.exists(path):
         time.sleep(0.05)
     with open(path, "r", errors="replace") as f:
+        partial = ""
         while True:
-            line = f.readline()
-            if line:
-                yield line
-            else:
+            piece = f.readline()
+            if not piece:
                 time.sleep(0.02)
+                continue
+            partial += piece
+            if partial.endswith("\n"):
+                yield partial
+                partial = ""
 
 
 def main(argv):

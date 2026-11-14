@@ -72,8 +72,9 @@ pub const POWER_FLUSHED_LBA: u64 = 6000;
 pub const POWER_UNFLUSHED_LBA: u64 = 6100;
 pub const POWER_BLOCKS: u32 = 16;
 /// How long the host waits for the power cut before reporting that it
-/// never came.
-const POWER_CUT_WAIT_MS: u64 = 10_000;
+/// never came. Generous: the director reads the marker from the serial
+/// console, which can lag by many seconds behind a burst of log lines.
+const POWER_CUT_WAIT_MS: u64 = 60_000;
 
 /// Blocks tests/block makes fail with real I/O errors (QEMU's blkdebug):
 /// reads of BAD_READ_LBA always, writes to BAD_WRITE_LBA always, and the
@@ -481,10 +482,17 @@ fn faulty_reads(
 }
 
 /// How long the slow-device phase reads while tests/block/director.py has
-/// the disk throttled (1 I/O per second), and how long to wait for the
-/// director to act on each marker.
+/// the disk throttled (1 I/O per second).
 const SLOW_WINDOW_MS: u64 = 3000;
-const DIRECTOR_GRACE_MS: u64 = 700;
+/// The director acts on markers it reads from the serial log, which can lag
+/// by seconds when there is a lot of output. So the phase does not assume:
+/// it probes until a read is slow (throttled) or fast again (lifted), for
+/// at most DIRECTOR_WAIT_MS each way.
+const DIRECTOR_WAIT_MS: u64 = 15_000;
+/// A read at least this slow means the throttle is in effect (1 I/O per
+/// second); one at most THROTTLE_LIFTED_MS means it has been lifted.
+const THROTTLED_MS: u64 = 400;
+const THROTTLE_LIFTED_MS: u64 = 100;
 
 /// Phase: a slow device (docs/design/robust-block.md). The host prints a
 /// marker; tests/block/director.py, outside the VM, throttles the disk to
@@ -497,7 +505,27 @@ fn slow_device(store: &mut Store<State>, blk: &Block, block_size: u32) -> Result
     let limit = CALL_LIMIT;
     let phase = "slow-device";
     emit("block-phase", &[("phase", Value::Str(phase))]);
-    std::thread::sleep(Duration::from_millis(DIRECTOR_GRACE_MS));
+    // Wait until the throttle is really in effect.
+    let waited = probe_until(store, blk, |ms| ms >= THROTTLED_MS)?;
+    let Some(waited) = waited else {
+        emit(
+            "block-throttle-not-applied",
+            &[
+                (
+                    "expected",
+                    Value::Str(&format!(
+                        "a read taking at least {THROTTLED_MS} ms within {DIRECTOR_WAIT_MS} ms of the slow-device marker (tests/block/director.py throttles the disk)"
+                    )),
+                ),
+                ("got", Value::Str("every read stayed fast: the disk was never throttled")),
+            ],
+        );
+        return Err("block-throttle-not-applied");
+    };
+    emit(
+        "block-throttle-seen",
+        &[("after_ms", Value::U64(waited.as_millis() as u64))],
+    );
     let end = std::time::Instant::now() + Duration::from_millis(SLOW_WINDOW_MS);
     let (mut ok, mut errors, mut i, mut slowest) = (0u64, 0u64, 0u64, Duration::ZERO);
     while std::time::Instant::now() < end {
@@ -531,9 +559,53 @@ fn slow_device(store: &mut Store<State>, blk: &Block, block_size: u32) -> Result
             ("slowest_call_ms", Value::U64(slowest.as_millis() as u64)),
         ],
     );
-    // Let the director lift the throttle, and late completions arrive.
-    std::thread::sleep(Duration::from_millis(DIRECTOR_GRACE_MS));
+    // Wait until the throttle is really lifted (late completions arrive
+    // meanwhile).
+    if probe_until(store, blk, |ms| ms <= THROTTLE_LIFTED_MS)?.is_none() {
+        emit(
+            "block-throttle-not-lifted",
+            &[
+                (
+                    "expected",
+                    Value::Str(&format!(
+                        "a read taking at most {THROTTLE_LIFTED_MS} ms within {DIRECTOR_WAIT_MS} ms of the end marker"
+                    )),
+                ),
+                ("got", Value::Str("every read stayed slow")),
+            ],
+        );
+        return Err("block-throttle-not-lifted");
+    }
     Ok(())
+}
+
+/// Read one known block repeatedly until a read's time (in ms, success or
+/// a readable error) satisfies `done`, for at most DIRECTOR_WAIT_MS.
+/// Ok(Some(elapsed)) when it did; Ok(None) if it never did.
+fn probe_until(
+    store: &mut Store<State>,
+    blk: &Block,
+    done: impl Fn(u64) -> bool,
+) -> Result<Option<Duration>, &'static str> {
+    let limit = CALL_LIMIT;
+    let began = std::time::Instant::now();
+    while began.elapsed() < Duration::from_millis(DIRECTOR_WAIT_MS) {
+        set_deadline(store, limit);
+        let t = std::time::Instant::now();
+        let r = blk
+            .call_read(&mut *store, FAULTY_LBA, 1)
+            .map_err(|e| call_failed("read", limit, e))?;
+        if let Err(msg) = &r {
+            if msg.trim().is_empty() {
+                return Err("block-error-unreadable");
+            }
+        }
+        if done(t.elapsed().as_millis() as u64) {
+            return Ok(Some(began.elapsed()));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(None)
 }
 
 /// Phase: errors the device really reports (docs/design/robust-block.md).

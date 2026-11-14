@@ -48,7 +48,11 @@ SRC="$DIR/src/lib.rs"
 RUN="$ROOT/harness/runs/$NAME/mutants-$(date -u +%Y%m%dT%H%M%SZ)"
 WORK="$ROOT/target/mutants/$NAME"
 mkdir -p "$RUN" "$WORK"
-export CARGO_TARGET_DIR="$WORK/build"
+# Only the driver builds go to $WORK/build. It is not exported: the
+# conformance test builds grind-host (and its helpers) into $ROOT/target and
+# boots the VM with that binary, so a target dir set here would leave it
+# running a stale host.
+DRIVER_TARGET="$WORK/build"
 WIT="$ROOT/portals/wit"
 
 # Build a copy of the driver from source file $1 into $2/driver.wasm.
@@ -58,9 +62,9 @@ build() {
 	cp "$DIR/Cargo.toml" "$DIR/Cargo.lock" "$tree/"
 	# The copy lives elsewhere, so point wit-bindgen at the WIT directly.
 	sed "s|path: \"../../portals/wit\"|path: \"$WIT\"|" "$src" >"$tree/src/lib.rs"
-	cargo build --release --locked --offline --manifest-path "$tree/Cargo.toml" \
+	CARGO_TARGET_DIR="$DRIVER_TARGET" cargo build --release --locked --offline --manifest-path "$tree/Cargo.toml" \
 		--target wasm32-unknown-unknown >"$out/build.log" 2>&1 || return 1
-	cp "$(find "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release" -maxdepth 1 -name '*.wasm' | head -n 1)" "$out/driver.wasm"
+	cp "$(find "$DRIVER_TARGET/wasm32-unknown-unknown/release" -maxdepth 1 -name '*.wasm' | head -n 1)" "$out/driver.wasm"
 }
 
 conformance() { # out-dir: exit status of the test
@@ -78,6 +82,11 @@ if ! conformance "$RUN/baseline"; then
 	exit 1
 fi
 echo "MUTANT baseline result=pass (tests/$CLASS)"
+# Record which host the runs used, so a stale binary would show.
+HOST_BIN="$ROOT/target/x86_64-unknown-linux-gnu/release/grind-host"
+if [ -f "$HOST_BIN" ]; then
+	echo "MUTANT host sha256=$(sha256sum "$HOST_BIN" | cut -c1-16) built=$(date -u -r "$HOST_BIN" +%Y-%m-%dT%H:%M:%SZ)"
+fi
 
 # 2. The sample.
 python3 -I "$ROOT/harness/mutate.py" list "$SRC" >"$RUN/all.tsv"
