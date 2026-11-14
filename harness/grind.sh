@@ -22,11 +22,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="$1"
 shift
 
-# Which conformance test each driver must pass. Kept here (trusted), not in
-# the driver's directory, so a driver cannot choose its own test.
+# Which conformance test each driver must pass, and the VM options it needs.
+# Kept here (trusted), not in the driver's directory, so a driver cannot
+# choose its own test or device.
+VMARGS=()
 case "$NAME" in
 e1000e) CLASS=nic ;;
 nvme) CLASS=block ;;
+rtl8139) CLASS=nic VMARGS=(--nic rtl8139) ;;
 *) echo "GRIND step=driver result=fail expected=\"a driver listed in harness/grind.sh\" got=\"$NAME\""; exit 2 ;;
 esac
 
@@ -123,7 +126,7 @@ if [ "$failed" -ne 0 ]; then
 fi
 
 # 3. Conformance.
-"$ROOT/tests/$CLASS/check.sh" "$RUN/driver.wasm" "$@" 2>&1 | tee -a "$LOG"
+"$ROOT/tests/$CLASS/check.sh" "$RUN/driver.wasm" "${VMARGS[@]}" "$@" 2>&1 | tee -a "$LOG"
 rc="${PIPESTATUS[0]}"
 cp "$ROOT/vm/build/serial.log" "$RUN/serial.log" 2>/dev/null
 [ "$CLASS" = nic ] && cp "$ROOT/target/nic-test/peer.log" "$RUN/peer.log" 2>/dev/null

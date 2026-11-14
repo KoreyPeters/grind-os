@@ -23,8 +23,9 @@ conformance test, keep the evidence. Trusted.
      from the driver runs on this machine at build time.
 2. **Build** for `wasm32-unknown-unknown` with `--locked`.
 3. **Conformance**: the test for the driver's device class. The mapping
-   lives in `grind.sh` (`e1000e` → `tests/nic`, `nvme` → `tests/block`),
-   not in the driver's directory, so a driver cannot pick its own test.
+   lives in `grind.sh` (`e1000e` → `tests/nic`, `nvme` → `tests/block`,
+   `rtl8139` → `tests/nic` with `vm/run.sh --nic rtl8139`), not in the
+   driver's directory, so a driver cannot pick its own test or device.
 4. **Evidence** in `harness/runs/<name>/<UTC time>/` (gitignored):
    `output.log`, `build.log`, `driver.wasm`, `serial.log`, `peer.log` (NIC
    only), and the commit and working-tree status the run used. The block
