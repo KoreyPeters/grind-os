@@ -253,36 +253,68 @@ impl mmio::Host for State {
         Ok(self.device.window().size())
     }
 
+    fn read8(&mut self, offset: u32) -> wasmtime::Result<Result<u8, mmio::Error>> {
+        let r = self.device.window().read8(offset);
+        self.trace_read("read8", offset, r.as_ref().ok().map(|v| u64::from(*v)));
+        mmio_result("read8", offset, None, r)
+    }
+
+    fn read16(&mut self, offset: u32) -> wasmtime::Result<Result<u16, mmio::Error>> {
+        let r = self.device.window().read16(offset);
+        self.trace_read("read16", offset, r.as_ref().ok().map(|v| u64::from(*v)));
+        mmio_result("read16", offset, None, r)
+    }
+
     fn read32(&mut self, offset: u32) -> wasmtime::Result<Result<u32, mmio::Error>> {
         let r = self.device.window().read32(offset);
-        if self.trace {
-            if let Ok(v) = &r {
-                emit(
-                    "mmio",
-                    &[
-                        ("op", "read32".into()),
-                        ("offset", Value::Hex(offset.into())),
-                        ("value", Value::Hex((*v).into())),
-                    ],
-                );
-            }
-        }
+        self.trace_read("read32", offset, r.as_ref().ok().map(|v| u64::from(*v)));
         mmio_result("read32", offset, None, r)
+    }
+
+    fn write8(&mut self, offset: u32, value: u8) -> wasmtime::Result<Result<(), mmio::Error>> {
+        let r = self.device.window().write8(offset, value);
+        self.trace_write("write8", offset, value.into(), r.is_ok());
+        mmio_result("write8", offset, Some(value.into()), r)
+    }
+
+    fn write16(&mut self, offset: u32, value: u16) -> wasmtime::Result<Result<(), mmio::Error>> {
+        let r = self.device.window().write16(offset, value);
+        self.trace_write("write16", offset, value.into(), r.is_ok());
+        mmio_result("write16", offset, Some(value.into()), r)
     }
 
     fn write32(&mut self, offset: u32, value: u32) -> wasmtime::Result<Result<(), mmio::Error>> {
         let r = self.device.window().write32(offset, value);
-        if self.trace && r.is_ok() {
+        self.trace_write("write32", offset, value, r.is_ok());
+        mmio_result("write32", offset, Some(value), r)
+    }
+}
+
+impl State {
+    fn trace_read(&self, op: &str, offset: u32, value: Option<u64>) {
+        if let (true, Some(v)) = (self.trace, value) {
             emit(
                 "mmio",
                 &[
-                    ("op", "write32".into()),
+                    ("op", op.into()),
+                    ("offset", Value::Hex(offset.into())),
+                    ("value", Value::Hex(v)),
+                ],
+            );
+        }
+    }
+
+    fn trace_write(&self, op: &str, offset: u32, value: u32, ok: bool) {
+        if self.trace && ok {
+            emit(
+                "mmio",
+                &[
+                    ("op", op.into()),
                     ("offset", Value::Hex(offset.into())),
                     ("value", Value::Hex(value.into())),
                 ],
             );
         }
-        mmio_result("write32", offset, Some(value), r)
     }
 }
 

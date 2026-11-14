@@ -8,14 +8,19 @@
 /// driver.
 package grind:portals@0.1.0;
 
-/// The device's register window (BAR0 for a PCI device). Other BARs, I/O
-/// port windows, the MSI-X table and config space are never exposed: some
-/// of them reach registers indirectly and would bypass the deny list.
+/// The device's register window: the memory BAR that holds its registers
+/// (BAR0 for most devices, BAR1 for the RTL8139). Other BARs, I/O-port
+/// windows, the MSI-X table and config space are never exposed: some of
+/// them reach registers indirectly and would bypass the write list.
+///
+/// Accesses are 8, 16 or 32 bits wide and naturally aligned. A write is
+/// checked against every byte it touches, so a 32-bit write that covers a
+/// denied byte register is denied.
 interface mmio {
     enum error {
         /// The access does not fit inside the window.
         out-of-range,
-        /// The offset is not a multiple of 4.
+        /// The offset is not a multiple of the access width.
         misaligned,
         /// The register is on the device's deny list (rule 10). The attempt
         /// is logged and the run counts as a failure even if the driver
@@ -25,7 +30,11 @@ interface mmio {
 
     /// Size of the window in bytes.
     size: func() -> u32;
+    read8: func(offset: u32) -> result<u8, error>;
+    read16: func(offset: u32) -> result<u16, error>;
     read32: func(offset: u32) -> result<u32, error>;
+    write8: func(offset: u32, value: u8) -> result<_, error>;
+    write16: func(offset: u32, value: u16) -> result<_, error>;
     write32: func(offset: u32, value: u32) -> result<_, error>;
 }
 

@@ -8,7 +8,7 @@ Trusted: drivers never change it.
 
 | Interface | Gives the driver | Never gives |
 | --- | --- | --- |
-| `mmio` | 32-bit reads/writes to the device's BAR0, bounds- and alignment-checked; writes filtered by the deny list (rule 10) | other BARs, I/O port windows, MSI-X table, config space |
+| `mmio` | 8-, 16- and 32-bit reads/writes to the device's memory register BAR (BAR0, or BAR1 for the RTL8139), bounds- and naturally-alignment-checked; every byte a write touches is checked against the write list (rule 10) | other BARs, I/O port windows, MSI-X table, config space |
 | `dma` | zeroed, page-aligned buffers mapped into the device's IOMMU domain; the driver sees only each buffer's IOVA | host pointers, other memory |
 | `clock` | monotonic time, sleeps of up to 1 s per call | wall-clock time |
 | `log` | structured log entries | any other output |

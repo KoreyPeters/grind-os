@@ -8,10 +8,11 @@ tests/portals/check.sh  # exit 0 only if everything passes
 ```
 
 `check.sh` runs the shim's unit tests, builds `grind-host` (static) and the
-test modules, then boots the VM twice: once to run `guest.sh` against the
-e1000e, and once with `vm/run.sh --nvme` and a fresh 16 MiB scratch image
+test modules, then boots the VM three times: to run `guest.sh` against the
+e1000e; with `vm/run.sh --nvme` and a fresh 16 MiB scratch image
 (`target/portals-nvme.img`) to run `guest-nvme.sh` against QEMU's NVMe
-controller.
+controller; and with `vm/run.sh --nic rtl8139` to run `guest-rtl8139.sh`
+against the RTL8139.
 `guest.sh` runs every case and prints
 `PORTALS step=<case> result=pass|fail expected="..." got="..."`, with the
 host's JSON log indented underneath.
@@ -54,6 +55,25 @@ handles the error and returns ok; the host must still fail the run.
 | `nvme-quiesce` | `nvme-smoke` | `device-quiesce` logged |
 | `nvme-no-dma-faults` | (after all cases) | no IOMMU DMA faults: refused commands never reached the device |
 
+Against the RTL8139 (`guest-rtl8139.sh`), whose registers are in BAR1:
+
+| Case | Module | Expected |
+| --- | --- | --- |
+| `rtl-gate` | `rtl-read-id` without the allow flag | exit 2 at `device-deny-list`: the list is not reviewed |
+| `rtl-bar1` | reads IDR0-5 with `read8` | exit 0; `device-open` reports `bar: 1`, `bar_size: 0x100`; the MAC is `52:54:00:12:34:56` |
+| `rtl-reset-at-open` | `rtl-read-id` | `reset: VFIO_DEVICE_RESET ok` |
+| `rtl-widths` | `write16`/`read16` of IMR (0x3C) | exit 0, reads back `0x0005` |
+| `rtl-9346cr` | `write8(0x50, 0x80)`: EEPROM programming mode | exit 1, `mmio-denied` naming 9346CR, `deny-list-violation` |
+| `rtl-flash` | `write32(0xD4, SWRWEn)`: software flash access | exit 1, `mmio-denied` naming FLASH |
+| `rtl-config-dword` | `write32(0x58)`: MSR's dword, which covers CONFIG3/4 | exit 1, `mmio-denied` naming CONFIG3 |
+| `rtl-quiesce` | `rtl-read-id` | `device-quiesce` logged |
+| `rtl-no-dma-faults` | (after all cases) | no IOMMU DMA faults |
+
+The shim refuses an I/O-port BAR: with the RTL8139's list temporarily
+pointed at BAR0, `grind-host` failed at `device-bar` ("an I/O-port BAR
+(config 0x0000c001)"). That was a one-off check, not a standing case,
+because it needs a wrong list.
+
 The NVMe modules share `modules/nvme-common/common.rs`, which each includes
 at its crate root (wit-bindgen 0.63 cannot re-export a world's export
 macro from a library crate).
@@ -61,7 +81,8 @@ The modules in `modules/` are trusted test fixtures, not drivers. Two of
 them use `unsafe` on purpose: `wasi-import` declares a foreign import, and
 none of them are subject to the driver rules.
 
-**Status:** the e1000e cases pass on QEMU 4.2.1 and 6.2.0; the NVMe cases
-pass on QEMU 6.2.0. The e1000e deny list and the NVMe register and command
+**Status:** the e1000e cases pass on QEMU 4.2.1 and 6.2.0; the NVMe and
+RTL8139 cases pass on QEMU 6.2.0. The RTL8139 deny list is not reviewed
+yet, so its cases use `--allow-unreviewed-deny-list`. The e1000e deny list and the NVMe register and command
 lists are human reviewed (see `shim/README.md`). The NVMe cases run without
 `--allow-unreviewed-deny-list`.

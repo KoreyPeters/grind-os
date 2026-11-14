@@ -207,6 +207,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-test-rtl-9346cr"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "portal-test-rtl-config-dword"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "portal-test-rtl-flash"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "portal-test-rtl-read-id"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "portal-test-rtl-widths"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "portal-test-spin"
 version = "0.1.0"
 dependencies = [

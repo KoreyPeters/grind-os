@@ -66,26 +66,28 @@ impl<R: RegionIo> Window<R> {
         self.violations.load(Ordering::SeqCst)
     }
 
-    fn check(&self, offset: u32) -> Result<(), MmioError> {
-        if !offset.is_multiple_of(4) {
+    /// Natural alignment, and inside the window.
+    fn check(&self, offset: u32, width: u32) -> Result<(), MmioError> {
+        if !offset.is_multiple_of(width) {
             return Err(MmioError::Misaligned);
         }
-        if u64::from(offset) + 4 > u64::from(self.size) {
+        if u64::from(offset) + u64::from(width) > u64::from(self.size) {
             return Err(MmioError::OutOfRange);
         }
         Ok(())
     }
 
-    pub fn read32(&self, offset: u32) -> Result<u32, MmioError> {
-        self.check(offset)?;
+    /// Read `width` (1, 2 or 4) bytes, little-endian.
+    fn read(&self, op: &str, offset: u32, width: u32) -> Result<u32, MmioError> {
+        self.check(offset, width)?;
         let mut buf = [0u8; 4];
         self.io
-            .read_exact_at(&mut buf, self.base + u64::from(offset))
+            .read_exact_at(&mut buf[..width as usize], self.base + u64::from(offset))
             .map_err(|e| {
                 emit(
                     "mmio-io-error",
                     &[
-                        ("attempted", Value::Str("read32")),
+                        ("attempted", Value::Str(op)),
                         ("offset", Value::Hex(offset.into())),
                         ("error", Value::Str(&e.to_string())),
                     ],
@@ -95,12 +97,24 @@ impl<R: RegionIo> Window<R> {
         Ok(u32::from_le_bytes(buf))
     }
 
+    pub fn read8(&self, offset: u32) -> Result<u8, MmioError> {
+        self.read("read8", offset, 1).map(|v| v as u8)
+    }
+
+    pub fn read16(&self, offset: u32) -> Result<u16, MmioError> {
+        self.read("read16", offset, 2).map(|v| v as u16)
+    }
+
+    pub fn read32(&self, offset: u32) -> Result<u32, MmioError> {
+        self.read("read32", offset, 4)
+    }
+
     /// A write by the shim itself, to a register the shim owns (for
     /// example, NVMe controller configuration and submission queue
     /// doorbells). Not filtered by the write list, which describes what
     /// drivers may write. Never reachable from a driver.
     pub(crate) fn write32_shim(&self, offset: u32, value: u32) -> Result<(), MmioError> {
-        self.check(offset)?;
+        self.check(offset, 4)?;
         self.io
             .write_all_at(&value.to_le_bytes(), self.base + u64::from(offset))
             .map_err(|e| {
@@ -117,9 +131,11 @@ impl<R: RegionIo> Window<R> {
             })
     }
 
-    pub fn write32(&self, offset: u32, value: u32) -> Result<(), MmioError> {
-        self.check(offset)?;
-        if let Err(refusal) = self.deny.check_write(offset, 4) {
+    /// A driver's write of `width` (1, 2 or 4) bytes, filtered by the
+    /// write list against every byte it touches.
+    fn write(&self, op: &str, offset: u32, width: u32, value: u32) -> Result<(), MmioError> {
+        self.check(offset, width)?;
+        if let Err(refusal) = self.deny.check_write(offset, width) {
             self.violations.fetch_add(1, Ordering::SeqCst);
             let (register, reason, source) = match refusal {
                 WriteRefusal::Denied(e) => (e.name, e.reason, e.source),
@@ -132,7 +148,7 @@ impl<R: RegionIo> Window<R> {
             emit(
                 "mmio-denied",
                 &[
-                    ("attempted", Value::Str("write32")),
+                    ("attempted", Value::Str(op)),
                     ("offset", Value::Hex(offset.into())),
                     ("value", Value::Hex(value.into())),
                     ("register", Value::Str(register)),
@@ -145,12 +161,15 @@ impl<R: RegionIo> Window<R> {
             return Err(MmioError::Denied(refusal));
         }
         self.io
-            .write_all_at(&value.to_le_bytes(), self.base + u64::from(offset))
+            .write_all_at(
+                &value.to_le_bytes()[..width as usize],
+                self.base + u64::from(offset),
+            )
             .map_err(|e| {
                 emit(
                     "mmio-io-error",
                     &[
-                        ("attempted", Value::Str("write32")),
+                        ("attempted", Value::Str(op)),
                         ("offset", Value::Hex(offset.into())),
                         ("value", Value::Hex(value.into())),
                         ("error", Value::Str(&e.to_string())),
@@ -158,6 +177,18 @@ impl<R: RegionIo> Window<R> {
                 );
                 MmioError::Io(e)
             })
+    }
+
+    pub fn write8(&self, offset: u32, value: u8) -> Result<(), MmioError> {
+        self.write("write8", offset, 1, value.into())
+    }
+
+    pub fn write16(&self, offset: u32, value: u16) -> Result<(), MmioError> {
+        self.write("write16", offset, 2, value.into())
+    }
+
+    pub fn write32(&self, offset: u32, value: u32) -> Result<(), MmioError> {
+        self.write("write32", offset, 4, value)
     }
 }
 
@@ -227,6 +258,44 @@ mod tests {
         assert!(matches!(w.write32(0x40, 0), Err(MmioError::OutOfRange)));
         assert!(matches!(w.read32(u32::MAX - 3), Err(MmioError::OutOfRange)));
         assert_eq!(w.violations(), 0);
+    }
+
+    #[test]
+    fn narrow_accesses_are_aligned_little_endian_and_in_range() {
+        let w = window();
+        w.write32(0x8, 0x4433_2211).unwrap();
+        assert_eq!(w.read8(0x8).unwrap(), 0x11);
+        assert_eq!(w.read8(0xb).unwrap(), 0x44);
+        assert_eq!(w.read16(0xa).unwrap(), 0x4433);
+        w.write8(0x9, 0xaa).unwrap();
+        assert_eq!(w.read32(0x8).unwrap(), 0x4433_aa11, "only one byte written");
+        w.write16(0xa, 0xbbcc).unwrap();
+        assert_eq!(w.read32(0x8).unwrap(), 0xbbcc_aa11);
+        assert!(matches!(w.read16(0x9), Err(MmioError::Misaligned)));
+        assert!(matches!(w.write16(0x1, 0), Err(MmioError::Misaligned)));
+        assert!(w.read8(0x3f).is_ok());
+        assert!(matches!(w.read8(0x40), Err(MmioError::OutOfRange)));
+        assert!(matches!(w.write16(0x40, 0), Err(MmioError::OutOfRange)));
+        assert_eq!(w.violations(), 0);
+    }
+
+    #[test]
+    fn narrow_writes_are_checked_byte_by_byte() {
+        // NVMCTL is the dword at 0x10: every narrow write inside it is
+        // denied, and the neighbours are not.
+        let w = window();
+        for (off, width) in [(0x10, 1), (0x13, 1), (0x12, 2)] {
+            let r = if width == 1 {
+                w.write8(off, 0xff)
+            } else {
+                w.write16(off, 0xffff)
+            };
+            assert!(matches!(r, Err(MmioError::Denied(_))), "0x{off:x}");
+        }
+        assert_eq!(w.violations(), 3);
+        assert_eq!(&w.io.0.lock().unwrap()[0x110..0x114], &[0, 0, 0, 0]);
+        assert!(w.write8(0x0f, 1).is_ok());
+        assert!(w.write16(0x14, 1).is_ok());
     }
 
     #[test]

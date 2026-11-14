@@ -7,6 +7,8 @@
 #   3. Boot the test VM and run tests/portals/guest.sh against the e1000e.
 #   4. Boot it again with an emulated NVMe controller backed by a fresh
 #      scratch image, and run tests/portals/guest-nvme.sh against that.
+#   5. Boot it a third time with an RTL8139 as the network card, and run
+#      tests/portals/guest-rtl8139.sh against that.
 # Exits 0 only if everything passes. Requires vm/fetch.sh to have run once.
 
 set -euo pipefail
@@ -38,7 +40,8 @@ cargo build --release --locked --manifest-path "$MODULES/Cargo.toml" --target wa
 
 adds=(--add "$HOST_BIN=/bin/grind-host"
 	--add "$ROOT/tests/portals/guest.sh=/tests/portals/guest.sh"
-	--add "$ROOT/tests/portals/guest-nvme.sh=/tests/portals/guest-nvme.sh")
+	--add "$ROOT/tests/portals/guest-nvme.sh=/tests/portals/guest-nvme.sh"
+	--add "$ROOT/tests/portals/guest-rtl8139.sh=/tests/portals/guest-rtl8139.sh")
 for wasm in "$WASM"/portal_test_*.wasm; do
 	name="$(basename "$wasm" .wasm)"
 	name="${name#portal_test_}"
@@ -54,3 +57,6 @@ rm -f "$IMAGE"
 truncate -s 16M "$IMAGE"
 "$ROOT/vm/run.sh" --check --nvme "$IMAGE" --run /tests/portals/guest-nvme.sh --timeout 180 "$@" ||
 	fail vm-nvme "tests/portals/guest-nvme.sh passes against the NVMe controller" "exit $?"
+
+"$ROOT/vm/run.sh" --check --nic rtl8139 --run /tests/portals/guest-rtl8139.sh --timeout 180 "$@" ||
+	fail vm-rtl8139 "tests/portals/guest-rtl8139.sh passes against the RTL8139" "exit $?"

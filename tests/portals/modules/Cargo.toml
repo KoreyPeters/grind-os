@@ -8,6 +8,7 @@ members = [
     "read-status", "bounds", "dma", "denied-write", "wasi-import", "spin", "trap",
     "nvme-smoke", "nvme-format", "nvme-save", "nvme-vendor-admin", "nvme-unlisted-io", "nvme-prp-shim", "nvme-prp-list", "nvme-sq-doorbell", "nvme-cc-write",
     "nvme-queue-full", "nvme-cq-doorbell", "nvme-cq-in-driver",
+    "rtl-read-id", "rtl-widths", "rtl-9346cr", "rtl-flash", "rtl-config-dword",
 ]
 
 [workspace.dependencies]
