@@ -56,34 +56,32 @@ run_case() {
 		"$(clean "$expected")" "$(clean "$got")"
 }
 
-# The RTL8139 deny list is not reviewed yet (rule 10), so cases that open
-# the device must allow that explicitly. This is valid only for emulated
-# devices.
-EMU=--allow-unreviewed-deny-list
+# No --allow-unreviewed-deny-list: the RTL8139 deny list is human-reviewed
+# (rule 10), so every case takes the path real hardware would.
 DENIED='"status":"fail","reason":"deny-list-violation"'
 
-# Gate: without the flag, the unreviewed list keeps the device closed.
-run_case rtl-gate 2 rtl-read-id '"step":"device-deny-list"' 'list for Realtek RTL8139' 'not reviewed yet'
+# Gate: the device opens without the flag because the list is reviewed.
+run_case rtl-gate 0 rtl-read-id '"deny_reviewed":true' '"status":"pass"'
 
 # The window is BAR1 (memory), 256 bytes, and holds the registers: IDR0-5
 # read one byte at a time give vm/run.sh's MAC address.
 run_case rtl-bar1 0 rtl-read-id \
 	'"model":"Realtek RTL8139"' '"bar":1,"bar_size":"0x100"' '"list_kind":"deny"' \
-	'"message":"IDR","field.mac":"52:54:00:12:34:56","field.window":"256"' '"status":"pass"' -- $EMU
-run_case rtl-reset-at-open 0 rtl-read-id '"reset":"VFIO_DEVICE_RESET ok"' -- $EMU
-run_case rtl-widths 0 rtl-widths '"message":"IMR","field.value":"0x0005"' '"status":"pass"' -- $EMU
+	'"message":"IDR","field.mac":"52:54:00:12:34:56","field.window":"256"' '"status":"pass"'
+run_case rtl-reset-at-open 0 rtl-read-id '"reset":"VFIO_DEVICE_RESET ok"'
+run_case rtl-widths 0 rtl-widths '"message":"IMR","field.value":"0x0005"' '"status":"pass"'
 
 # The deny list (rule 10). Each module handles the error; the host must
 # still fail the run.
 run_case rtl-9346cr 1 rtl-9346cr \
-	'"event":"mmio-denied","attempted":"write8","offset":"0x50","value":"0x80","register":"9346CR"' "$DENIED" -- $EMU
+	'"event":"mmio-denied","attempted":"write8","offset":"0x50","value":"0x80","register":"9346CR"' "$DENIED"
 run_case rtl-flash 1 rtl-flash \
-	'"event":"mmio-denied","attempted":"write32","offset":"0xd4","value":"0x20000","register":"FLASH"' "$DENIED" -- $EMU
+	'"event":"mmio-denied","attempted":"write32","offset":"0xd4","value":"0x20000","register":"FLASH"' "$DENIED"
 run_case rtl-config-dword 1 rtl-config-dword \
-	'"event":"mmio-denied","attempted":"write32","offset":"0x58","value":"0x0","register":"CONFIG3"' "$DENIED" -- $EMU
+	'"event":"mmio-denied","attempted":"write32","offset":"0x58","value":"0x0","register":"CONFIG3"' "$DENIED"
 
 # Teardown: bus mastering off before the driver's buffers are unmapped.
-run_case rtl-quiesce 0 rtl-read-id '"event":"device-quiesce","bdf":"'"$BDF"'"' -- $EMU
+run_case rtl-quiesce 0 rtl-read-id '"event":"device-quiesce","bdf":"'"$BDF"'"'
 
 # After every case above: the IOMMU logged no DMA faults.
 expected="no DMAR fault lines in dmesg after all cases"

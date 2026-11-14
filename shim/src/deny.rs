@@ -275,14 +275,14 @@ const fn e8139(
 /// The EEPROM is also writable through PCI Vital Product Data (8.8), which
 /// is in config space: drivers never see config space.
 ///
-/// Not yet reviewed by the human.
+/// Reviewed by the human against the datasheet (rule 10).
 pub static RTL8139: WriteList = WriteList {
     vendor: 0x10ec,
     device: 0x8139,
     model: "Realtek RTL8139",
     kind: ListKind::Deny,
     bar: 1,
-    reviewed: false,
+    reviewed: true,
     commands: None,
     entries: &[
         e8139(0x50, 1, "9346CR",
@@ -674,6 +674,7 @@ mod tests {
     fn rtl8139_decisions() {
         let l = &RTL8139;
         assert_eq!(l.bar, 1, "registers in BAR1, not the I/O BAR0");
+        assert!(l.fully_reviewed(), "the shipped RTL8139 list");
         for (offset, len, name) in [
             (0x50, 1, "9346CR"),
             (0x51, 1, "CONFIG0"),

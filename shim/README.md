@@ -189,7 +189,9 @@ access"). This is a judgement for the review.
 The EEPROM can also be written through PCI Vital Product Data (8.8),
 which is in config space; drivers never see config space.
 
-Not yet reviewed by the human.
+The human reviewed the list against the datasheet, including leaving the
+reserved bytes writable, and set `reviewed: true` in their own commit
+(rule 10). Any change to the entries needs a new review.
 
 **Sources.**
 

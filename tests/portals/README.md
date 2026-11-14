@@ -59,7 +59,7 @@ Against the RTL8139 (`guest-rtl8139.sh`), whose registers are in BAR1:
 
 | Case | Module | Expected |
 | --- | --- | --- |
-| `rtl-gate` | `rtl-read-id` without the allow flag | exit 2 at `device-deny-list`: the list is not reviewed |
+| `rtl-gate` | `rtl-read-id` without the allow flag | exit 0: the list is human-reviewed (`deny_reviewed: true`) |
 | `rtl-bar1` | reads IDR0-5 with `read8` | exit 0; `device-open` reports `bar: 1`, `bar_size: 0x100`; the MAC is `52:54:00:12:34:56` |
 | `rtl-reset-at-open` | `rtl-read-id` | `reset: VFIO_DEVICE_RESET ok` |
 | `rtl-widths` | `write16`/`read16` of IMR (0x3C) | exit 0, reads back `0x0005` |
@@ -82,7 +82,7 @@ them use `unsafe` on purpose: `wasi-import` declares a foreign import, and
 none of them are subject to the driver rules.
 
 **Status:** the e1000e cases pass on QEMU 4.2.1 and 6.2.0; the NVMe and
-RTL8139 cases pass on QEMU 6.2.0. The RTL8139 deny list is not reviewed
-yet, so its cases use `--allow-unreviewed-deny-list`. The e1000e deny list and the NVMe register and command
+RTL8139 cases pass on QEMU 6.2.0. The RTL8139 deny list is human
+reviewed, and its cases run without `--allow-unreviewed-deny-list`. The e1000e deny list and the NVMe register and command
 lists are human reviewed (see `shim/README.md`). The NVMe cases run without
 `--allow-unreviewed-deny-list`.
