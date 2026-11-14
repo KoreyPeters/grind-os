@@ -70,6 +70,30 @@ else
 fi
 printf 'BLOCK step=identify-nonsense result=%s expected="%s" got="%s"\n' "$ident" "$id_expected" "$(clean "$ident_got")"
 
+# A device with small queues (robustness contract): CAP.MQES reports 16
+# entries, and a Create I/O queue asking for more gets Invalid Queue Size,
+# as from a device with that limit (grind-host --fault-mqes). QEMU's own
+# limit is 2048, so this is the only place a driver's queue sizing meets
+# a limit. The driver must stay within it, then pass a recovery check
+# (--block-quick: write, flush and read back 2000-2007, which the main run
+# writes the same way, so the seed pattern stays for the main run).
+q_expected="with the queue limit at 16 entries (CAP.MQES), start creates queues within it and a write, flush and read back succeeds (exit 0)"
+out2="$(/bin/grind-host --device "$BDF" --module "$MODULE" --timeout-ms 15000 \
+	--exercise-block --expect-block-size "$BLOCK_SIZE" --expect-blocks "$BLOCKS" --block-quick --fault-mqes 16 2>&1)"
+rc2=$?
+printf '%s\n' "$out2" | sed 's/^/    /'
+last2="$(printf '%s\n' "$out2" | tail -n 1)"
+if printf '%s' "$out2" | grep -qF '"event":"block-queue-too-large"'; then
+	queues=fail queues_got="$(printf '%s\n' "$out2" | grep -F '"event":"block-queue-too-large"' | head -n 1)"
+elif ! printf '%s' "$out2" | grep -qF '"kind":"queue-limit"'; then
+	queues=fail queues_got="the limit was never read: no read of CAP.MQES; exit $rc2"
+elif [ "$rc2" -eq 0 ]; then
+	queues=pass queues_got="exit 0; $(printf '%s\n' "$out2" | grep -F '"event":"queue-size-ok"' | tr '\n' ' ')"
+else
+	queues=fail queues_got="exit $rc2; last line: $last2"
+fi
+printf 'BLOCK step=small-queues result=%s expected="%s" got="%s"\n' "$queues" "$q_expected" "$(clean "$queues_got")"
+
 # No --allow-unreviewed-deny-list: the device's register and command lists
 # are human-reviewed (rule 10), the same path real hardware takes.
 # Streamed live, not collected and printed at the end: tests/block's
@@ -87,5 +111,5 @@ out="$(cat /tmp/host.out)"
 last="$(printf '%s\n' "$out" | tail -n 1)"
 [ "$rc" -eq 0 ] && result=pass || result=fail
 printf 'BLOCK step=host result=%s expected="%s" got="%s"\n' "$result" "$expected" "$(clean "exit $rc; last line: $last")"
-[ "$alloc" = pass ] && [ "$ident" = pass ] || exit 1
+[ "$alloc" = pass ] && [ "$ident" = pass ] && [ "$queues" = pass ] || exit 1
 exit "$rc"

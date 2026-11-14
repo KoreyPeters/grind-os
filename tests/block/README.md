@@ -118,6 +118,18 @@ off, as `nic-peer` is for the NIC test.
    readable error, not trap or hang (`alloc-fail`). The run's fault seed
    is random, printed as `BLOCK fault-seed=N (replay with
    BLOCK_FAULT_SEED=N)`, and passed to the host.
+
+   A third pre-run gives the driver a device with small queues
+   (`--fault-mqes 16`): reads of CAP report a queue limit (MQES) of 16
+   entries, and a Create I/O queue command asking for more gets the
+   completion such a device returns, Invalid Queue Size, without
+   reaching the device; the host logs it as `block-queue-too-large`.
+   QEMU's own limit is 2048, so this is the only place a driver's queue
+   sizing meets a limit. The driver must start within it, then write,
+   flush and read back 2000-2007 (`--block-quick`, which leaves the seed
+   for the main run) (`small-queues`). Checked: the NVMe driver asks for
+   16 entries and passes; mutant m27, which asks for one entry more than
+   it means to, fails with `block-queue-too-large` (17 entries).
 4. After the VM powers off, `image.py check` reads the image file: the 298
    written blocks must hold the data pattern and the other 32470 the seed.
    A refused write that reached the disk anyway shows up as `BADW` in
@@ -157,7 +169,7 @@ tests/block/check.sh tests/block/modules/target/wasm32-unknown-unknown/release/b
 | Module | What it does | How the test fails |
 | --- | --- | --- |
 | `fake` | never touches the device: right geometry, reads zeros, ignores writes | `block-mismatch` on the first seed read; image check: all 298 written blocks still hold the seed |
-| `cheat` | never touches the device but knows the test: synthesizes the seed, keeps writes in memory, follows the error contract | every check in the VM passes; **only the image check fails** (298 blocks: seed still there) |
+| `cheat` | never touches the device but knows the test: synthesizes the seed, keeps writes in memory, follows the error contract | the image check fails (298 blocks: seed still there); since the robustness phases, so do the pre-runs it never reaches the device for (`identify-nonsense`, `small-queues`) and the throttle check (`block-throttle-not-applied`) |
 | `lenient` | `cheat`, but reads outside the disk return data | `block-accepted-invalid` at `read(32768, 1)` |
 | `partial` | `cheat`, but a write past the end keeps the block that fits before failing | `block-mismatch` at the re-read of block 32767: `BADW` instead of `DATA` |
 | `alloc-panic` | unwraps a failed DMA allocation in `start` | `alloc-fail`: a trap, not a readable error |
@@ -171,15 +183,19 @@ after the cut. image.py was also checked offline: 5 of 16 unflushed
 blocks kept passes; one byte changed in an unflushed block fails.
 
 `cheat` also pretends blocks 3000 and 3100 are bad, so the
-device-errors phase cannot catch it either: it stays the control that
-only the image check can catch.
+device-errors phase cannot catch it either. The checks in the VM
+that catch it do so only because it never reaches the device; the
+image check catches it on its own, whatever ran in the VM.
 
 **Status (2026-11-14):** the NVMe driver as first written failed two
 items: it did not retry the transient error, and after the slow-device
 phase it took the late completions of commands it had given up on for
 the next command's. Reground against the full test
 (docs/design/robust-block.md, step 6), it passes every phase; the
-mutation score (`harness/mutants.sh nvme`) rose from 3/8 to 9/20.
+mutation score (`harness/mutants.sh nvme`) rose from 3/8 to 9/20. One
+of those 9 (m17, which cannot change anything on QEMU) was caught only
+by a flush timeout that did not recur, so 8 were real; with the
+small-queues pre-run, m27 is caught too: 9/20, all real.
 
 `cheat`, `lenient` and `partial` share `modules/cheat-common/cheat.rs`.
 `cheat` shows that the image check is independent of anything that ran

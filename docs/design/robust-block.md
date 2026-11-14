@@ -99,7 +99,11 @@ drivers did, a fresh session regrinds it, recording each failing run.
    6. the mutation score, then regrinding the NVMe driver.
 
 **Done 2026-11-14.** All six steps are in. The reground NVMe driver
-passes; the mutation score rose from 3/8 to 9/20, and the survivors
-change only logging, polling pauses or limits QEMU never reaches, apart
-from two small gaps (the queue counts the device grants and the I/O
-queue size).
+passes; the mutation score rose from 3/8 to 9/20, of which 8 were real
+catches (m17 cannot change anything on QEMU and was caught only by a
+flush timeout that did not recur). One survivor (m27, an I/O queue one
+entry larger than meant) was a real gap: QEMU's queue limit is too large
+to reach. A small-queues pre-run (the host reports a 16-entry limit and
+refuses larger queues) now catches it: 9/20, all real. The other
+survivors change only logging, polling pauses or limits QEMU never
+reaches.

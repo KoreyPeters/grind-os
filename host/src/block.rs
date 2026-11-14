@@ -62,6 +62,11 @@ pub struct Expect {
     /// `--block-power-loss`: end with the power-loss phase; tests/block's
     /// director cuts the power at its marker.
     pub power_loss: bool,
+    /// `--block-quick`: only the geometry and one recovery check (write,
+    /// flush and read back RCVR at 2000-2007), for a pre-run that must
+    /// leave the seed pattern for the main run (tests/block's small-queues
+    /// pre-run). The main run writes the same RCVR blocks.
+    pub quick: bool,
 }
 
 /// The power-loss phase: blocks written and flushed before the cut
@@ -187,6 +192,9 @@ pub fn exercise(
     );
     if !ok {
         return Err("block-geometry");
+    }
+    if expect.quick {
+        return recovery(store, blk, block_size, "start");
     }
 
     let last = blocks - 1;

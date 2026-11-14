@@ -122,7 +122,7 @@ grep -F 'SLOW flush' "$WORK/wbdisk.log" || true
 
 # The run ends with the power cut, so the VM never reports a result and
 # run.sh's exit status is not the verdict. Judge from the serial log:
-# both pre-runs passed, the host reached the power-loss marker without
+# the three pre-runs passed, the host reached the power-loss marker without
 # failing first, and the director cut the power there.
 # One cleaned copy, searched as a file: piping the log into grep -q under
 # pipefail fails falsely on a large log (grep stops early, tr gets SIGPIPE).
@@ -130,7 +130,7 @@ tr -d '\r' <"$SERIAL" >"$WORK/serial.txt"
 log_has() { grep -aqE "$1" "$WORK/serial.txt"; }
 log_line() { grep -aoE "$1.*" "$WORK/serial.txt" | head -n 1 | cut -c1-200; }
 host_ok=1
-for step in alloc-fail identify-nonsense; do
+for step in alloc-fail identify-nonsense small-queues; do
 	if ! log_has "BLOCK step=$step result=pass"; then
 		host_ok=0
 		printf 'BLOCK step=%s result=fail expected="%s" got="%s"\n' "$step" "the $step pre-run passes" \

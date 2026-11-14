@@ -7,7 +7,7 @@
 //!            [--timeout-ms N] [--dma-limit-mib N] [--trace]
 //!            [--allow-unreviewed-deny-list]
 //!            [--serve-ping <ipv4> [--serve-ms N] [--expect-link-flaps N]]
-//!            [--fault-seed N] [--fail-allocation N] [--fault-identify]
+//!            [--fault-seed N] [--fail-allocation N] [--fault-identify] [--fault-mqes N] [--block-quick]
 //!            [--exercise-block --expect-block-size N --expect-blocks N]
 //! ```
 //!
@@ -152,6 +152,7 @@ struct Args {
     fault_seed: u64,
     fail_allocation: Option<u32>,
     fault_identify: bool,
+    fault_mqes: Option<u32>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -167,9 +168,11 @@ fn parse_args() -> Result<Args, String> {
     let mut fault_seed = 1;
     let mut fail_allocation = None;
     let mut fault_identify = false;
+    let mut fault_mqes = None;
     let mut exercise = false;
     let mut device_errors = false;
     let mut power_loss = false;
+    let mut block_quick = false;
     let mut block_size = None;
     let mut blocks = None;
     let mut serve = Duration::from_secs(10);
@@ -204,6 +207,7 @@ fn parse_args() -> Result<Args, String> {
             "--exercise-block" => exercise = true,
             "--block-device-errors" => device_errors = true,
             "--block-power-loss" => power_loss = true,
+            "--block-quick" => block_quick = true,
             "--expect-block-size" => {
                 let v = value("--expect-block-size")?;
                 block_size = Some(
@@ -225,6 +229,15 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("--fault-seed {v}: not a number"))?;
             }
             "--fault-identify" => fault_identify = true,
+            "--fault-mqes" => {
+                let v = value("--fault-mqes")?;
+                fault_mqes = Some(
+                    v.parse::<u32>()
+                        .ok()
+                        .filter(|n| (2..=65536).contains(n))
+                        .ok_or_else(|| format!("--fault-mqes {v}: not 2 to 65536 entries"))?,
+                );
+            }
             "--fail-allocation" => {
                 let v = value("--fail-allocation")?;
                 fail_allocation = Some(
@@ -261,6 +274,7 @@ fn parse_args() -> Result<Args, String> {
         fault_seed,
         fail_allocation,
         fault_identify,
+        fault_mqes,
         exercise_block: match (exercise, block_size, blocks) {
             (false, None, None) => None,
             (true, Some(block_size), Some(blocks)) => Some(block::Expect {
@@ -268,6 +282,7 @@ fn parse_args() -> Result<Args, String> {
                 blocks,
                 device_errors,
                 power_loss,
+                quick: block_quick,
             }),
             _ => {
                 return Err(
@@ -303,6 +318,9 @@ impl mmio::Host for State {
         if r.is_ok() {
             if let Some(v) = self.faults.register_read("read8", offset, 1) {
                 r = Ok(v as u8);
+            } else if let Ok(v) = r {
+                let v = self.faults.cap_read("read8", offset, 1, v.into());
+                r = Ok(v as u8);
             }
         }
         self.trace_read("read8", offset, r.as_ref().ok().map(|v| u64::from(*v)));
@@ -314,6 +332,9 @@ impl mmio::Host for State {
         if r.is_ok() {
             if let Some(v) = self.faults.register_read("read16", offset, 2) {
                 r = Ok(v as u16);
+            } else if let Ok(v) = r {
+                let v = self.faults.cap_read("read16", offset, 2, v.into());
+                r = Ok(v as u16);
             }
         }
         self.trace_read("read16", offset, r.as_ref().ok().map(|v| u64::from(*v)));
@@ -324,6 +345,9 @@ impl mmio::Host for State {
         let mut r = self.device.window().read32(offset);
         if r.is_ok() {
             if let Some(v) = self.faults.register_read("read32", offset, 4) {
+                r = Ok(v);
+            } else if let Ok(v) = r {
+                let v = self.faults.cap_read("read32", offset, 4, v.into());
                 r = Ok(v);
             }
         }
@@ -582,6 +606,9 @@ impl nvme::Host for State {
             return Ok(Err(nvme::Error::Failed));
         }
         self.faults.admin_command(&command);
+        if let Some(c) = self.faults.create_queue(&command) {
+            return Ok(Ok(c));
+        }
         let r = self.device.nvme_admin(&command).ok_or_else(|| {
             wasmtime::Error::msg("nvme portal used on a device that takes no commands")
         })?;
@@ -857,7 +884,7 @@ fn main() -> ExitCode {
         return setup_error("linker", "portals added to the linker", &format!("{e:#}"));
     }
     let started = Instant::now();
-    let state = State {
+    let mut state = State {
         device,
         table: ResourceTable::new(),
         limits: StoreLimitsBuilder::new().memory_size(MAX_MEMORY).build(),
@@ -870,6 +897,9 @@ fn main() -> ExitCode {
             started,
         ),
     };
+    if let Some(entries) = args.fault_mqes {
+        state.faults.limit_queues(entries);
+    }
     let mut store = Store::new(&engine, state);
     store.limiter(|s| &mut s.limits);
     store.epoch_deadline_trap();

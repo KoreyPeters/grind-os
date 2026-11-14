@@ -85,6 +85,13 @@ pub struct Faults {
     /// Namespace command (`identify_ns`).
     identify_nonsense: bool,
     identify_ns: Option<u64>,
+    /// `--fault-mqes N`: the device's queue limit as the driver sees it.
+    /// CAP.MQES reads report N entries, and a Create I/O queue command
+    /// asking for more is refused as a device with that limit would
+    /// refuse it. None: the device's own limit.
+    queue_limit: Option<u32>,
+    /// Create I/O queue commands refused for exceeding `queue_limit`.
+    pub queues_too_large: u64,
 }
 
 impl Faults {
@@ -110,7 +117,95 @@ impl Faults {
             injected_gone: 0,
             identify_nonsense,
             identify_ns: None,
+            queue_limit: None,
+            queues_too_large: 0,
         }
+    }
+
+    /// `--fault-mqes N`: report a queue limit of `entries` (2 to 65536).
+    pub fn limit_queues(&mut self, entries: u32) {
+        self.queue_limit = Some(entries);
+    }
+
+    /// `--fault-mqes`: a register read that covers CAP.MQES (CAP bits
+    /// 15:0, zero-based: the largest queue the device supports, minus 1;
+    /// FreeBSD nvme.h, NVME_CAP_LO_REG_MQES) reports the limit instead of
+    /// the device's. Every other register and byte reads as the device.
+    pub fn cap_read(&mut self, op: &str, offset: u32, width: u32, value: u32) -> u32 {
+        let Some(entries) = self.queue_limit else {
+            return value;
+        };
+        let mqes = entries - 1;
+        let mut v = value;
+        for byte in 0..2u32 {
+            if byte >= offset && byte < offset + width {
+                let shift = 8 * (byte - offset);
+                v = (v & !(0xff << shift)) | (((mqes >> (8 * byte)) & 0xff) << shift);
+            }
+        }
+        if v != value {
+            self.log(
+                "queue-limit",
+                &[
+                    ("op", Value::Str(op)),
+                    ("offset", Value::Hex(offset.into())),
+                    ("device", Value::Hex(value.into())),
+                    ("now", Value::Hex(v.into())),
+                    ("entries", Value::U64(entries.into())),
+                ],
+            );
+        }
+        v
+    }
+
+    /// `--fault-mqes`: a Create I/O Submission (0x01) or Completion (0x05)
+    /// Queue command asking for more entries than the limit gets the
+    /// completion a device with that limit returns, Invalid Queue Size
+    /// (SCT 1, SC 0x02; FreeBSD nvme.h, NVME_SC_INVALID_QUEUE_SIZE), and
+    /// never reaches the device. QSIZE is CDW10 bits 31:16, zero-based.
+    /// Logged as a `block-queue-too-large` event; tests/block fails on it.
+    pub fn create_queue(&mut self, command: &[u8]) -> Option<Vec<u8>> {
+        let entries = self.queue_limit?;
+        if command.len() != 64 || !matches!(command[0], 0x01 | 0x05) {
+            return None;
+        }
+        let cdw10 = u32::from_le_bytes(command[40..44].try_into().expect("4 bytes"));
+        let asked = (cdw10 >> 16) + 1;
+        let queue = if command[0] == 0x01 {
+            "submission"
+        } else {
+            "completion"
+        };
+        if asked <= entries {
+            emit(
+                "queue-size-ok",
+                &[
+                    ("queue", Value::Str(queue)),
+                    ("entries", Value::U64(asked.into())),
+                    ("limit", Value::U64(entries.into())),
+                ],
+            );
+            return None;
+        }
+        self.queues_too_large += 1;
+        emit(
+            "block-queue-too-large",
+            &[
+                ("queue", Value::Str(queue)),
+                (
+                    "expected",
+                    Value::Str(&format!(
+                        "a Create I/O {queue} queue of at most {entries} entries, the limit CAP.MQES reports"
+                    )),
+                ),
+                ("got", Value::Str(&format!("{asked} entries (QSIZE {})", asked - 1))),
+            ],
+        );
+        let mut c = vec![0u8; 16];
+        c[12..14].copy_from_slice(&command[2..4]); // the command's ID
+                                                   // Status: phase 1, SC 0x02, SCT 1.
+        c[14..16].copy_from_slice(&((1u16 << 9) | (0x02 << 1) | 1).to_le_bytes());
+        Some(c)
     }
 
     /// xorshift64 (Marsaglia, 2003): small, fast, deterministic.
@@ -477,6 +572,38 @@ mod tests {
         let mut ctrl = vec![1u8; 4096];
         f.identify_data(0x1000, 0, &mut ctrl);
         assert_eq!((ctrl[25], ctrl[26]), (1, 1), "no longer namespace data");
+    }
+
+    #[test]
+    fn queue_limit_changes_only_mqes_and_refuses_larger_queues() {
+        let mut f = Faults::new(1, None, false, Instant::now());
+        let cap = 0x3c03_07ffu32;
+        assert_eq!(f.cap_read("read32", 0, 4, cap), cap, "no limit set");
+        f.limit_queues(16);
+        assert_eq!(f.cap_read("read32", 0, 4, cap), 0x3c03_000f);
+        assert_eq!(f.cap_read("read16", 0, 2, 0x07ff), 0x000f);
+        assert_eq!(f.cap_read("read8", 1, 1, 0x07), 0x00);
+        assert_eq!(f.cap_read("read16", 2, 2, 0x3c03), 0x3c03, "not MQES");
+        assert_eq!(f.cap_read("read32", 4, 4, 0x20), 0x20, "CAP high");
+        let mut cmd = [0u8; 64];
+        cmd[0] = 0x01;
+        cmd[2..4].copy_from_slice(&0x1234u16.to_le_bytes());
+        cmd[40..44].copy_from_slice(&((15u32 << 16) | 1).to_le_bytes());
+        assert_eq!(f.create_queue(&cmd), None, "16 entries fit");
+        cmd[40..44].copy_from_slice(&((16u32 << 16) | 1).to_le_bytes());
+        let c = f.create_queue(&cmd).expect("17 entries refused");
+        assert_eq!(u16::from_le_bytes([c[12], c[13]]), 0x1234);
+        let s = u16::from_le_bytes([c[14], c[15]]);
+        assert_eq!(
+            ((s >> 9) & 7, (s >> 1) & 0xff),
+            (1, 2),
+            "Invalid Queue Size"
+        );
+        cmd[0] = 0x05;
+        assert!(f.create_queue(&cmd).is_some(), "completion queues too");
+        cmd[0] = 0x06;
+        assert_eq!(f.create_queue(&cmd), None, "other commands pass");
+        assert_eq!(f.queues_too_large, 2);
     }
 
     #[test]
