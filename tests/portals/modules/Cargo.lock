@@ -102,6 +102,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "portal-test-denied-write"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "portal-test-dma"
 version = "0.1.0"
 dependencies = [

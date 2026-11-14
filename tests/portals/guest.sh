@@ -52,6 +52,6 @@ run_case wasi-rejected 2 'import wasi_snapshot_preview1::proc_exit is not a port
 run_case timeout 1 '"reason":"timeout"' spin $EMU --timeout-ms 1000
 run_case trap 1 '"reason":"trap"' trap $EMU
 run_case unreviewed-refused 2 '"step":"device-deny-list"' read-status
-run_case denied-write 1 '"event":"mmio-denied"' denied-write $EMU
+run_case denied-write 1 '"event":"mmio-denied","attempted":"write32","offset":"0x102c"' denied-write $EMU
 
 exit "$failed"

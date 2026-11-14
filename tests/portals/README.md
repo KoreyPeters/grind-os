@@ -22,12 +22,11 @@ host's JSON log indented underneath.
 | `timeout` | spins forever, 1 s limit | exit 1, `timeout` |
 | `trap` | panics | exit 1, `trap` with backtrace |
 | `unreviewed-refused` | no `--allow-unreviewed-deny-list` | exit 2 at `device-deny-list` |
-| `denied-write` | writes a deny-listed register | exit 1, `mmio-denied` logged, `deny-list-violation` |
+| `denied-write` | writes NVM word 0 through EEWR (0x102C), then "handles" the `denied` error | exit 1, `mmio-denied` logged, `deny-list-violation` |
 
 The modules in `modules/` are trusted test fixtures, not drivers. Two of
 them use `unsafe` on purpose: `wasi-import` declares a foreign import, and
 none of them are subject to the driver rules.
 
-**Status:** every case passes except `denied-write`. Its module is not
-written yet, because it needs a real entry in the e1000e deny list, which in
-turn needs the 82574 datasheet (see `shim/README.md`).
+**Status:** all eight cases pass on QEMU 4.2.1. The e1000e deny list is
+written but not yet human-reviewed (see `shim/README.md`).
