@@ -12,9 +12,15 @@
 | `clock` | monotonic time, sleeps of up to 1 s per call | wall-clock time |
 | `log` | structured log entries | any other output |
 
-A driver exports `start() -> result<_, string>`. The packet-facing side
-(sending and receiving frames) is deliberately left out until milestone 4's
-ping test shows what it needs. Interrupts are not exposed: drivers poll.
+A driver exports `start() -> result<_, string>`. Interrupts are not
+exposed: drivers poll.
+
+An Ethernet driver targets world `nic`, which adds the exported `ethernet`
+interface: `mac-address`, `link-up`, `transmit(frame)` and
+`receive() -> option<frame>`. Frames exclude the FCS. The host calls these
+only after `start` succeeds, one call at a time, and polls `receive`. This
+is the smallest interface milestone 4's ping test needs; queue depths,
+offloads and batching wait until a test needs them.
 
 The host binds portals to exactly one device when it instantiates a
 driver, so there is nothing to name another device with.

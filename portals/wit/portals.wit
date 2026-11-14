@@ -81,3 +81,27 @@ world driver {
     /// Bring the device up. An error string says what went wrong.
     export start: func() -> result<_, string>;
 }
+
+/// The packet-facing side of an Ethernet driver. The driver exports it; the
+/// host calls it only after `start` returned ok, and never concurrently.
+/// There are no interrupts: the host polls `receive`.
+///
+/// Frames run from the destination MAC address through the payload: no
+/// preamble and no FCS. The host does not pad short frames.
+interface ethernet {
+    /// The station address the device receives unicast frames for.
+    mac-address: func() -> tuple<u8, u8, u8, u8, u8, u8>;
+    /// Whether the link is up now (as the device reports it).
+    link-up: func() -> bool;
+    /// Send one frame (14 to 1514 bytes). Returning ok means the frame was
+    /// handed to the device, not that it has left the wire.
+    transmit: func(frame: list<u8>) -> result<_, string>;
+    /// Take one received frame, if any is waiting.
+    receive: func() -> result<option<list<u8>>, string>;
+}
+
+/// An Ethernet (NIC) driver: the driver world plus the ethernet exports.
+world nic {
+    include driver;
+    export ethernet;
+}
