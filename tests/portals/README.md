@@ -28,5 +28,5 @@ The modules in `modules/` are trusted test fixtures, not drivers. Two of
 them use `unsafe` on purpose: `wasi-import` declares a foreign import, and
 none of them are subject to the driver rules.
 
-**Status:** all eight cases pass on QEMU 4.2.1. The e1000e deny list is
+**Status:** all eight cases pass on QEMU 4.2.1 and 6.2.0. The e1000e deny list is
 written but not yet human-reviewed (see `shim/README.md`).

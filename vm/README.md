@@ -103,6 +103,8 @@ The full serial log goes to `vm/build/serial.log`.
   passes even without `intel_iommu=on`. The flag is kept so the VM doesn't
   depend on a distro default. Booting with `intel_iommu=off` fails at the
   `iommu` step, as it should.
-- Verified with QEMU 4.2.1 (Ubuntu 20.04). This version is old, and its
-  e1000e and vIOMMU emulation lack years of upstream fixes. Upgrade it
-  before drivers are developed against it (milestone 4).
+- First verified with QEMU 4.2.1 (Ubuntu 20.04), whose e1000e and vIOMMU
+  emulation lacked years of upstream fixes. Re-verified with QEMU 6.2.0
+  (Ubuntu 22.04) before milestone 4; all checks pass. 6.2 is still dated
+  (Ubuntu 24.04 ships 8.2): if a driver hits behaviour that looks like an
+  emulator bug, upgrade QEMU before blaming the driver.

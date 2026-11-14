@@ -32,7 +32,7 @@ and the program stops at the first failure:
    `0xffffffff`, since all ones means the device did not respond. The value
    itself is not interpreted.
 
-Observed in the test VM with QEMU 4.2.1: `STATUS = 0x00000281`.
+Observed in the test VM with QEMU 4.2.1 and 6.2.0: `STATUS = 0x00000281`.
 
 ## Build notes
 
