@@ -189,6 +189,7 @@ mod tests {
         device: 0xffff,
         model: "test",
         kind: ListKind::Deny,
+        bar: 0,
         reviewed: true,
         commands: None,
         entries: &[WriteEntry {
@@ -245,6 +246,7 @@ mod tests {
         device: 0xfffe,
         model: "test allow",
         kind: ListKind::Allow,
+        bar: 0,
         reviewed: true,
         commands: None,
         entries: &[WriteEntry {

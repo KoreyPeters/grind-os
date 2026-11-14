@@ -223,14 +223,35 @@ impl Device {
             .try_clone()
             .map_err(fails("config", "duplicate the device fd for config space"))?;
 
-        // BAR0: the register window.
-        let bar0 = region_info(&dev, VFIO_PCI_BAR0_REGION_INDEX, "bar0")?;
-        let rw = VFIO_REGION_INFO_FLAG_READ | VFIO_REGION_INFO_FLAG_WRITE;
-        if bar0.flags & rw != rw || bar0.size == 0 || bar0.size > u64::from(u32::MAX) {
+        // The register window: the memory BAR the write list names. An
+        // I/O-port BAR is refused: its registers are reached indirectly and
+        // the portals never expose one. Config space says which kind a BAR
+        // is (bit 0 of the BAR register: 1 for I/O).
+        let bar_index = deny.bar;
+        if bar_index > 5 {
+            return Err(fail("bar", "a write list naming BAR 0 to 5", bar_index));
+        }
+        let mut bar_reg = [0u8; 4];
+        dev.read_exact_at(
+            &mut bar_reg,
+            cfg.offset + PCI_BASE_ADDRESS_0 + 4 * u64::from(bar_index),
+        )
+        .map_err(fails("bar", "read the BAR register in config space"))?;
+        let bar_reg = u32::from_le_bytes(bar_reg);
+        if bar_reg & 1 != 0 {
             return Err(fail(
-                "bar0",
-                "a readable, writable BAR0 of 1 byte to 4 GiB",
-                format!("flags 0x{:x}, size 0x{:x}", bar0.flags, bar0.size),
+                "bar",
+                format!("BAR{bar_index} is a memory BAR"),
+                format!("an I/O-port BAR (config 0x{bar_reg:08x})"),
+            ));
+        }
+        let bar = region_info(&dev, VFIO_PCI_BAR0_REGION_INDEX + bar_index, "bar")?;
+        let rw = VFIO_REGION_INFO_FLAG_READ | VFIO_REGION_INFO_FLAG_WRITE;
+        if bar.flags & rw != rw || bar.size == 0 || bar.size > u64::from(u32::MAX) {
+            return Err(fail(
+                "bar",
+                format!("a readable, writable BAR{bar_index} of 1 byte to 4 GiB"),
+                format!("flags 0x{:x}, size 0x{:x}", bar.flags, bar.size),
             ));
         }
 
@@ -242,7 +263,8 @@ impl Device {
                 ("device", Value::Hex(device_id.into())),
                 ("model", Value::Str(deny.model)),
                 ("iommu_group", Value::Str(&group_id)),
-                ("bar0_size", Value::Hex(bar0.size)),
+                ("bar", Value::U64(bar_index.into())),
+                ("bar_size", Value::Hex(bar.size)),
                 ("list_kind", Value::Str(deny.kind.as_str())),
                 ("deny_entries", Value::U64(deny.entries.len() as u64)),
                 ("deny_reviewed", Value::Bool(deny.reviewed)),
@@ -260,7 +282,7 @@ impl Device {
             ],
         );
 
-        let window = Window::new(dev, bar0.offset, bar0.size as u32, deny);
+        let window = Window::new(dev, bar.offset, bar.size as u32, deny);
         let dma = DmaAllocator::new(
             Arc::new(Domain {
                 container,

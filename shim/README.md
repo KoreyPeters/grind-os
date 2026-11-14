@@ -7,14 +7,17 @@ The only code that touches a device on a driver's behalf. Trusted.
 - `Device::open` opens a PCI device through VFIO (Type1 v2 IOMMU), resets
   it (`VFIO_DEVICE_RESET`, so nothing carries over from a previous user; a
   device VFIO cannot reset is refused), confirms its identity through config
-  space, enables memory decode and bus mastering, and finds BAR0. Each
-  failure says which step failed, what was expected and what happened.
+  space, enables memory decode and bus mastering, and finds the register
+  BAR the device's write list names (`bar`: BAR0 for the e1000e and NVMe,
+  BAR1 for the RTL8139). It refuses a BAR that config space marks as I/O
+  ports. Each failure says which step failed, what was expected and what
+  happened.
 - `Device::quiesce` clears bus mastering and checks it reads back clear, so
   the device can no longer issue DMA. The host calls it before the
   driver's DMA buffers are unmapped; dropping a `Device` calls it as a
   backstop. Logged as `device-quiesce` (command register before and after)
   or `device-quiesce-error`.
-- `Window` gives checked 32-bit access to BAR0. Writes the device's write
+- `Window` gives checked access to that BAR. Writes the device's write
   list refuses are not performed; they are logged (`mmio-denied`) and
   counted. Any count above zero fails the run.
 - `DmaAllocator` and `DmaBuffer` handle DMA memory. Buffers are page-aligned,
@@ -52,6 +55,10 @@ has a kind (CLAUDE.md rule 10), logged in `device-open` as `list_kind`:
 
 A device that takes commands also has a command list (below). It counts as
 reviewed only when both lists are.
+
+Entries are naturally aligned registers of 1, 2 or 4 bytes, or whole
+dword ranges. A write is checked against every byte it touches, so a
+32-bit write that covers a denied byte register is denied.
 
 A refused write logs `mmio-denied` with the entry it hit (deny list) or
 `register: unlisted` (allow list), plus `list_kind`. An allow list with no
@@ -146,6 +153,60 @@ not a source (see `docs/design/milestone-5-nvme.md`).
 
 All are kept in the gitignored `.cache/sources/`.
 
+### Realtek RTL8139 (QEMU rtl8139): deny list
+
+`RTL8139` in `src/deny.rs`, a deny list from the datasheet. Its
+registers are in **BAR1** (memory); BAR0 is the same registers as I/O
+ports and is never exposed, nor is the 512 KiB expansion ROM BAR.
+
+| Offset | Register | Section | Why |
+| --- | --- | --- | --- |
+| 0x50 | 9346CR | 6.10 | EEM = 10b bit-bangs the 93C46/93C56 EEPROM through bits 3-0; EEM = 01b re-runs the EEPROM auto-load; EEM = 11b unlocks CONFIG0/1/3/4 and BMCR bits 13, 12, 8 |
+| 0x51 | CONFIG0 | 6.11 | boot ROM size, from the EEPROM; defence in depth |
+| 0x52 | CONFIG1 | 6.12 | LED and power settings, from the EEPROM; defence in depth |
+| 0x59 | CONFIG3 | 6.14 | PARM_En: whether the PHY parameters are auto-loaded from the EEPROM; defence in depth |
+| 0x5A | CONFIG4 | 6.15 | AnaOff turns off the analog power; LongWF survives PCI reset; defence in depth |
+| 0xD4-0xD7 | FLASH | 6.30 | drives the boot ROM flash's data and address pins; SWRWEn enables software flash access |
+| 0xD8 | Config5 | 6.31 | not protected by 9346CR; bits from the EEPROM; FIFOAddrPtr (Realtek internal test use) resets only at power-on |
+
+CONFIG0/1/3/4 are writable only with 9346CR unlocked, so denying 9346CR
+already protects them; they are listed too in case that protection is
+not what the datasheet says.
+
+Checked and deliberately allowed: IDR0-5 and MAR0-7 (volatile; IDR is
+loaded *from* the EEPROM), MSR (6.13), BMCR (its protected bits need
+9346CR), CSCR, PHY1_PARM, TW_PARM and PHY2_PARM (software can write them
+only with PARM_En = 0 and 9346CR unlocked), the wakeup-frame registers
+(0x84-0xD3), TPPoll, C+CR, RDSAR, ETThR, and the CardBus and MII
+registers (0xF0-0xFF).
+
+**Reserved bytes are left writable** (0x06-0x07, 0x53, 0x5B, 0x5F,
+0x76-0x77, 0x81, 0xDA-0xDF, 0xE2-0xE3, 0xED-0xEF): the datasheet
+documents them as reserved, and most share a dword with registers that
+must be written whole (IDR0-5 "are only permitted to write by 4-byte
+access"). This is a judgement for the review.
+
+The EEPROM can also be written through PCI Vital Product Data (8.8),
+which is in config space; drivers never see config space.
+
+Not yet reviewed by the human.
+
+**Sources.**
+
+- Realtek RTL8139C(L)+ Datasheet, **Rev. 1.6 (03 September 2004), Track
+  ID JATR-1076-21**, Realtek's PDF from
+  `https://people.freebsd.org/~wpaul/RealTek/spec-8139cp(160).pdf`
+  (sha256 `f3973ef7d9f6cc9cf0bc372c19323a383d38c6f1f4465063d1be885fc83a38cc`).
+  Used: the section 6 register table, 6.10-6.15, 6.30, 6.31, 8.1.4, 8.8,
+  and every mention of the EEPROM, flash or boot ROM. QEMU's `rtl8139` is
+  a C+ (revision 0x20).
+- Realtek RTL8139C(L) Datasheet, Rev. 1.6 (29 December 2005), same page
+  (sha256 `9c0a6bd3ae35551f9bd024443776b5b5a7797527c163e6940389821dff47e93b`):
+  only read, to cross-check.
+
+Both are kept in the gitignored `.cache/datasheets/rtl8139/` and read as
+text with `pdftotext -layout`.
+
 ### Intel 82574L (QEMU e1000e): written
 
 13 BAR0 registers are denied. Each entry in `src/deny.rs` cites its
@@ -213,7 +274,8 @@ every register. Config space is never exposed either.
 
 ## Sources
 
-- VFIO and PCI constants: Linux userspace API headers `<linux/vfio.h>` and
+- VFIO and PCI constants (including `PCI_BASE_ADDRESS_0`, added for the
+  register BAR): Linux userspace API headers `<linux/vfio.h>` and
   `<linux/pci_regs.h>` (GPL-2.0 WITH Linux-syscall-note). Values were checked
   by compiling a C program against the host's headers and printing them.
 - No Linux driver code was consulted.

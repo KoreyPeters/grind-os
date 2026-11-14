@@ -40,6 +40,8 @@ pub const VFIO_DMA_MAP_FLAG_WRITE: u32 = 1 << 1;
 
 // <linux/pci_regs.h>
 pub const PCI_COMMAND: u64 = 0x04;
+/// The first BAR register in config space; BAR n is at 0x10 + 4n.
+pub const PCI_BASE_ADDRESS_0: u64 = 0x10;
 pub const PCI_COMMAND_MEMORY: u16 = 0x2;
 pub const PCI_COMMAND_MASTER: u16 = 0x4;
 

@@ -64,6 +64,10 @@ pub struct WriteList {
     pub device: u16,
     pub model: &'static str,
     pub kind: ListKind,
+    /// Which BAR holds the device's memory-mapped registers, the window
+    /// drivers get through `mmio` and the offsets `entries` refer to. It
+    /// must be a memory BAR; I/O-port BARs are never exposed.
+    pub bar: u32,
     /// True once the human has reviewed `entries` against their sources.
     pub reviewed: bool,
     /// For a device that fetches commands from memory: the commands the
@@ -169,6 +173,7 @@ pub static E1000E_82574L: WriteList = WriteList {
     device: 0x10d3,
     model: "Intel 82574L",
     kind: ListKind::Deny,
+    bar: 0,
     reviewed: true,
     commands: None,
     entries: &[
@@ -214,6 +219,96 @@ pub static E1000E_82574L: WriteList = WriteList {
     ],
 };
 
+/// Cite a section of the RTL8139C(L)+ datasheet.
+macro_rules! ds8139 {
+    ($section:literal) => {
+        concat!(
+            "Realtek RTL8139C(L)+ Datasheet Rev. 1.6 (03 September 2004, Track ID JATR-1076-21), section ",
+            $section
+        )
+    };
+}
+
+const fn e8139(
+    offset: u32,
+    len: u32,
+    name: &'static str,
+    reason: &'static str,
+    source: &'static str,
+) -> WriteEntry {
+    WriteEntry {
+        offset,
+        len,
+        name,
+        reason,
+        source,
+    }
+}
+
+/// Realtek RTL8139, as emulated by QEMU's `rtl8139` device (an
+/// RTL8139C+, PCI revision 0x20). Registers are in BAR1 (memory); BAR0 is
+/// the same registers as I/O ports and is never exposed.
+///
+/// From the register map (section 6, table at the start) and the register
+/// descriptions (6.10-6.15, 6.30, 6.31), and every datasheet mention of the
+/// EEPROM, flash or boot ROM. Two registers reach non-volatile memory:
+/// 9346CR, whose programming mode bit-bangs the 93C46/93C56 EEPROM, and
+/// FLASH, which drives the boot ROM flash. The CONFIG registers are loaded
+/// from the EEPROM and are denied as defence in depth.
+///
+/// Checked and deliberately allowed: IDR0-5 and MAR0-7 (station and
+/// multicast address registers, volatile; IDR is loaded *from* the
+/// EEPROM), MSR (0x58, media status, 6.13), BMCR (0x62; bits 13, 12 and 8
+/// are writable only with 9346CR unlocked, which is denied), CSCR, the PHY
+/// and twister parameter registers PHY1_PARM, TW_PARM and PHY2_PARM
+/// (volatile; writable by software only with CONFIG3.PARM_En = 0 and
+/// 9346CR unlocked, 6.14, so in practice not at all), the power-management wakeup-frame registers (0x84-0xD3,
+/// volatile), TPPoll, C+CR, RDSAR, ETThR, the CardBus function event
+/// registers and MIIR (0xF0-0xFF).
+///
+/// Reserved bytes (0x06-0x07, 0x53, 0x5B, 0x5F, 0x76-0x77, 0x81, 0xDA-0xDF,
+/// 0xE2-0xE3, 0xED-0xEF) are left writable: the datasheet documents them
+/// as reserved, and most share a dword with registers a driver may need to
+/// write whole (IDR0-5 "are only permitted to write by 4-byte access",
+/// section 6 register table).
+///
+/// The EEPROM is also writable through PCI Vital Product Data (8.8), which
+/// is in config space: drivers never see config space.
+///
+/// Not yet reviewed by the human.
+pub static RTL8139: WriteList = WriteList {
+    vendor: 0x10ec,
+    device: 0x8139,
+    model: "Realtek RTL8139",
+    kind: ListKind::Deny,
+    bar: 1,
+    reviewed: false,
+    commands: None,
+    entries: &[
+        e8139(0x50, 1, "9346CR",
+            "EEM = 10b (93C46 Programming) lets bits 3-0 bit-bang the EEPROM (EECS, EESK, EEDI); EEM = 01b re-runs the EEPROM auto-load; EEM = 11b unlocks writes to CONFIG0/1/3/4 and BMCR bits 13, 12, 8",
+            ds8139!("6.10")),
+        e8139(0x51, 1, "CONFIG0",
+            "boot ROM size, auto-loaded from the EEPROM; writable only with 9346CR unlocked; denied as defence in depth",
+            ds8139!("6.11")),
+        e8139(0x52, 1, "CONFIG1",
+            "LED and power-management settings whose initial values come from the EEPROM; writable only with 9346CR unlocked; denied as defence in depth",
+            ds8139!("6.12")),
+        e8139(0x59, 1, "CONFIG3",
+            "PARM_En chooses whether the PHY parameters are auto-loaded from the EEPROM; writable only with 9346CR unlocked; denied as defence in depth",
+            ds8139!("6.14")),
+        e8139(0x5A, 1, "CONFIG4",
+            "AnaOff turns off the analog power; LongWF is unaffected by PCI RST#, so it would survive the shim's reset; writable only with 9346CR unlocked; denied as defence in depth",
+            ds8139!("6.15")),
+        e8139(0xD4, 4, "FLASH",
+            "drives the boot ROM flash's data (MD7-0) and address (MA16-0) pins; SWRWEn enables software read/write access to the flash",
+            ds8139!("6.30")),
+        e8139(0xD8, 1, "Config5",
+            "not protected by 9346CR; bits 2-0 are auto-loaded from the EEPROM, and FIFOAddrPtr (Realtek internal test use) can only be reset at power-on, so it would survive the shim's reset",
+            ds8139!("6.31")),
+    ],
+};
+
 /// The FreeBSD NVMe source the QEMU NVMe list cites.
 #[allow(unused_macros)]
 macro_rules! freebsd_nvme {
@@ -254,12 +349,13 @@ pub static QEMU_NVME: WriteList = WriteList {
     device: 0x0010,
     model: "QEMU NVM Express controller",
     kind: ListKind::Allow,
+    bar: 0,
     reviewed: true,
     commands: Some(&crate::nvme::NVME_COMMANDS),
     entries: &[],
 };
 
-static ALL: &[&WriteList] = &[&E1000E_82574L, &QEMU_NVME];
+static ALL: &[&WriteList] = &[&E1000E_82574L, &QEMU_NVME, &RTL8139];
 
 /// The write list for a PCI vendor and device ID, if the shim supports it.
 pub fn for_device(vendor: u16, device: u16) -> Option<&'static WriteList> {
@@ -368,6 +464,7 @@ mod tests {
         device: 0xffff,
         model: "test",
         kind: ListKind::Deny,
+        bar: 0,
         reviewed: true,
         commands: None,
         entries: &[
@@ -413,6 +510,7 @@ mod tests {
         device: 0xfffe,
         model: "test allow",
         kind: ListKind::Allow,
+        bar: 0,
         reviewed: true,
         commands: None,
         entries: &[
@@ -469,6 +567,7 @@ mod tests {
             device: 0xfffd,
             model: "test empty allow",
             kind: ListKind::Allow,
+            bar: 0,
             reviewed: true,
             commands: None,
             entries: &[],
@@ -486,8 +585,16 @@ mod tests {
         let mut prev_end = 0u64;
         for e in list.entries {
             let what = format!("{} {} at 0x{:x}", list.model, e.name, e.offset);
-            if !(e.len > 0 && e.len % 4 == 0 && e.offset % 4 == 0) {
-                return Err(format!("{what}: not an aligned dword range"));
+            // Naturally aligned registers of 1, 2 or 4 bytes, or whole
+            // dwords.
+            let aligned = match e.len {
+                1 | 2 | 4 => e.offset % e.len == 0,
+                n => n % 4 == 0 && e.offset % 4 == 0,
+            };
+            if !aligned {
+                return Err(format!(
+                    "{what}: not a naturally aligned register or dword range"
+                ));
             }
             if u64::from(e.offset) < prev_end {
                 return Err(format!(
@@ -552,6 +659,7 @@ mod tests {
             device: 0,
             model: "cite",
             kind: ListKind::Allow,
+            bar: 0,
             reviewed: false,
             commands: None,
             entries,
@@ -560,6 +668,49 @@ mod tests {
         assert!(well_formed(&list(&TRACE)).is_ok());
         let err = well_formed(&list(&SECTION)).unwrap_err();
         assert!(err.contains("does not cite"), "{err}");
+    }
+
+    #[test]
+    fn rtl8139_decisions() {
+        let l = &RTL8139;
+        assert_eq!(l.bar, 1, "registers in BAR1, not the I/O BAR0");
+        for (offset, len, name) in [
+            (0x50, 1, "9346CR"),
+            (0x51, 1, "CONFIG0"),
+            (0x52, 1, "CONFIG1"),
+            (0x59, 1, "CONFIG3"),
+            (0x5A, 1, "CONFIG4"),
+            (0xD4, 4, "FLASH"),
+            (0xD7, 1, "FLASH"),
+            (0xD8, 1, "Config5"),
+            // A dword write covering 9346CR and CONFIG0/1.
+            (0x50, 4, "9346CR"),
+            // A dword write to MSR's dword reaches CONFIG3.
+            (0x58, 4, "CONFIG3"),
+        ] {
+            assert_eq!(denied(l, offset, len), Some(name), "0x{offset:x}+{len}");
+        }
+        // What a driver needs: IDR (dword), TSD/TSAD, RBSTART, CR (byte),
+        // CAPR and IMR/ISR (words), TCR, RCR, MSR (byte), BMCR, C+CR, MIIR.
+        for (offset, len) in [
+            (0x00, 4),
+            (0x04, 4),
+            (0x10, 4),
+            (0x20, 4),
+            (0x30, 4),
+            (0x37, 1),
+            (0x38, 2),
+            (0x3C, 2),
+            (0x3E, 2),
+            (0x40, 4),
+            (0x44, 4),
+            (0x58, 1),
+            (0x62, 2),
+            (0xE0, 2),
+            (0xFC, 4),
+        ] {
+            assert_eq!(denied(l, offset, len), None, "0x{offset:x}+{len} allowed");
+        }
     }
 
     #[test]
@@ -586,6 +737,7 @@ mod tests {
         device: 0x0001,
         model: "test unreviewed",
         kind: ListKind::Deny,
+        bar: 0,
         reviewed: false,
         commands: None,
         entries: &[],
@@ -595,6 +747,7 @@ mod tests {
         device: 0x0002,
         model: "test reviewed",
         kind: ListKind::Deny,
+        bar: 0,
         reviewed: true,
         commands: None,
         entries: &[],
@@ -614,6 +767,7 @@ mod tests {
         device: 0x0003,
         model: "test commands unreviewed",
         kind: ListKind::Allow,
+        bar: 0,
         reviewed: true,
         commands: Some(&UNREVIEWED_COMMANDS),
         entries: &[],
