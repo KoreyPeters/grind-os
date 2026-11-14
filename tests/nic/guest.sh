@@ -23,8 +23,9 @@ if [ ! -f "$MODULE" ]; then
 	exit 1
 fi
 
-# The e1000e deny list is unreviewed (rule 10): allowed for emulated devices only.
-out="$(/bin/grind-host --device "$BDF" --module "$MODULE" --allow-unreviewed-deny-list \
+# No --allow-unreviewed-deny-list: the driver must pass with the device's
+# human-reviewed list (rule 10), the same path real hardware takes.
+out="$(/bin/grind-host --device "$BDF" --module "$MODULE" \
 	--timeout-ms 15000 --serve-ping "$IP" --serve-ms "$SERVE_MS" 2>&1)"
 rc=$?
 printf '%s\n' "$out" | sed 's/^/    /'
