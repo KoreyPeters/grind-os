@@ -100,10 +100,8 @@ const MAX_FRAME: usize = 1514;
 const MIN_TX_LEN: usize = 17;
 const TIPG_VALUE: u32 = 0x0060_2006;
 const RCTL_VALUE: u32 = bit::RCTL_EN | bit::RCTL_BAM | bit::RCTL_SECRC;
-const TCTL_VALUE: u32 = bit::TCTL_EN
-    | bit::TCTL_PSP
-    | (0x0F << bit::TCTL_CT_SHIFT)
-    | (0x3F << bit::TCTL_COLD_SHIFT);
+const TCTL_VALUE: u32 =
+    bit::TCTL_EN | bit::TCTL_PSP | (0x0F << bit::TCTL_CT_SHIFT) | (0x3F << bit::TCTL_COLD_SHIFT);
 
 // Timeouts, in microseconds.
 const MASTER_DISABLE_TIMEOUT_US: u64 = 10_000;
@@ -198,8 +196,10 @@ fn dma_err(what: &str, e: dma::Error) -> String {
 }
 
 fn emit(level: log::Level, message: &str, fields: &[(&str, String)]) {
-    let fields: Vec<(String, String)> =
-        fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    let fields: Vec<(String, String)> = fields
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
     log::emit(level, message, &fields);
 }
 
@@ -316,7 +316,10 @@ fn allocate(what: &str, size: u32) -> Result<dma::Buffer, String> {
 }
 
 fn fmt_mac(m: &[u8; 6]) -> String {
-    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    m.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// SPEC.md "`start` sequence".
@@ -414,7 +417,10 @@ impl Nic {
         // 5. Mask interrupts again; clear pending causes (4.6.1).
         write(reg::IMC, "IMC", u32::MAX)?;
         let _ = mmio::read32(reg::ICR);
-        info("reset complete", &[("waited_us", (reset_us + 1000).to_string())]);
+        info(
+            "reset complete",
+            &[("waited_us", (reset_us + 1000).to_string())],
+        );
 
         // 6. General configuration (4.6.2).
         let gcr = read(reg::GCR, "GCR")?;
@@ -630,7 +636,10 @@ impl Nic {
                 "RX descriptor reads disagree; not taken this call",
                 &[
                     ("descriptor", slot.to_string()),
-                    ("expected", "two identical reads with the buffer address the driver wrote".into()),
+                    (
+                        "expected",
+                        "two identical reads with the buffer address the driver wrote".into(),
+                    ),
                 ],
             );
             return Ok(None);
@@ -649,7 +658,10 @@ impl Nic {
                     ("descriptor", slot.to_string()),
                     ("status", format!("0x{status:02x}")),
                     ("rdh", rdh.to_string()),
-                    ("expected", "RDH past a written-back descriptor (7.1.8)".into()),
+                    (
+                        "expected",
+                        "RDH past a written-back descriptor (7.1.8)".into(),
+                    ),
                 ],
             );
             return Ok(None);
@@ -669,7 +681,10 @@ impl Nic {
                     ("status", format!("0x{status:02x}")),
                     ("errors", format!("0x{errors:02x}")),
                     ("length", len.to_string()),
-                    ("expected", "DD and EOP set, no errors, length 14-1514".into()),
+                    (
+                        "expected",
+                        "DD and EOP set, no errors, length 14-1514".into(),
+                    ),
                 ],
             );
             None
@@ -737,7 +752,8 @@ impl Nic {
                 ("skipped", skipped.to_string()),
                 (
                     "expected",
-                    "descriptor rx_next written back (DD) whenever RDH has passed it (7.1.8)".into(),
+                    "descriptor rx_next written back (DD) whenever RDH has passed it (7.1.8)"
+                        .into(),
                 ),
             ],
         );
@@ -804,7 +820,10 @@ impl Nic {
                 ("tdh", tdh.to_string()),
                 ("tx_clean", self.tx_clean.to_string()),
                 ("tx_tail", self.tx_tail.to_string()),
-                ("expected", "tx_clean <= TDH <= tx_tail (around the ring)".into()),
+                (
+                    "expected",
+                    "tx_clean <= TDH <= tx_tail (around the ring)".into(),
+                ),
             ],
         );
         if since(t) >= TX_RESYNC_NS {
@@ -900,7 +919,9 @@ impl Guest for Driver {
 
 impl ethernet::Guest for Driver {
     fn mac_address() -> (u8, u8, u8, u8, u8, u8) {
-        let m = NIC.with(|n| n.borrow().as_ref().map(|nic| nic.mac)).unwrap_or([0; 6]);
+        let m = NIC
+            .with(|n| n.borrow().as_ref().map(|nic| nic.mac))
+            .unwrap_or([0; 6]);
         (m[0], m[1], m[2], m[3], m[4], m[5])
     }
 
