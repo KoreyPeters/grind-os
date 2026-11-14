@@ -55,10 +55,14 @@ and a final `NIC result=pass|fail`. The peer prints every frame it
 receives (`rx:` lines). Logs: `vm/build/serial.log`,
 `target/nic-test/peer.log`.
 
-## Negative control
+## Negative controls
 
 `modules/silent` claims the link is up but never receives anything. The
-test must fail on it, which shows it cannot pass without a working driver:
+test must fail on it, which shows it cannot pass without a working driver.
+`modules/mute-error` returns an empty error from `receive`, and
+`modules/leaky` allocates a DMA buffer on every `receive`: grind-host
+must fail them with `driver-error-unreadable` and `dma-growth`, the
+host's side of the robustness contract (`docs/design/robust-nic.md`):
 
 ```sh
 cargo build --release --manifest-path tests/nic/modules/Cargo.toml --target wasm32-unknown-unknown

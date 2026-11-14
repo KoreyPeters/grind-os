@@ -19,6 +19,44 @@ const IP_PROTO_ICMP: u8 = 1;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 
+/// EtherType of the NIC test's control frames: 0x88B5, which IEEE 802
+/// reserves for local experimental use, so no real protocol uses it.
+pub const ETHERTYPE_CONTROL: u16 = 0x88B5;
+/// Control frames start their payload with this, so a stray frame with the
+/// same EtherType is not taken for one.
+pub const CONTROL_MAGIC: &[u8; 8] = b"GRINDCTL";
+
+/// A message from the test's peer to the host (docs/design/robust-nic.md),
+/// never handed to the responder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// The peer's timeline is over: stop serving.
+    Done,
+}
+
+impl Control {
+    pub fn name(self) -> &'static str {
+        match self {
+            Control::Done => "done",
+        }
+    }
+}
+
+/// The control message in `frame`, if it is one: EtherType 0x88B5, then
+/// `CONTROL_MAGIC`, then one op byte (1 = done).
+pub fn control(frame: &[u8]) -> Option<Control> {
+    if frame.len() < ETH_HEADER + CONTROL_MAGIC.len() + 1
+        || u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_CONTROL
+        || &frame[ETH_HEADER..ETH_HEADER + CONTROL_MAGIC.len()] != CONTROL_MAGIC
+    {
+        return None;
+    }
+    match frame[ETH_HEADER + CONTROL_MAGIC.len()] {
+        1 => Some(Control::Done),
+        _ => None,
+    }
+}
+
 /// What the responder made of one received frame.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
@@ -212,6 +250,26 @@ impl Responder {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn control_frames() {
+        let mut f = vec![0xffu8; 12];
+        f.extend_from_slice(&ETHERTYPE_CONTROL.to_be_bytes());
+        f.extend_from_slice(CONTROL_MAGIC);
+        f.push(1);
+        assert_eq!(control(&f), Some(Control::Done));
+        let mut unknown = f.clone();
+        *unknown.last_mut().unwrap() = 9;
+        assert_eq!(control(&unknown), None);
+        let mut no_magic = f.clone();
+        no_magic[14] = b'X';
+        assert_eq!(control(&no_magic), None);
+        let mut ipv4 = f.clone();
+        ipv4[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        assert_eq!(control(&ipv4), None);
+        assert_eq!(control(&f[..20]), None, "too short");
+    }
+
     use super::*;
 
     const US: Mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];

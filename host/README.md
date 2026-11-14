@@ -37,9 +37,21 @@ grind-host --device <pci-address> --module <driver.wasm>
    to return. Each frame is logged as `answered`, `frame-ignored` or
    `frame-malformed`; a frame outside 14–1514 bytes is a driver error.
 
-   Serving ends in a pass if nothing failed. Whether the pings were
-   actually answered on the wire is for the test's peer to judge
-   (`tests/nic`).
+   The host polls `link-up` every 100 ms and logs each change. It stops
+   when the peer sends a control frame saying its timeline is done
+   (EtherType 0x88B5, `src/net.rs`), or after `--serve-ms`. To keep a
+   flood from stalling the serial console, routine events are logged for
+   the first 20 of each kind and then only counted (`serve-end`).
+
+   The verdict follows the NIC robustness contract
+   (`docs/design/robust-nic.md`): a driver error is logged, not fatal
+   (reporting "link down" is correct). Serving fails on a trap, a
+   timeout, an empty error (`driver-error-unreadable`), a frame outside
+   14-1514 bytes (`frame-invalid`), DMA memory growing after `start`
+   (`dma-growth`), or fewer link drops reported than
+   `--expect-link-flaps` (`link-flaps-unseen`). Whether frames were
+   answered, and whether the driver recovered after each hostile phase,
+   is for the test's peer to judge (`tests/nic`).
 5. **Exercise** (only with `--exercise-block`). The device must take NVMe
    commands and the driver must target world `block-driver`. The host
    checks `block-size` and `capacity` against the expected values, then

@@ -102,15 +102,46 @@ world driver {
 ///
 /// Frames run from the destination MAC address through the payload: no
 /// preamble and no FCS. The host does not pad short frames.
+///
+/// Robustness contract (docs/design/robust-nic.md). The NIC test forces
+/// each of these conditions in every run, and a driver's SPEC.md says how
+/// it meets each:
+///
+/// - Link goes down: `link-up` returns false within 1 s; `transmit` may
+///   return an error or drop the frame. Link comes back: `link-up` true and
+///   frames flow again within 5 s, without `start` being called again.
+/// - Frames arrive faster than the host polls: frames may be lost, but the
+///   driver recovers by itself and frames flow again within 1 s of the
+///   flood ending.
+/// - Hostile frames (oversized, runt, garbage) are never returned if
+///   outside 14-1514 bytes and never break later receives.
+/// - A full transmit ring makes `transmit` return an error; nothing blocks
+///   past the call limit.
+/// - Registers reading all-ones (a device gone or wedged): every call
+///   returns within the limit, with a readable error if it cannot do its
+///   job; the driver recovers if the device comes back.
+/// - Anything the device writes to DMA memory (descriptor lengths, status,
+///   indexes, headers) is validated before use: a bad value means a
+///   readable error or a dropped frame, never an out-of-range access, a
+///   trap, or a wrong frame returned.
+/// - DMA allocation failing makes `start` return a readable error.
+/// - Over a run: no trap, no timeout, no growth in DMA memory after
+///   `start`, and every error string non-empty, saying what was attempted,
+///   expected and got (rule 3).
+///
+/// An error is not a failure in itself: reporting "link down" is correct.
 interface ethernet {
     /// The station address the device receives unicast frames for.
     mac-address: func() -> tuple<u8, u8, u8, u8, u8, u8>;
     /// Whether the link is up now (as the device reports it).
     link-up: func() -> bool;
     /// Send one frame (14 to 1514 bytes). Returning ok means the frame was
-    /// handed to the device, not that it has left the wire.
+    /// handed to the device, not that it has left the wire. An error when
+    /// the frame cannot be queued (link down, ring full).
     transmit: func(frame: list<u8>) -> result<_, string>;
-    /// Take one received frame, if any is waiting.
+    /// Take one received frame, if any is waiting. An error only when the
+    /// driver cannot tell (the device misbehaving); the next call tries
+    /// again.
     receive: func() -> result<option<list<u8>>, string>;
 }
 

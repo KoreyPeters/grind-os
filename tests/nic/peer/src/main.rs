@@ -56,6 +56,11 @@ const BULK_MIN: usize = 1000;
 const BULK_SPAN: usize = 473;
 /// Frames printed before the rest are only counted.
 const MAX_PRINTED: usize = 60;
+/// Control frames to grind-host (host/src/net.rs): EtherType 0x88B5, the
+/// magic, then an op byte.
+const ETHERTYPE_CONTROL: u16 = 0x88B5;
+const CONTROL_MAGIC: &[u8; 8] = b"GRINDCTL";
+const CONTROL_DONE: u8 = 1;
 
 fn fmt_mac(m: &[u8]) -> String {
     m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
@@ -227,6 +232,19 @@ fn echo_request(seq: u16, data: &[u8]) -> Vec<u8> {
     let c = checksum(&icmp);
     icmp[2..4].copy_from_slice(&c.to_be_bytes());
     f.extend_from_slice(&icmp);
+    f
+}
+
+/// A control frame to the host: `op` and its argument bytes.
+fn control_frame(op: u8, arg: &[u8]) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&DUT_MAC);
+    f.extend_from_slice(&PEER_MAC);
+    f.extend_from_slice(&ETHERTYPE_CONTROL.to_be_bytes());
+    f.extend_from_slice(CONTROL_MAGIC);
+    f.push(op);
+    f.extend_from_slice(arg);
+    f.resize(f.len().max(60), 0);
     f
 }
 
@@ -449,6 +467,8 @@ fn run(args: &Args) -> Result<(), ()> {
             );
         }
     }
+    // The timeline is over: tell the host to stop serving.
+    wire.send(&control_frame(CONTROL_DONE, &[]));
     if wire.seen > wire.printed {
         println!("    ({} more frames not shown)", wire.seen - wire.printed);
     }
