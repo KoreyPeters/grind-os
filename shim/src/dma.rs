@@ -339,23 +339,69 @@ impl DmaBuffer {
     pub fn read(&self, offset: u32, len: u32) -> Result<Vec<u8>, DmaError> {
         let start = self.check(offset, len as usize)?;
         fence(Ordering::SeqCst);
-        let base = self.ptr.as_ptr();
-        // SAFETY: start + i < self.len, inside the allocation we own. Volatile
-        // because the device may write this memory at any time.
-        Ok((0..len as usize)
-            .map(|i| unsafe { base.add(start + i).read_volatile() })
-            .collect())
+        let mut out = vec![0u8; len as usize];
+        // SAFETY: `check` keeps start..start + len inside the allocation we
+        // own. Volatile because the device may write this memory at any time.
+        unsafe { volatile_read(self.ptr.as_ptr().add(start), &mut out) };
+        Ok(out)
     }
 
     pub fn write(&self, offset: u32, data: &[u8]) -> Result<(), DmaError> {
         let start = self.check(offset, data.len())?;
-        let base = self.ptr.as_ptr();
-        for (i, b) in data.iter().enumerate() {
-            // SAFETY: as in `read`.
-            unsafe { base.add(start + i).write_volatile(*b) };
-        }
+        // SAFETY: as in `read`.
+        unsafe { volatile_write(self.ptr.as_ptr().add(start), data) };
         fence(Ordering::SeqCst);
         Ok(())
+    }
+}
+
+/// Copy `out.len()` bytes from `src` with volatile reads (issue #11): single
+/// bytes until `src` is 8-byte aligned, then aligned u64 reads, then the
+/// remaining bytes. The same bytes as one volatile read per byte, in about
+/// an eighth of the accesses.
+///
+/// # Safety
+/// `src..src + out.len()` must be valid for reads.
+unsafe fn volatile_read(src: *const u8, out: &mut [u8]) {
+    let n = out.len();
+    let head = src.align_offset(8).min(n);
+    let mut i = 0;
+    while i < head {
+        out[i] = src.add(i).read_volatile();
+        i += 1;
+    }
+    while i + 8 <= n {
+        let w = (src.add(i) as *const u64).read_volatile();
+        out[i..i + 8].copy_from_slice(&w.to_ne_bytes());
+        i += 8;
+    }
+    while i < n {
+        out[i] = src.add(i).read_volatile();
+        i += 1;
+    }
+}
+
+/// Copy `data` to `dst` with volatile writes, aligned as in
+/// [`volatile_read`].
+///
+/// # Safety
+/// `dst..dst + data.len()` must be valid for writes.
+unsafe fn volatile_write(dst: *mut u8, data: &[u8]) {
+    let n = data.len();
+    let head = dst.align_offset(8).min(n);
+    let mut i = 0;
+    while i < head {
+        dst.add(i).write_volatile(data[i]);
+        i += 1;
+    }
+    while i + 8 <= n {
+        let w = u64::from_ne_bytes(data[i..i + 8].try_into().expect("8 bytes"));
+        (dst.add(i) as *mut u64).write_volatile(w);
+        i += 8;
+    }
+    while i < n {
+        dst.add(i).write_volatile(data[i]);
+        i += 1;
     }
 }
 
@@ -413,6 +459,58 @@ impl Drop for DmaBuffer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn volatile_copies_match_byte_copies_at_every_offset_and_length() {
+        // Two 8-byte-aligned pages of distinct bytes.
+        let mut backing = vec![0u64; 1024];
+        let base = backing.as_mut_ptr() as *mut u8;
+        let bytes = 8192;
+        let reference: Vec<u8> = (0..bytes).map(|i| (i * 7 + i / 251) as u8).collect();
+        unsafe { std::ptr::copy_nonoverlapping(reference.as_ptr(), base, bytes) };
+        for offset in (0..24).chain([4093, 4096, 4100]) {
+            for len in (0..40).chain([4095, 4096, 4097]) {
+                if offset + len > bytes {
+                    continue;
+                }
+                let mut out = vec![0xaa; len];
+                unsafe { super::volatile_read(base.add(offset), &mut out) };
+                assert_eq!(out, reference[offset..offset + len], "read {offset}+{len}");
+
+                let data: Vec<u8> = (0..len).map(|i| (i as u8) ^ 0x5c).collect();
+                unsafe { super::volatile_write(base.add(offset), &data) };
+                let mut want = reference.clone();
+                want[offset..offset + len].copy_from_slice(&data);
+                let got = unsafe { std::slice::from_raw_parts(base, bytes) };
+                assert_eq!(got, &want[..], "write {offset}+{len}");
+                unsafe { std::ptr::copy_nonoverlapping(reference.as_ptr(), base, bytes) };
+            }
+        }
+    }
+
+    /// Timing, not correctness: `cargo test -p grind-shim --release --
+    /// --ignored --nocapture volatile_copy_speed`.
+    #[test]
+    #[ignore]
+    fn volatile_copy_speed() {
+        let mut backing = vec![0u64; 512];
+        let base = backing.as_mut_ptr() as *mut u8;
+        let mut out = vec![0u8; 4096];
+        let rounds = 20_000;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = unsafe { base.add(i).read_volatile() };
+            }
+        }
+        let bytewise = t.elapsed() / rounds;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            unsafe { super::volatile_read(base, &mut out) };
+        }
+        let wordwise = t.elapsed() / rounds;
+        println!("4 KiB read: byte at a time {bytewise:?}, 8 bytes at a time {wordwise:?}");
+    }
+
     use super::*;
 
     /// What QEMU 6.2.0's Intel IOMMU reports for each test device.
