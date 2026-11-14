@@ -12,13 +12,17 @@
 //! Separately, `--fail-allocation N` makes the driver's Nth DMA allocation
 //! fail.
 //!
-//! Faults are drawn from a seeded generator, and every one is logged (the
-//! first few of each kind in full, then counted), so a failure says what
-//! was injected and where. The windows are timed, so a replay with the
+//! Faults are drawn from a seeded generator, and every one is logged with
+//! its time (`t_ms` from the start of the run, the same clock as the
+//! driver's log lines), so a failure can be lined up with the fault that
+//! caused it. The one exception is a window that hits every register read
+//! (a device gone): those are counted per register and summarised when the
+//! window closes (`fault-window-end`), since each would say the same thing. The windows are timed, so a replay with the
 //! same seed injects the same kinds at the same rates, not the very same
 //! calls.
 
 use grind_shim::log::{emit, Value};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// Fault kinds, as bits in the control frame.
@@ -28,8 +32,6 @@ pub const KIND_SLOW: u8 = 4;
 
 /// How long a slowed call waits.
 const SLOW: Duration = Duration::from_millis(2);
-/// Injected faults logged in full per kind; the rest are counted.
-const LOG_CAP: u64 = 10;
 
 /// One fault window: until when, which kinds, and how often (per mille of
 /// the calls each kind applies to).
@@ -40,10 +42,23 @@ pub struct Window {
     pub per_mille: u16,
 }
 
+/// What one window injected, for its summary.
+#[derive(Default)]
+struct WindowCounts {
+    registers: u64,
+    device_data: u64,
+    slow: u64,
+    /// Register faults per offset.
+    by_register: BTreeMap<u32, u64>,
+}
+
 /// The fault state of one run.
 pub struct Faults {
     rng: u64,
+    /// The run's start, for `t_ms` (the host's clock portal uses the same).
+    started: Instant,
     window: Option<Window>,
+    counts: WindowCounts,
     /// `--fail-allocation N`: fail the Nth DMA allocation (1-based).
     fail_allocation: Option<u32>,
     allocations: u32,
@@ -54,11 +69,13 @@ pub struct Faults {
 }
 
 impl Faults {
-    pub fn new(seed: u64, fail_allocation: Option<u32>) -> Faults {
+    pub fn new(seed: u64, fail_allocation: Option<u32>, started: Instant) -> Faults {
         Faults {
             // xorshift64 must not start at zero.
             rng: seed.max(1),
+            started,
             window: None,
+            counts: WindowCounts::default(),
             fail_allocation,
             allocations: 0,
             injected_registers: 0,
@@ -78,8 +95,13 @@ impl Faults {
         x
     }
 
-    /// Open a window of `ms` milliseconds.
+    fn t_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Open a window of `ms` milliseconds (closing any open one first).
     pub fn open(&mut self, ms: u32, kinds: u8, per_mille: u16) {
+        self.close();
         let w = Window {
             until: Instant::now() + Duration::from_millis(ms.into()),
             kinds,
@@ -94,6 +116,33 @@ impl Faults {
                 ("device_data", Value::Bool(kinds & KIND_DEVICE_DATA != 0)),
                 ("slow", Value::Bool(kinds & KIND_SLOW != 0)),
                 ("per_mille", Value::U64(w.per_mille.into())),
+                ("t_ms", Value::U64(self.t_ms())),
+            ],
+        );
+    }
+
+    /// End the open window, if any, and log what it injected.
+    pub fn close(&mut self) {
+        if self.window.take().is_none() {
+            return;
+        }
+        let c = std::mem::take(&mut self.counts);
+        let by_register: Vec<String> = c
+            .by_register
+            .iter()
+            .map(|(off, n)| format!("0x{off:x}:{n}"))
+            .collect();
+        emit(
+            "fault-window-end",
+            &[
+                ("t_ms", Value::U64(self.t_ms())),
+                ("registers", Value::U64(c.registers)),
+                ("device_data", Value::U64(c.device_data)),
+                ("slow", Value::U64(c.slow)),
+                (
+                    "register_faults_by_offset",
+                    Value::Str(&by_register.join(" ")),
+                ),
             ],
         );
     }
@@ -102,18 +151,19 @@ impl Faults {
     fn hit(&mut self, kind: u8) -> bool {
         let Some(w) = self.window else { return false };
         if Instant::now() >= w.until {
-            self.window = None;
+            self.close();
             return false;
         }
         w.kinds & kind != 0 && self.next() % 1000 < u64::from(w.per_mille)
     }
 
-    fn log(n: u64, what: &str, fields: &[(&str, Value)]) {
-        if n <= LOG_CAP {
-            let mut f = vec![("kind", Value::Str(what))];
-            f.extend_from_slice(fields);
-            emit("fault-injected", &f);
-        }
+    fn log(&self, what: &str, fields: &[(&str, Value)]) {
+        let mut f = vec![
+            ("t_ms", Value::U64(self.t_ms())),
+            ("kind", Value::Str(what)),
+        ];
+        f.extend_from_slice(fields);
+        emit("fault-injected", &f);
     }
 
     /// A register read: `Some(all-ones)` to return instead of the device's
@@ -124,14 +174,19 @@ impl Faults {
             return None;
         }
         self.injected_registers += 1;
-        Self::log(
-            self.injected_registers,
-            "register-all-ones",
-            &[
-                ("op", Value::Str(op)),
-                ("offset", Value::Hex(offset.into())),
-            ],
-        );
+        self.counts.registers += 1;
+        *self.counts.by_register.entry(offset).or_default() += 1;
+        // A window that hits every read is a device gone: summarised at
+        // its end instead of one line per read.
+        if self.window.is_some_and(|w| w.per_mille < 1000) {
+            self.log(
+                "register-all-ones",
+                &[
+                    ("op", Value::Str(op)),
+                    ("offset", Value::Hex(offset.into())),
+                ],
+            );
+        }
         Some(if width == 4 {
             u32::MAX
         } else {
@@ -150,8 +205,8 @@ impl Faults {
         // Never zero: the byte always changes.
         data[at] ^= (self.next() % 255 + 1) as u8;
         self.injected_device_data += 1;
-        Self::log(
-            self.injected_device_data,
+        self.counts.device_data += 1;
+        self.log(
             "device-data",
             &[
                 ("iova", Value::Hex(iova)),
@@ -165,6 +220,7 @@ impl Faults {
     fn slow(&mut self) {
         if self.hit(KIND_SLOW) {
             self.injected_slow += 1;
+            self.counts.slow += 1;
             std::thread::sleep(SLOW);
         }
     }
@@ -179,6 +235,7 @@ impl Faults {
         emit(
             "fault-injected",
             &[
+                ("t_ms", Value::U64(self.t_ms())),
                 ("kind", Value::Str("allocation")),
                 ("op", Value::Str(op)),
                 ("size", Value::U64(size.into())),
@@ -195,7 +252,7 @@ mod tests {
 
     #[test]
     fn no_faults_outside_a_window() {
-        let mut f = Faults::new(1, None);
+        let mut f = Faults::new(1, None, Instant::now());
         for _ in 0..1000 {
             assert_eq!(f.register_read("read32", 0, 4), None);
         }
@@ -206,13 +263,13 @@ mod tests {
 
     #[test]
     fn a_window_injects_at_about_its_rate_and_ends() {
-        let mut f = Faults::new(42, None);
+        let mut f = Faults::new(42, None, Instant::now());
         f.open(60_000, KIND_REGISTERS, 200);
         let hits = (0..10_000)
             .filter(|_| f.register_read("read32", 0x8, 4).is_some())
             .count();
         assert!((1500..2500).contains(&hits), "about 20%: {hits}");
-        let mut short = Faults::new(42, None);
+        let mut short = Faults::new(42, None, Instant::now());
         short.open(0, KIND_REGISTERS, 1000);
         assert_eq!(
             short.register_read("read32", 0, 4),
@@ -223,7 +280,7 @@ mod tests {
 
     #[test]
     fn all_ones_fits_the_width() {
-        let mut f = Faults::new(3, None);
+        let mut f = Faults::new(3, None, Instant::now());
         f.open(60_000, KIND_REGISTERS, 1000);
         assert_eq!(f.register_read("read8", 0, 1), Some(0xff));
         assert_eq!(f.register_read("read16", 0, 2), Some(0xffff));
@@ -232,7 +289,7 @@ mod tests {
 
     #[test]
     fn device_data_changes_exactly_one_byte() {
-        let mut f = Faults::new(9, None);
+        let mut f = Faults::new(9, None, Instant::now());
         f.open(60_000, KIND_DEVICE_DATA, 1000);
         let mut d = vec![0x55u8; 32];
         f.device_data(0x1000, 0, &mut d);
@@ -244,7 +301,7 @@ mod tests {
     #[test]
     fn the_same_seed_gives_the_same_faults() {
         let run = |seed| {
-            let mut f = Faults::new(seed, None);
+            let mut f = Faults::new(seed, None, Instant::now());
             f.open(60_000, KIND_REGISTERS, 300);
             (0..200)
                 .map(|_| f.register_read("read32", 0, 4).is_some())
@@ -255,8 +312,30 @@ mod tests {
     }
 
     #[test]
+    fn a_window_counts_its_faults_by_register_and_resets_on_close() {
+        let mut f = Faults::new(4, None, Instant::now());
+        f.open(60_000, KIND_REGISTERS, 1000);
+        for _ in 0..3 {
+            f.register_read("read32", 0x8, 4);
+        }
+        f.register_read("read16", 0x3e, 2);
+        assert_eq!(f.counts.registers, 4);
+        assert_eq!(f.counts.by_register.get(&0x8), Some(&3));
+        assert_eq!(f.counts.by_register.get(&0x3e), Some(&1));
+        f.close();
+        assert!(f.window.is_none());
+        assert_eq!(f.counts.registers, 0, "the next window starts afresh");
+        assert_eq!(f.injected_registers, 4, "the run total is kept");
+        // Opening a new window closes the old one first.
+        f.open(60_000, KIND_REGISTERS, 1000);
+        f.register_read("read32", 0, 4);
+        f.open(60_000, KIND_DEVICE_DATA, 1000);
+        assert_eq!(f.counts.registers, 0);
+    }
+
+    #[test]
     fn fail_allocation_fails_exactly_the_nth() {
-        let mut f = Faults::new(1, Some(2));
+        let mut f = Faults::new(1, Some(2), Instant::now());
         assert!(!f.allocation("allocate", 4096));
         assert!(f.allocation("allocate", 4096));
         assert!(!f.allocation("allocate", 4096));

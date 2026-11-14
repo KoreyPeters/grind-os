@@ -60,8 +60,13 @@ grind-host --device <pci-address> --module <driver.wasm>
    changed, and some calls are slowed by 2 ms; the host closes the window
    itself. `--fail-allocation N` fails the driver's Nth DMA allocation.
    Faults come from a xorshift64 generator seeded by `--fault-seed`
-   (default 1); every one is logged (`fault-injected`, the first 10 of
-   each kind in full) and counted in `serve-end`. Only what the driver
+   (default 1). Every fault is logged (`fault-injected`) with `t_ms`, the
+   time since the run started, on the same clock as the driver's own log
+   lines (`driver-log` now carries `t_ms` too), so a fault lines up with
+   what the driver did next. A window that hits every register read (a
+   device gone) is counted per register instead of one line per read.
+   Each window ends with `fault-window-end`: its counts, and register
+   faults by offset. Totals are in `serve-end`. Only what the driver
    sees changes: writes and anything reaching the device are untouched,
    so rule 10 holds. Whether frames were
    answered, and whether the driver recovered after each hostile phase,

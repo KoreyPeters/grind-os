@@ -545,7 +545,12 @@ impl log::Host for State {
         };
         // Driver keys are prefixed so they cannot collide with ours.
         let keys: Vec<String> = fields.iter().map(|(k, _)| format!("field.{k}")).collect();
+        // t_ms: the same clock as injected faults, so the two line up.
         let mut out = vec![
+            (
+                "t_ms",
+                Value::U64(self.started.elapsed().as_millis() as u64),
+            ),
             ("level", Value::Str(level)),
             ("message", Value::Str(&message)),
         ];
@@ -814,13 +819,14 @@ fn main() -> ExitCode {
         drop(device);
         return setup_error("linker", "portals added to the linker", &format!("{e:#}"));
     }
+    let started = Instant::now();
     let state = State {
         device,
         table: ResourceTable::new(),
         limits: StoreLimitsBuilder::new().memory_size(MAX_MEMORY).build(),
         trace: args.trace,
-        started: Instant::now(),
-        faults: faults::Faults::new(args.fault_seed, args.fail_allocation),
+        started,
+        faults: faults::Faults::new(args.fault_seed, args.fail_allocation, started),
     };
     let mut store = Store::new(&engine, state);
     store.limiter(|s| &mut s.limits);
@@ -1244,6 +1250,7 @@ fn serve(store: &mut Store<State>, nic: &Nic, opts: &ServeOptions) -> Result<(),
             }
         }
     }
+    store.data_mut().faults.close();
     let dma_at_end = store.data().device.dma().used();
     emit(
         "serve-end",

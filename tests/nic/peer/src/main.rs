@@ -565,15 +565,34 @@ fn recovery(wire: &mut Wire, after: &str, seq: &mut u16) -> bool {
             break begun.elapsed();
         }
     };
+    // Send every remaining ping even after a loss: the pattern of losses
+    // (one, a run, every Nth) says more than the first one does.
+    let mut lost = Vec::new();
     for i in 2..=RECOVER_PINGS {
         *seq += 1;
         if let Err(why) = ping_once(wire, *seq, &data, PING_WAIT) {
-            step(&name, false, &expected, &format!("first reply after {} ms, then ping {i} (seq {seq}) failed: {why}", first.as_millis()));
-            return false;
+            lost.push((i, *seq, why));
         }
     }
-    step(&name, true, &expected, &format!("first reply after {} ms ({tries} tries), then {} more", first.as_millis(), RECOVER_PINGS - 1));
-    true
+    if lost.is_empty() {
+        step(&name, true, &expected, &format!("first reply after {} ms ({tries} tries), then {} more", first.as_millis(), RECOVER_PINGS - 1));
+        return true;
+    }
+    let shown: Vec<String> = lost.iter().take(10).map(|(i, s, why)| format!("#{i} (seq {s}, {why})")).collect();
+    step(
+        &name,
+        false,
+        &expected,
+        &format!(
+            "first reply after {} ms, then {} of the next {} lost: {}{}",
+            first.as_millis(),
+            lost.len(),
+            RECOVER_PINGS - 1,
+            shown.join(", "),
+            if lost.len() > 10 { ", ..." } else { "" }
+        ),
+    );
+    false
 }
 
 /// `count` large pings, one at a time, sequence numbers from `after + 1`,
@@ -590,12 +609,18 @@ fn bulk(wire: &mut Wire, name: &str, after: u16, count: u16) -> bool {
         let seq = after + 1 + i;
         let len = bulk_len(seq);
         if let Err(why) = ping_once(wire, seq, &bulk_data(seq, len), PING_WAIT) {
+            // Is the driver dead, or did it lose just this one? Ten more
+            // small pings tell them apart.
+            let data: Vec<u8> = (0..PING_DATA as u8).collect();
+            let after_ok = (1..=10u16)
+                .filter(|k| ping_once(wire, after + count + k, &data, PING_WAIT).is_ok())
+                .count();
             step(
                 name,
                 false,
                 &expected,
                 &format!(
-                    "ping {} of {count} (seq {seq}, {len} data bytes) failed after {i} replies ({bytes} data bytes each way): {why}",
+                    "ping {} of {count} (seq {seq}, {len} data bytes) failed after {i} replies ({bytes} data bytes each way): {why}; then {after_ok} of 10 small pings answered",
                     i + 1
                 ),
             );
@@ -629,12 +654,17 @@ fn fault_windows(wire: &mut Wire, seq: &mut u16) -> bool {
         wire.send(&control_frame(CONTROL_FAULTS, &arg));
         let begun = Instant::now();
         let (mut sent, mut answered) = (0u32, 0u32);
+        let (mut run, mut longest) = (0u32, 0u32);
         let data: Vec<u8> = (0..PING_DATA as u8).collect();
         while begun.elapsed() < FAULT_WINDOW {
             *seq += 1;
             sent += 1;
             if ping_once(wire, *seq, &data, FAULT_PING_EVERY).is_ok() {
                 answered += 1;
+                run = 0;
+            } else {
+                run += 1;
+                longest = longest.max(run);
             }
         }
         drain(wire, Duration::from_millis(200));
@@ -645,7 +675,7 @@ fn fault_windows(wire: &mut Wire, seq: &mut u16) -> bool {
                 "a {} ms window of injected device faults ({name}, {per_mille} per mille), traffic kept flowing",
                 FAULT_WINDOW.as_millis()
             ),
-            &format!("{sent} pings during the window, {answered} answered (not judged)"),
+            &format!("{sent} pings during the window, {answered} answered, longest run lost {longest} (not judged)"),
         );
         if !recovery(wire, &format!("faults-{name}"), seq) {
             return false;

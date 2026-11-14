@@ -78,6 +78,13 @@ harness/grind.sh e1000e                    # builds the driver and runs this
    responding" and recovery paths, which reads it can retry past never
    reach.
 
+   Reports say what was lost, not just the first loss: a recovery check
+   sends all 20 pings and lists every lost one (for example "4 of the
+   next 19 lost: #11, #12, #13, #14"); a fault window reports its longest
+   run of lost pings; a failed bulk step sends 10 more small pings and
+   says how many were answered, telling a dead driver from one that lost
+   a frame.
+
    The faults are seeded, and the seed is random each run:
    `check.sh` prints `NIC fault-seed=N (replay with NIC_FAULT_SEED=N)`
    and passes it to the guest (`vm/run.sh --seed`, `grind.seed=`) and on
