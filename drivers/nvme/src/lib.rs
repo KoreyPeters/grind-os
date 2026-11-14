@@ -49,7 +49,10 @@ thread_local! {
 }
 
 fn info(message: &str, fields: &[(&str, String)]) {
-    let f: Vec<(String, String)> = fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    let f: Vec<(String, String)> = fields
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
     log::emit(log::Level::Info, message, &f);
 }
 
@@ -79,11 +82,21 @@ struct Kind {
 
 impl Reporter {
     fn note(&mut self, level: log::Level, message: &'static str, fields: &[(&str, String)]) {
-        let fields: Vec<(String, String)> = fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let fields: Vec<(String, String)> = fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
         let i = match self.kinds.iter().position(|k| k.message == message) {
             Some(i) => i,
             None => {
-                self.kinds.push(Kind { message, level, total: 0, unreported: 0, latest: Vec::new(), last_summary_ns: 0 });
+                self.kinds.push(Kind {
+                    message,
+                    level,
+                    total: 0,
+                    unreported: 0,
+                    latest: Vec::new(),
+                    last_summary_ns: 0,
+                });
                 self.kinds.len() - 1
             }
         };
@@ -103,11 +116,23 @@ impl Reporter {
     /// report is a second old.
     fn tick(&mut self) {
         let now = clock::now_ns();
-        for k in self.kinds.iter_mut().filter(|k| k.unreported > 0 && now.saturating_sub(k.last_summary_ns) >= SUMMARY_NS) {
-            let mut f = vec![
-                ("summary".to_string(), format!("{} more since the last report, {} in all", k.unreported, k.total)),
-            ];
-            f.extend(k.latest.iter().map(|(a, b)| (format!("latest_{a}"), b.clone())));
+        for k in self
+            .kinds
+            .iter_mut()
+            .filter(|k| k.unreported > 0 && now.saturating_sub(k.last_summary_ns) >= SUMMARY_NS)
+        {
+            let mut f = vec![(
+                "summary".to_string(),
+                format!(
+                    "{} more since the last report, {} in all",
+                    k.unreported, k.total
+                ),
+            )];
+            f.extend(
+                k.latest
+                    .iter()
+                    .map(|(a, b)| (format!("latest_{a}"), b.clone())),
+            );
             log::emit(k.level, k.message, &f);
             k.unreported = 0;
             k.last_summary_ns = now;
@@ -159,23 +184,35 @@ fn status(cpl: &[u8]) -> (u16, u16) {
 }
 
 fn admin(what: &str, cmd: Vec<u8>) -> Result<Vec<u8>, String> {
-    let cpl = nvme::admin(&cmd).map_err(|e| format!("{what}: expected a completion, the nvme portal returned {e:?}"))?;
+    let cpl = nvme::admin(&cmd)
+        .map_err(|e| format!("{what}: expected a completion, the nvme portal returned {e:?}"))?;
     if cpl.len() != 16 {
-        return Err(format!("{what}: expected a 16-byte completion, got {} bytes", cpl.len()));
+        return Err(format!(
+            "{what}: expected a 16-byte completion, got {} bytes",
+            cpl.len()
+        ));
     }
     let (sent, got) = (le16(&cmd, 2), le16(&cpl, 12));
     if got != sent {
-        return Err(format!("{what}: expected the completion for command {sent}, got command {got}"));
+        return Err(format!(
+            "{what}: expected the completion for command {sent}, got command {got}"
+        ));
     }
     match status(&cpl) {
         (0, 0) => Ok(cpl),
-        (sct, sc) => Err(format!("{what}: expected success, got status SCT 0x{sct:x} SC 0x{sc:02x}")),
+        (sct, sc) => Err(format!(
+            "{what}: expected success, got status SCT 0x{sct:x} SC 0x{sc:02x}"
+        )),
     }
 }
 
 fn identify(buf: &dma::Buffer, cns: u32, nsid: u32, what: &str) -> Result<Vec<u8>, String> {
-    admin(what, command(OPC_IDENTIFY, 0, nsid, buf.iova(), 0, [cns, 0, 0]))?;
-    buf.read(0, PAGE).map_err(|e| format!("{what}: read data: {e:?}"))
+    admin(
+        what,
+        command(OPC_IDENTIFY, 0, nsid, buf.iova(), 0, [cns, 0, 0]),
+    )?;
+    buf.read(0, PAGE)
+        .map_err(|e| format!("{what}: read data: {e:?}"))
 }
 
 fn setup() -> Result<Disk, String> {
@@ -183,7 +220,9 @@ fn setup() -> Result<Disk, String> {
     let cap_hi = mmio::read32(REG_CAP + 4).map_err(|e| format!("read CAP: {e:?}"))?;
     let csts = mmio::read32(REG_CSTS).map_err(|e| format!("read CSTS: {e:?}"))?;
     if csts & 1 != 1 || csts & 2 != 0 {
-        return Err(format!("controller state: expected CSTS.RDY = 1 and CFS = 0, got CSTS 0x{csts:08x}"));
+        return Err(format!(
+            "controller state: expected CSTS.RDY = 1 and CFS = 0, got CSTS 0x{csts:08x}"
+        ));
     }
     let mqes = (cap_lo & 0xffff) + 1;
     let mpsmin = (cap_hi >> 16) & 0xf;
@@ -195,7 +234,11 @@ fn setup() -> Result<Disk, String> {
     if nn < 1 {
         return Err("Identify Controller: expected at least one namespace (NN >= 1), got 0".into());
     }
-    let max_transfer = if mdts == 0 { u32::MAX } else { 1u32.checked_shl(mdts + 12 + mpsmin).unwrap_or(u32::MAX) };
+    let max_transfer = if mdts == 0 {
+        u32::MAX
+    } else {
+        1u32.checked_shl(mdts + 12 + mpsmin).unwrap_or(u32::MAX)
+    };
 
     let ns = identify(&page, 0, NSID, "Identify Namespace 1")?;
     let blocks = le64(&ns, 0);
@@ -206,7 +249,9 @@ fn setup() -> Result<Disk, String> {
         fmt |= ((flbas >> 5) & 0x3) << 4;
     }
     if fmt > nlbaf {
-        return Err(format!("Identify Namespace 1: format index {fmt} beyond NLBAF {nlbaf}"));
+        return Err(format!(
+            "Identify Namespace 1: format index {fmt} beyond NLBAF {nlbaf}"
+        ));
     }
     let lbaf = le32(&ns, 128 + 4 * usize::from(fmt));
     let ms = lbaf & 0xffff;
@@ -219,7 +264,9 @@ fn setup() -> Result<Disk, String> {
     let block_size = 1u32 << lbads;
     let max_bytes = (MAX_PRP_BYTES.min(max_transfer) / block_size) * block_size;
     if max_bytes == 0 {
-        return Err(format!("transfer size: blocks of {block_size} bytes exceed the {max_transfer}-byte limit"));
+        return Err(format!(
+            "transfer size: blocks of {block_size} bytes exceed the {max_transfer}-byte limit"
+        ));
     }
 
     let cpl = admin(
@@ -232,13 +279,35 @@ fn setup() -> Result<Disk, String> {
     let (sqs, cqs) = ((granted & 0xffff) + 1, (granted >> 16) + 1);
 
     let entries = QUEUE_ENTRIES.min(mqes);
-    admin("Create I/O Completion Queue 1", command(OPC_CREATE_CQ, 0, 0, 0, 0, [((entries - 1) << 16) | u32::from(QID), 1, 0]))?;
+    admin(
+        "Create I/O Completion Queue 1",
+        command(
+            OPC_CREATE_CQ,
+            0,
+            0,
+            0,
+            0,
+            [((entries - 1) << 16) | u32::from(QID), 1, 0],
+        ),
+    )?;
     admin(
         "Create I/O Submission Queue 1",
-        command(OPC_CREATE_SQ, 0, 0, 0, 0, [((entries - 1) << 16) | u32::from(QID), (u32::from(QID) << 16) | 1, 0]),
+        command(
+            OPC_CREATE_SQ,
+            0,
+            0,
+            0,
+            0,
+            [
+                ((entries - 1) << 16) | u32::from(QID),
+                (u32::from(QID) << 16) | 1,
+                0,
+            ],
+        ),
     )?;
 
-    let data = dma::allocate(MAX_PRP_BYTES).map_err(|e| format!("allocate the data buffer: {e:?}"))?;
+    let data =
+        dma::allocate(MAX_PRP_BYTES).map_err(|e| format!("allocate the data buffer: {e:?}"))?;
     info(
         "nvme ready",
         &[
@@ -250,7 +319,15 @@ fn setup() -> Result<Disk, String> {
             ("io_queues_granted", format!("{sqs} SQ, {cqs} CQ")),
         ],
     );
-    Ok(Disk { block_size, blocks, max_bytes, data, next_cid: 1, pending: None, reporter: Reporter::default() })
+    Ok(Disk {
+        block_size,
+        blocks,
+        max_bytes,
+        data,
+        next_cid: 1,
+        pending: None,
+        reporter: Reporter::default(),
+    })
 }
 
 /// The one command the device may still be working on: submitted, but
@@ -266,7 +343,10 @@ struct Pending {
 enum Attempt {
     Done,
     /// The device reported an error; `retry` when DNR is clear.
-    DeviceError { message: String, retry: bool },
+    DeviceError {
+        message: String,
+        retry: bool,
+    },
     /// A completion that cannot be this command's (wrong CID, SQID or
     /// size, or more entries than commands outstanding): the device
     /// returned nonsense. Every command has completed, so a retry is safe.
@@ -285,16 +365,29 @@ impl Disk {
     /// driver the device is done with the data buffer, not their contents.
     fn drain(&mut self, what: &str, deadline: u64) -> Result<(), String> {
         while let Some(p) = &self.pending {
-            let done = nvme::complete(QID).map_err(|e| portal_error(what, "collect the completion of an earlier command", e))?;
+            let done = nvme::complete(QID).map_err(|e| {
+                portal_error(what, "collect the completion of an earlier command", e)
+            })?;
             if let Some(first) = done.first() {
-                let (sqid, cid) = if first.len() == 16 { (le16(first, 10), le16(first, 12)) } else { (0, 0) };
+                let (sqid, cid) = if first.len() == 16 {
+                    (le16(first, 10), le16(first, 12))
+                } else {
+                    (0, 0)
+                };
                 self.reporter.note(
                     log::Level::Warn,
                     "late completion discarded",
                     &[
                         ("command", p.what.clone()),
                         ("expected_cid", p.cid.to_string()),
-                        ("got", format!("{} entries; first SQ {sqid} CID {cid}, {} ms after submission", done.len(), Self::elapsed_ms(p.since_ns))),
+                        (
+                            "got",
+                            format!(
+                                "{} entries; first SQ {sqid} CID {cid}, {} ms after submission",
+                                done.len(),
+                                Self::elapsed_ms(p.since_ns)
+                            ),
+                        ),
                     ],
                 );
                 self.pending = None;
@@ -315,7 +408,14 @@ impl Disk {
 
     /// Submit one I/O command and wait (until `deadline`) for its
     /// completion. On a timeout the command stays pending.
-    fn attempt(&mut self, what: &str, opcode: u8, lba: u64, bytes: u32, deadline: u64) -> Result<Attempt, String> {
+    fn attempt(
+        &mut self,
+        what: &str,
+        opcode: u8,
+        lba: u64,
+        bytes: u32,
+        deadline: u64,
+    ) -> Result<Attempt, String> {
         self.drain(what, deadline)?;
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1).max(1);
@@ -323,14 +423,28 @@ impl Disk {
             (0, 0, [0, 0, 0])
         } else {
             let iova = self.data.iova();
-            let prp2 = if bytes > PAGE { iova + u64::from(PAGE) } else { 0 };
-            (iova, prp2, [lba as u32, (lba >> 32) as u32, bytes / self.block_size - 1])
+            let prp2 = if bytes > PAGE {
+                iova + u64::from(PAGE)
+            } else {
+                0
+            };
+            (
+                iova,
+                prp2,
+                [lba as u32, (lba >> 32) as u32, bytes / self.block_size - 1],
+            )
         };
-        nvme::submit(QID, &command(opcode, cid, NSID, prp1, prp2, cdw)).map_err(|e| portal_error(what, "queue the command", e))?;
+        nvme::submit(QID, &command(opcode, cid, NSID, prp1, prp2, cdw))
+            .map_err(|e| portal_error(what, "queue the command", e))?;
         let since_ns = clock::now_ns();
-        self.pending = Some(Pending { cid, what: what.to_string(), since_ns });
+        self.pending = Some(Pending {
+            cid,
+            what: what.to_string(),
+            since_ns,
+        });
         loop {
-            let done = nvme::complete(QID).map_err(|e| portal_error(what, "collect the completion", e))?;
+            let done =
+                nvme::complete(QID).map_err(|e| portal_error(what, "collect the completion", e))?;
             if !done.is_empty() {
                 // One command was outstanding, so the first entry ends it,
                 // whatever it says.
@@ -343,7 +457,10 @@ impl Disk {
                 }
                 let cpl = &done[0];
                 if cpl.len() != 16 {
-                    return Ok(Attempt::Nonsense(format!("expected a 16-byte completion, got {} bytes", cpl.len())));
+                    return Ok(Attempt::Nonsense(format!(
+                        "expected a 16-byte completion, got {} bytes",
+                        cpl.len()
+                    )));
                 }
                 let (sqid, got) = (le16(cpl, 10), le16(cpl, 12));
                 if sqid != QID || got != cid {
@@ -357,7 +474,10 @@ impl Disk {
                     (sct, sc) => {
                         let dnr = s >> 15 & 1 == 1;
                         Attempt::DeviceError {
-                            message: format!("expected success, got status SCT 0x{sct:x} SC 0x{sc:02x}{}", if dnr { ", DNR set" } else { "" }),
+                            message: format!(
+                                "expected success, got status SCT 0x{sct:x} SC 0x{sc:02x}{}",
+                                if dnr { ", DNR set" } else { "" }
+                            ),
                             retry: !dnr,
                         }
                     }
@@ -376,20 +496,43 @@ impl Disk {
     /// Issue one I/O command, retrying a transient failure (an error status
     /// with DNR clear, or a completion that cannot be this command's) up to
     /// MAX_ATTEMPTS times, all before `deadline`.
-    fn io(&mut self, what: &str, opcode: u8, lba: u64, bytes: u32, deadline: u64) -> Result<(), String> {
+    fn io(
+        &mut self,
+        what: &str,
+        opcode: u8,
+        lba: u64,
+        bytes: u32,
+        deadline: u64,
+    ) -> Result<(), String> {
         let mut failures: Vec<String> = Vec::new();
         for n in 1..=MAX_ATTEMPTS {
             let (message, retry) = match self.attempt(what, opcode, lba, bytes, deadline)? {
                 Attempt::Done => {
                     if !failures.is_empty() {
-                        self.reporter.note(log::Level::Info, "succeeded after retry", &[("command", what.to_string()), ("attempt", n.to_string()), ("earlier", failures.join("; "))]);
+                        self.reporter.note(
+                            log::Level::Info,
+                            "succeeded after retry",
+                            &[
+                                ("command", what.to_string()),
+                                ("attempt", n.to_string()),
+                                ("earlier", failures.join("; ")),
+                            ],
+                        );
                     }
                     return Ok(());
                 }
                 Attempt::DeviceError { message, retry } => (message, retry),
                 Attempt::Nonsense(message) => (message, true),
             };
-            self.reporter.note(log::Level::Warn, "command failed", &[("command", what.to_string()), ("attempt", n.to_string()), ("got", message.clone())]);
+            self.reporter.note(
+                log::Level::Warn,
+                "command failed",
+                &[
+                    ("command", what.to_string()),
+                    ("attempt", n.to_string()),
+                    ("got", message.clone()),
+                ],
+            );
             failures.push(format!("attempt {n}: {message}"));
             if !retry || clock::now_ns() >= deadline {
                 break;
@@ -416,9 +559,16 @@ impl Disk {
         let mut at = lba;
         while (out.len() as u64) < total {
             let bytes = (total - out.len() as u64).min(self.max_bytes.into()) as u32;
-            let what = format!("Read LBA {at}-{} of read({lba}, {count})", at + u64::from(bytes / self.block_size) - 1);
+            let what = format!(
+                "Read LBA {at}-{} of read({lba}, {count})",
+                at + u64::from(bytes / self.block_size) - 1
+            );
             self.io(&what, OPC_READ, at, bytes, deadline)?;
-            out.extend(self.data.read(0, bytes).map_err(|e| format!("{what}: read the data buffer: {e:?}"))?);
+            out.extend(
+                self.data
+                    .read(0, bytes)
+                    .map_err(|e| format!("{what}: read the data buffer: {e:?}"))?,
+            );
             at += u64::from(bytes / self.block_size);
         }
         Ok(out)
@@ -427,17 +577,25 @@ impl Disk {
     fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), String> {
         let bs = self.block_size as usize;
         if data.is_empty() || data.len() % bs != 0 {
-            return Err(format!("write: expected a whole number of {bs}-byte blocks, got {} bytes", data.len()));
+            return Err(format!(
+                "write: expected a whole number of {bs}-byte blocks, got {} bytes",
+                data.len()
+            ));
         }
         self.check_range("write", lba, (data.len() / bs) as u64)?;
         let deadline = clock::now_ns() + CALL_BUDGET_NS;
         let blocks = data.len() / bs;
         let mut at = lba;
         for chunk in data.chunks(self.max_bytes as usize) {
-            let what = format!("Write LBA {at}-{} of write({lba}, {blocks} blocks)", at + (chunk.len() / bs) as u64 - 1);
+            let what = format!(
+                "Write LBA {at}-{} of write({lba}, {blocks} blocks)",
+                at + (chunk.len() / bs) as u64 - 1
+            );
             // The buffer is free: no command is pending once drain returns.
             self.drain(&what, deadline)?;
-            self.data.write(0, chunk).map_err(|e| format!("{what}: fill the data buffer: {e:?}"))?;
+            self.data
+                .write(0, chunk)
+                .map_err(|e| format!("{what}: fill the data buffer: {e:?}"))?;
             self.io(&what, OPC_WRITE, at, chunk.len() as u32, deadline)?;
             at += (chunk.len() / bs) as u64;
         }
