@@ -12,6 +12,12 @@
 #   --log FILE                check mode: serial log (default vm/build/serial.log)
 #   --run GUEST_PATH          after the VM checks, run this initramfs program
 #                             with the e1000e's PCI address (see build-initramfs.sh --add)
+#   --net-udp PEER:LOCAL      connect the e1000e to a UDP socket instead of
+#                             user-mode networking: QEMU binds 127.0.0.1:LOCAL
+#                             and sends each frame as one datagram to
+#                             127.0.0.1:PEER (see tests/nic)
+#
+# The e1000e's MAC address is always 52:54:00:12:34:56.
 #
 # Host-side failures print one line of the form
 #   VMRUN step=<step> expected="..." got="..."
@@ -27,9 +33,10 @@ MODE=shell
 TIMEOUT=90
 LOG="$BUILD/serial.log"
 RUN=""
+NETDEV="user,id=net0"
 
 usage() {
-	sed -n '4,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+	sed -n '4,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 	exit 2
 }
 
@@ -39,6 +46,13 @@ while [ $# -gt 0 ]; do
 	--timeout) TIMEOUT="${2:?--timeout needs a value}"; shift ;;
 	--log) LOG="${2:?--log needs a value}"; shift ;;
 	--run) RUN="${2:?--run needs a value}"; shift ;;
+	--net-udp)
+		ports="${2:?--net-udp needs PEER:LOCAL}"
+		[[ "$ports" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]] ||
+			{ echo "run.sh: --net-udp takes PEER:LOCAL port numbers, got: $ports" >&2; exit 2; }
+		NETDEV="socket,id=net0,udp=127.0.0.1:${BASH_REMATCH[1]},localaddr=127.0.0.1:${BASH_REMATCH[2]}"
+		shift
+		;;
 	-h | --help) usage ;;
 	*) echo "run.sh: unknown argument: $1" >&2; usage ;;
 	esac
@@ -75,8 +89,8 @@ QEMU_ARGS=(
 	-nodefaults -no-user-config -display none -no-reboot
 	# The IOMMU must be created before the devices it translates for.
 	-device intel-iommu,intremap=on
-	-netdev user,id=net0
-	-device e1000e,netdev=net0
+	-netdev "$NETDEV"
+	-device e1000e,netdev=net0,mac=52:54:00:12:34:56
 	-kernel "$BUILD/vmlinuz"
 	-initrd "$BUILD/initramfs.gz"
 	-append "$APPEND"
