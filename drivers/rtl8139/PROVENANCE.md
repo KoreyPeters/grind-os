@@ -89,3 +89,37 @@ commands; no `mmio-denied`. Nothing to fix. Observations recorded above.
 Confirmation run; the only change since run 1 was this file. Same
 result: ARP after 5 requests (2.1 s), pings 1.3-1.4 ms, 0 violations,
 0 refused commands, no driver warnings.
+
+## C-mode experiment (2026-11-14)
+
+After issue #13 added `dma.allocate32`, a second fresh session wrote a
+C-mode driver for this chip (receive ring buffer via RBSTART/CAPR/CBR,
+transmit through TSD0-3/TSAD0-3, C+ mode left off, all DMA buffers below
+4 GiB), from the same two datasheets under the same rules (no other
+RTL8139 driver, this directory's earlier driver included; no QEMU source;
+no web). It passed `harness/grind.sh rtl8139` on its first run and on a
+confirmation run, so again no failure exercised the grind loop. It was
+not kept: one driver per device, and the C+ driver covers the test.
+
+Both datasheets defer C-mode buffer details to a Realtek programming
+guide that was not available. The session recorded each gap as an
+assumption and settled it against QEMU 6.2.0:
+
+- Rx packet header: 4 bytes, a status word (C datasheet 6.1) then the
+  length, both little-endian; the length includes the 4-byte CRC and
+  excludes the header (seen: `01 20 40 00` for a broadcast ARP, length
+  64).
+- CAPR holds the read offset minus 16 (its initial value is 0xFFF0);
+  writing next offset - 16 empties the ring.
+- With RCR.WRAP = 1 and RBLEN = 8K + 16, offsets wrap at 8192, and a
+  packet is contiguous past the end. Confirmed only once `tests/nic`
+  gained its bulk step (commit 76719a0): the ring wrapped about 45 times.
+- Transmit descriptors are used in order 0, 1, 2, 3 after reset; TSAD
+  (0x60) shows TOKn set per completed descriptor.
+- Whether C mode pads short frames was not tested; the driver padded to
+  60 bytes itself.
+
+The bulk step was checked with a mutant of that driver whose ring wrap
+was 8192 + 16: it passed ARP and the three small pings and failed `bulk`
+at ping 8, where the ring first wraps, with its own log naming a bad
+receive header at ring offset 1356.
