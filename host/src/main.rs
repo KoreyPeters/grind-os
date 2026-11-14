@@ -6,7 +6,13 @@
 //! grind-host --device <pci-address> --module <driver.wasm>
 //!            [--timeout-ms N] [--dma-limit-mib N] [--trace]
 //!            [--allow-unreviewed-deny-list]
+//!            [--serve-ping <ipv4> [--serve-ms N]]
 //! ```
+//!
+//! With `--serve-ping`, the module must target world `nic`. After `start`
+//! succeeds, the host polls the driver's `receive` for `--serve-ms` and
+//! answers ARP and ICMP echo requests for the address through `transmit`
+//! (see `net.rs`).
 //!
 //! The module must be a core Wasm module built for wasm32-unknown-unknown
 //! with wit-bindgen against `portals/wit` (world `driver`). Its only allowed
@@ -23,19 +29,42 @@
 use grind_shim::log::{emit, Value};
 use grind_shim::{Device, DmaBuffer, DmaError, MmioError};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
-wasmtime::component::bindgen!({
-    path: "../portals/wit",
-    world: "driver",
-    imports: { default: trappable },
-    with: { "grind:portals/dma.buffer": grind_shim::DmaBuffer },
-});
+mod net;
 
-use grind::portals::{clock, dma, log, mmio};
+/// World `driver`: the portals plus `start`.
+mod driver_world {
+    wasmtime::component::bindgen!({
+        path: "../portals/wit",
+        world: "driver",
+        imports: { default: trappable },
+        with: { "grind:portals/dma.buffer": grind_shim::DmaBuffer },
+    });
+}
+
+/// World `nic`: the same portals (shared with `driver_world`), plus the
+/// `ethernet` exports.
+mod nic_world {
+    wasmtime::component::bindgen!({
+        path: "../portals/wit",
+        world: "nic",
+        imports: { default: trappable },
+        with: {
+            "grind:portals/mmio": crate::driver_world::grind::portals::mmio,
+            "grind:portals/dma": crate::driver_world::grind::portals::dma,
+            "grind:portals/clock": crate::driver_world::grind::portals::clock,
+            "grind:portals/log": crate::driver_world::grind::portals::log,
+        },
+    });
+}
+
+use driver_world::grind::portals::{clock, dma, log, mmio};
+use driver_world::Driver;
+use nic_world::Nic;
+use std::net::Ipv4Addr;
 
 /// Core-module import names a driver may use: the portal interfaces.
 const PORTAL_IMPORTS: &[&str] = &[
@@ -49,6 +78,15 @@ const PORTAL_IMPORTS: &[&str] = &[
 const MAX_SLEEP_US: u32 = 1_000_000;
 /// Linear memory limit for a driver.
 const MAX_MEMORY: usize = 64 << 20;
+/// The epoch ticks this often; call time limits are counted in ticks.
+const TICK: Duration = Duration::from_millis(10);
+/// Time limit for each `ethernet` call while serving.
+const CALL_LIMIT: Duration = Duration::from_secs(1);
+/// Pause between `receive` polls that found nothing.
+const IDLE_POLL: Duration = Duration::from_millis(1);
+/// Frame sizes the `ethernet` interface allows (no FCS).
+const MIN_FRAME: usize = 14;
+const MAX_FRAME: usize = 1514;
 
 struct Args {
     device: String,
@@ -57,6 +95,8 @@ struct Args {
     dma_limit: u64,
     trace: bool,
     allow_unreviewed: bool,
+    serve_ping: Option<Ipv4Addr>,
+    serve: Duration,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -67,6 +107,8 @@ fn parse_args() -> Result<Args, String> {
     let mut dma_limit = 64u64 << 20;
     let mut trace = false;
     let mut allow_unreviewed = false;
+    let mut serve_ping = None;
+    let mut serve = Duration::from_secs(10);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -88,6 +130,20 @@ fn parse_args() -> Result<Args, String> {
             }
             "--trace" => trace = true,
             "--allow-unreviewed-deny-list" => allow_unreviewed = true,
+            "--serve-ping" => {
+                let v = value("--serve-ping")?;
+                serve_ping = Some(
+                    v.parse()
+                        .map_err(|_| format!("--serve-ping {v}: not an IPv4 address"))?,
+                );
+            }
+            "--serve-ms" => {
+                let v = value("--serve-ms")?;
+                serve = Duration::from_millis(
+                    v.parse()
+                        .map_err(|_| format!("--serve-ms {v}: not a number"))?,
+                );
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -98,6 +154,8 @@ fn parse_args() -> Result<Args, String> {
         dma_limit,
         trace,
         allow_unreviewed,
+        serve_ping,
+        serve,
     })
 }
 
@@ -441,27 +499,34 @@ fn main() -> ExitCode {
     };
     let mut store = Store::new(&engine, state);
     store.limiter(|s| &mut s.limits);
-    store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
-    let ticker = Arc::new(engine.clone());
-    let timeout = args.timeout;
-    std::thread::spawn(move || {
-        std::thread::sleep(timeout);
+    // Each call into the driver gets a deadline counted in ticks.
+    let ticker = engine.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(TICK);
         ticker.increment_epoch();
     });
 
-    let driver = match Driver::instantiate(&mut store, &component, &linker) {
-        Ok(d) => d,
+    // Instantiation runs the module's start section, so it needs a deadline
+    // too.
+    set_deadline(&mut store, args.timeout);
+    let instance = match args.serve_ping {
+        None => Driver::instantiate(&mut store, &component, &linker).map(Instance::Driver),
+        Some(_) => Nic::instantiate(&mut store, &component, &linker).map(Instance::Nic),
+    };
+    let instance = match instance {
+        Ok(i) => i,
         Err(e) => {
+            let world = if args.serve_ping.is_some() { "nic" } else { "driver" };
             return setup_error(
                 "instantiate",
-                "the driver instantiates against the portals",
+                &format!("the driver instantiates as world {world} against the portals"),
                 &format!("{e:#}"),
-            )
+            );
         }
     };
 
-    // 4. Run.
+    // 4. Run: start, then (for a NIC) serve.
     emit(
         "start",
         &[
@@ -469,12 +534,36 @@ fn main() -> ExitCode {
             ("timeout_ms", Value::U64(args.timeout.as_millis() as u64)),
         ],
     );
-    let outcome = driver.call_start(&mut store);
+    set_deadline(&mut store, args.timeout);
+    let started = match &instance {
+        Instance::Driver(d) => d.call_start(&mut store),
+        Instance::Nic(n) => n.call_start(&mut store),
+    };
+    let failure: Option<&'static str> = match started {
+        Err(e) => Some(call_failed("start", args.timeout, e)),
+        Ok(Err(msg)) => {
+            emit(
+                "driver-error",
+                &[
+                    ("call", Value::Str("start")),
+                    ("expected", Value::Str("start returns ok")),
+                    ("got", Value::Str(&msg)),
+                ],
+            );
+            Some("driver-error")
+        }
+        Ok(Ok(())) => match (&instance, args.serve_ping) {
+            (Instance::Nic(nic), Some(ip)) => serve(&mut store, nic, ip, args.serve).err(),
+            _ => None,
+        },
+    };
+
     let elapsed_ms = store.data().started.elapsed().as_millis() as u64;
     let violations = store.data().device.window().violations();
     let dma_used = store.data().device.dma().used();
     // Release the driver's resources (DMA buffers are unmapped, then freed)
     // before reporting.
+    drop(instance);
     drop(store);
 
     let extra = [
@@ -482,37 +571,174 @@ fn main() -> ExitCode {
         ("elapsed_ms", Value::U64(elapsed_ms)),
         ("dma_bytes_at_exit", Value::U64(dma_used)),
     ];
-    match outcome {
-        Err(e) => {
-            let timed_out = matches!(e.downcast_ref::<Trap>(), Some(Trap::Interrupt));
-            let reason = if timed_out { "timeout" } else { "trap" };
+    match failure {
+        Some(reason) => finish("fail", reason, &extra, 1),
+        None if violations > 0 => finish("fail", "deny-list-violation", &extra, 1),
+        None => finish("pass", "ok", &extra, 0),
+    }
+}
+
+enum Instance {
+    Driver(Driver),
+    Nic(Nic),
+}
+
+/// Give the next call into the driver `limit` before it is interrupted.
+fn set_deadline(store: &mut Store<State>, limit: Duration) {
+    let ticks = limit.as_millis().div_ceil(TICK.as_millis()) as u64;
+    // One extra tick: the current tick may be about to end.
+    store.set_epoch_deadline(ticks + 1);
+}
+
+/// Log a call into the driver that trapped or ran out of time; return the
+/// result reason.
+fn call_failed(call: &str, limit: Duration, e: wasmtime::Error) -> &'static str {
+    let timed_out = matches!(e.downcast_ref::<Trap>(), Some(Trap::Interrupt));
+    let reason = if timed_out { "timeout" } else { "trap" };
+    emit(
+        "trap",
+        &[
+            ("reason", Value::Str(reason)),
+            ("call", Value::Str(call)),
+            (
+                "expected",
+                Value::Str(&format!("{call} returns within {} ms", limit.as_millis())),
+            ),
+            ("got", Value::Str(&format!("{e:?}"))),
+        ],
+    );
+    reason
+}
+
+/// A driver-reported error from an `ethernet` call.
+fn driver_error(call: &str, msg: &str) -> &'static str {
+    emit(
+        "driver-error",
+        &[
+            ("call", Value::Str(call)),
+            ("expected", Value::Str(&format!("{call} returns ok"))),
+            ("got", Value::Str(msg)),
+        ],
+    );
+    "driver-error"
+}
+
+/// After `start`: poll the driver for frames and answer ARP and ping for
+/// `ip` until `duration` has passed. Returns the failure reason, if any.
+fn serve(
+    store: &mut Store<State>,
+    nic: &Nic,
+    ip: Ipv4Addr,
+    duration: Duration,
+) -> Result<(), &'static str> {
+    let eth = nic.grind_portals_ethernet();
+
+    set_deadline(store, CALL_LIMIT);
+    let m = eth
+        .call_mac_address(&mut *store)
+        .map_err(|e| call_failed("mac-address", CALL_LIMIT, e))?;
+    let mac: net::Mac = [m.0, m.1, m.2, m.3, m.4, m.5];
+    set_deadline(store, CALL_LIMIT);
+    let link_up = eth
+        .call_link_up(&mut *store)
+        .map_err(|e| call_failed("link-up", CALL_LIMIT, e))?;
+    emit(
+        "serve-start",
+        &[
+            ("ipv4", Value::Str(&ip.to_string())),
+            ("mac", Value::Str(&net::fmt_mac(&mac))),
+            ("link_up", Value::Str(if link_up { "true" } else { "false" })),
+            ("serve_ms", Value::U64(duration.as_millis() as u64)),
+        ],
+    );
+    if !link_up {
+        emit(
+            "link-down",
+            &[
+                ("expected", Value::Str("link-up returns true once start has returned ok")),
+                ("got", Value::Str("false")),
+            ],
+        );
+        return Err("link-down");
+    }
+
+    let responder = net::Responder { mac, ip };
+    let (mut received, mut answered) = (0u64, 0u64);
+    let end = Instant::now() + duration;
+    while Instant::now() < end {
+        set_deadline(store, CALL_LIMIT);
+        let frame = match eth.call_receive(&mut *store) {
+            Err(e) => return Err(call_failed("receive", CALL_LIMIT, e)),
+            Ok(Err(msg)) => return Err(driver_error("receive", &msg)),
+            Ok(Ok(None)) => {
+                std::thread::sleep(IDLE_POLL);
+                continue;
+            }
+            Ok(Ok(Some(frame))) => frame,
+        };
+        received += 1;
+        if !(MIN_FRAME..=MAX_FRAME).contains(&frame.len()) {
             emit(
-                "trap",
+                "frame-invalid",
                 &[
-                    ("reason", Value::Str(reason)),
+                    ("call", Value::Str("receive")),
                     (
                         "expected",
-                        Value::Str(&format!(
-                            "start returns within {} ms",
-                            args.timeout.as_millis()
-                        )),
+                        Value::Str("a frame of 14 to 1514 bytes, without FCS"),
                     ),
-                    ("got", Value::Str(&format!("{e:?}"))),
+                    ("got", Value::Str(&format!("{} bytes", frame.len()))),
+                    ("head", Value::Str(&hex_head(&frame))),
                 ],
             );
-            finish("fail", reason, &extra, 1)
+            return Err("driver-error");
         }
-        Ok(Err(msg)) => {
-            emit(
-                "driver-error",
-                &[
-                    ("expected", Value::Str("start returns ok")),
-                    ("got", Value::Str(&msg)),
-                ],
-            );
-            finish("fail", "driver-error", &extra, 1)
+        match responder.handle(&frame) {
+            net::Outcome::Reply { frame: reply, summary } => {
+                set_deadline(store, CALL_LIMIT);
+                match eth.call_transmit(&mut *store, &reply) {
+                    Err(e) => return Err(call_failed("transmit", CALL_LIMIT, e)),
+                    Ok(Err(msg)) => return Err(driver_error("transmit", &msg)),
+                    Ok(Ok(())) => {}
+                }
+                answered += 1;
+                emit(
+                    "answered",
+                    &[
+                        ("summary", Value::Str(&summary)),
+                        ("len", Value::U64(reply.len() as u64)),
+                    ],
+                );
+            }
+            net::Outcome::Ignored { summary } => {
+                emit("frame-ignored", &[("summary", Value::Str(&summary))]);
+            }
+            net::Outcome::Malformed { reason } => {
+                emit(
+                    "frame-malformed",
+                    &[
+                        ("reason", Value::Str(&reason)),
+                        ("head", Value::Str(&hex_head(&frame))),
+                    ],
+                );
+            }
         }
-        Ok(Ok(())) if violations > 0 => finish("fail", "deny-list-violation", &extra, 1),
-        Ok(Ok(())) => finish("pass", "ok", &extra, 0),
     }
+    emit(
+        "serve-end",
+        &[
+            ("frames_received", Value::U64(received)),
+            ("frames_answered", Value::U64(answered)),
+        ],
+    );
+    Ok(())
+}
+
+/// The first 64 bytes of a frame in hex, for logs.
+fn hex_head(frame: &[u8]) -> String {
+    let n = frame.len().min(64);
+    let mut s: String = frame[..n].iter().map(|b| format!("{b:02x}")).collect();
+    if frame.len() > n {
+        s.push_str("...");
+    }
+    s
 }
