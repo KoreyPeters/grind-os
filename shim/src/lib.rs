@@ -6,7 +6,7 @@
 //!
 //! - [`Window`]: 32-bit reads and writes to BAR0, bounds- and
 //!   alignment-checked, with writes filtered through the device's
-//!   [`deny::DenyList`] (rule 10).
+//!   [`deny::WriteList`], a deny list or an allow list (rule 10).
 //! - [`DmaAllocator`]: zeroed buffers pinned and mapped into the device's
 //!   IOMMU domain, addressed by the driver only through their IOVA.
 //!

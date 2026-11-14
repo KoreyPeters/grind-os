@@ -2,7 +2,7 @@
 
 //! Opening a PCI device through VFIO.
 
-use crate::deny::{self, DenyList};
+use crate::deny::{self, WriteList};
 use crate::dma::{DmaAllocator, Domain};
 use crate::log::{emit, Value};
 use crate::sys::*;
@@ -76,7 +76,7 @@ pub struct Device {
     bdf: String,
     vendor: u16,
     device_id: u16,
-    deny: &'static DenyList,
+    deny: &'static WriteList,
     window: Window<File>,
     dma: DmaAllocator,
     /// A second handle on the VFIO device fd, for config space.
@@ -96,7 +96,7 @@ impl Device {
     /// Open the device at PCI address `bdf` (e.g. `0000:00:01.0`), which must
     /// already be bound to vfio-pci.
     ///
-    /// Refuses devices with no deny list, and devices whose deny list has not
+    /// Refuses devices with no write list, and devices whose list has not
     /// been reviewed unless `allow_unreviewed` is set and the machine's DMI
     /// system vendor names an emulator (see `deny::admit`).
     /// DMA allocations are limited to `dma_limit` bytes in total.
@@ -105,7 +105,7 @@ impl Device {
         let vendor = sysfs_hex(&format!("{sys}/vendor"))?;
         let device_id = sysfs_hex(&format!("{sys}/device"))?;
 
-        // Rule 10: no reviewed deny list, no access.
+        // Rule 10: no reviewed write list, no access.
         let sys_vendor = deny::sys_vendor();
         let deny = deny::admit(vendor, device_id, allow_unreviewed, sys_vendor.as_deref())
             .map_err(|r| fail("deny-list", r.expected, r.got))?;
@@ -239,6 +239,7 @@ impl Device {
                 ("model", Value::Str(deny.model)),
                 ("iommu_group", Value::Str(&group_id)),
                 ("bar0_size", Value::Hex(bar0.size)),
+                ("list_kind", Value::Str(deny.kind.as_str())),
                 ("deny_entries", Value::U64(deny.entries.len() as u64)),
                 ("deny_reviewed", Value::Bool(deny.reviewed)),
                 (
@@ -332,7 +333,7 @@ impl Device {
         (self.vendor, self.device_id)
     }
 
-    pub fn deny_list(&self) -> &'static DenyList {
+    pub fn deny_list(&self) -> &'static WriteList {
         self.deny
     }
 

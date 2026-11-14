@@ -14,9 +14,9 @@ The only code that touches a device on a driver's behalf. Trusted.
   driver's DMA buffers are unmapped; dropping a `Device` calls it as a
   backstop. Logged as `device-quiesce` (command register before and after)
   or `device-quiesce-error`.
-- `Window` gives checked 32-bit access to BAR0. Writes that touch a
-  deny-list entry are refused, logged (`mmio-denied`) and counted. Any count
-  above zero fails the run.
+- `Window` gives checked 32-bit access to BAR0. Writes the device's write
+  list refuses are not performed; they are logged (`mmio-denied`) and
+  counted. Any count above zero fails the run.
 - `DmaAllocator` and `DmaBuffer` handle DMA memory. Buffers are page-aligned,
   zeroed, pinned and mapped with `VFIO_IOMMU_MAP_DMA` at IOVAs from 4 GiB up,
   with an unmapped guard page after each one. Dropping a buffer unmaps it
@@ -27,10 +27,24 @@ The only code that touches a device on a driver's behalf. Trusted.
 No crate dependencies. `unsafe` is limited to the ioctl wrappers in
 `sys.rs`, adopting the device fd, and DMA buffer memory in `dma.rs`.
 
-## Deny lists (rule 10)
+## Write lists (rule 10)
 
-`src/deny.rs` holds one list per supported device model. A device with no
-list cannot be opened. A list that is not yet human-reviewed is refused
+`src/deny.rs` holds one write list per supported device model. Each list
+has a kind (CLAUDE.md rule 10), logged in `device-open` as `list_kind`:
+
+| Kind | Built from | A write passes when | Each entry cites |
+| --- | --- | --- | --- |
+| `deny` | the device's datasheet | it touches no entry | a datasheet section |
+| `allow` | a reference driver's source (if rule 6 permits it) or traces of it | it lies entirely inside one entry | a file at an exact commit (`... at commit <hash>`), or a trace (`trace <file>`) |
+
+A refused write logs `mmio-denied` with the entry it hit (deny list) or
+`register: unlisted` (allow list), plus `list_kind`. An allow list with no
+entries refuses every write. Unit tests cover both kinds, including writes
+that straddle an entry's edge; `every_list_is_well_formed` checks that
+every shipped list is aligned, sorted, non-overlapping, has reasons, and
+cites sources of the right form for its kind.
+
+A device with no list cannot be opened. A list that is not yet human-reviewed is refused
 unless the caller passes `allow_unreviewed`
 (`grind-host --allow-unreviewed-deny-list`) *and* the machine is an
 emulator: `/sys/class/dmi/id/sys_vendor` must read exactly `QEMU`. On real
@@ -42,7 +56,6 @@ through to a QEMU guest would pass this check, so a reviewed list is still
 required before passing real hardware through.
 
 Writes are the only thing filtered: reads are allowed everywhere in BAR0.
-Every entry must cite the datasheet section it comes from.
 
 ### Intel 82574L (QEMU e1000e): written
 

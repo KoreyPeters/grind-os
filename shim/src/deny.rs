@@ -1,53 +1,104 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Per-device register deny lists (rule 10).
+//! Per-device register write lists (rule 10).
 //!
 //! The IOMMU stops stray memory access but not deliberate register writes.
-//! Each supported device has a list of register ranges that could
-//! permanently damage hardware (anything that writes flash, NVM or
-//! firmware), identified from the device's datasheet. The shim refuses and
-//! logs every write that touches a listed range.
+//! Each supported device has a list that decides which register writes the
+//! shim refuses, so no driver can permanently damage hardware (anything
+//! that writes flash, NVM or firmware). A list is one of two kinds:
+//!
+//! - **Deny** (from the datasheet): writes that touch a listed range are
+//!   refused; all others pass.
+//! - **Allow** (from a reference driver's source or traces): only writes
+//!   that fall entirely inside a listed range pass; all others are refused.
+//!
+//! Either way, a refused write is logged and counted, and fails the run.
 //!
 //! A device with no list here cannot be opened at all. A list that has not
 //! been reviewed by the human is refused unless the caller explicitly allows
 //! it (for emulated devices only).
 
-/// One denied register range in the register window.
+/// Whether a list names the writes to refuse or the only writes to permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    /// From the datasheet: writes touching an entry are refused.
+    Deny,
+    /// From a reference driver: writes outside every entry are refused.
+    Allow,
+}
+
+impl ListKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListKind::Deny => "deny",
+            ListKind::Allow => "allow",
+        }
+    }
+}
+
+/// One register range in a write list.
 #[derive(Debug)]
-pub struct DenyEntry {
+pub struct WriteEntry {
     /// Byte offset in the register window (BAR0).
     pub offset: u32,
     /// Length in bytes.
     pub len: u32,
-    /// The register's name in the datasheet.
+    /// The register's name in the source.
     pub name: &'static str,
-    /// Why writing it could damage hardware.
+    /// Deny list: why writing it could damage hardware. Allow list: what
+    /// the reference driver writes it for.
     pub reason: &'static str,
-    /// Datasheet document, revision and section it came from.
+    /// Where the entry came from: a datasheet document, revision and
+    /// section; or a file at an exact commit; or a trace (rule 7).
     pub source: &'static str,
 }
 
-/// The deny list for one device model.
+/// The write list for one device model.
 #[derive(Debug)]
-pub struct DenyList {
+pub struct WriteList {
     pub vendor: u16,
     pub device: u16,
     pub model: &'static str,
-    /// True once the human has reviewed `entries` against the datasheet.
+    pub kind: ListKind,
+    /// True once the human has reviewed `entries` against their sources.
     pub reviewed: bool,
-    pub entries: &'static [DenyEntry],
+    pub entries: &'static [WriteEntry],
 }
 
-impl DenyList {
-    /// The first entry a write of `len` bytes at `offset` would touch.
-    pub fn check_write(&self, offset: u32, len: u32) -> Option<&'static DenyEntry> {
+/// Why a write was refused.
+#[derive(Debug, Clone, Copy)]
+pub enum WriteRefusal {
+    /// Deny list: the write touches this entry.
+    Denied(&'static WriteEntry),
+    /// Allow list: the write is not entirely inside any entry.
+    NotAllowed,
+}
+
+impl WriteList {
+    /// Whether a write of `len` bytes at `offset` may go to the device.
+    pub fn check_write(&self, offset: u32, len: u32) -> Result<(), WriteRefusal> {
         let start = u64::from(offset);
         let end = start + u64::from(len);
-        self.entries.iter().find(|e| {
-            let e_start = u64::from(e.offset);
-            let e_end = e_start + u64::from(e.len);
-            start < e_end && e_start < end
-        })
+        let range = |e: &WriteEntry| (u64::from(e.offset), u64::from(e.offset) + u64::from(e.len));
+        match self.kind {
+            ListKind::Deny => match self.entries.iter().find(|e| {
+                let (e_start, e_end) = range(e);
+                start < e_end && e_start < end
+            }) {
+                Some(e) => Err(WriteRefusal::Denied(e)),
+                None => Ok(()),
+            },
+            ListKind::Allow => {
+                if self.entries.iter().any(|e| {
+                    let (e_start, e_end) = range(e);
+                    e_start <= start && end <= e_end
+                }) {
+                    Ok(())
+                } else {
+                    Err(WriteRefusal::NotAllowed)
+                }
+            }
+        }
     }
 }
 
@@ -67,8 +118,8 @@ const fn e82574(
     name: &'static str,
     reason: &'static str,
     source: &'static str,
-) -> DenyEntry {
-    DenyEntry {
+) -> WriteEntry {
+    WriteEntry {
         offset,
         len,
         name,
@@ -100,10 +151,11 @@ const fn e82574(
 /// whole, which covers it.
 ///
 /// Reviewed by the human against the datasheet (rule 10).
-pub static E1000E_82574L: DenyList = DenyList {
+pub static E1000E_82574L: WriteList = WriteList {
     vendor: 0x8086,
     device: 0x10d3,
     model: "Intel 82574L",
+    kind: ListKind::Deny,
     reviewed: true,
     entries: &[
         e82574(0x0_0010, 4, "EEC",
@@ -148,14 +200,14 @@ pub static E1000E_82574L: DenyList = DenyList {
     ],
 };
 
-static ALL: &[&DenyList] = &[&E1000E_82574L];
+static ALL: &[&WriteList] = &[&E1000E_82574L];
 
-/// The deny list for a PCI vendor and device ID, if the shim supports it.
-pub fn for_device(vendor: u16, device: u16) -> Option<&'static DenyList> {
+/// The write list for a PCI vendor and device ID, if the shim supports it.
+pub fn for_device(vendor: u16, device: u16) -> Option<&'static WriteList> {
     find(ALL, vendor, device)
 }
 
-fn find(lists: &[&'static DenyList], vendor: u16, device: u16) -> Option<&'static DenyList> {
+fn find(lists: &[&'static WriteList], vendor: u16, device: u16) -> Option<&'static WriteList> {
     lists
         .iter()
         .copied()
@@ -183,7 +235,7 @@ pub fn sys_vendor() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Rule 10's gate: the device's deny list, if the device may be opened.
+/// Rule 10's gate: the device's write list, if the device may be opened.
 ///
 /// - A device with no list is refused.
 /// - A reviewed list is admitted.
@@ -198,19 +250,19 @@ pub fn admit(
     device: u16,
     allow_unreviewed: bool,
     sys_vendor: Option<&str>,
-) -> Result<&'static DenyList, Refusal> {
+) -> Result<&'static WriteList, Refusal> {
     gate(ALL, vendor, device, allow_unreviewed, sys_vendor)
 }
 
 fn gate(
-    lists: &[&'static DenyList],
+    lists: &[&'static WriteList],
     vendor: u16,
     device: u16,
     allow_unreviewed: bool,
     sys_vendor: Option<&str>,
-) -> Result<&'static DenyList, Refusal> {
+) -> Result<&'static WriteList, Refusal> {
     let list = find(lists, vendor, device).ok_or_else(|| Refusal {
-        expected: format!("a deny list for {vendor:04x}:{device:04x}"),
+        expected: format!("a write list (rule 10) for {vendor:04x}:{device:04x}"),
         got: "none; the shim refuses devices without one (rule 10)".into(),
     })?;
     if list.reviewed {
@@ -218,7 +270,11 @@ fn gate(
     }
     if !allow_unreviewed {
         return Err(Refusal {
-            expected: format!("a human-reviewed deny list for {}", list.model),
+            expected: format!(
+                "a human-reviewed {} list for {}",
+                list.kind.as_str(),
+                list.model
+            ),
             got: "the list is not reviewed yet (rule 10); allowed only for emulated devices".into(),
         });
     }
@@ -243,20 +299,21 @@ fn gate(
 mod tests {
     use super::*;
 
-    static TEST_LIST: DenyList = DenyList {
+    static TEST_LIST: WriteList = WriteList {
         vendor: 0xffff,
         device: 0xffff,
         model: "test",
+        kind: ListKind::Deny,
         reviewed: true,
         entries: &[
-            DenyEntry {
+            WriteEntry {
                 offset: 0x10,
                 len: 4,
                 name: "A",
                 reason: "test",
                 source: "test",
             },
-            DenyEntry {
+            WriteEntry {
                 offset: 0x100,
                 len: 0x10,
                 name: "B",
@@ -266,39 +323,167 @@ mod tests {
         ],
     };
 
+    /// The entry a deny-list refusal names, or None if the write passes.
+    fn denied(list: &WriteList, offset: u32, len: u32) -> Option<&'static str> {
+        match list.check_write(offset, len) {
+            Ok(()) => None,
+            Err(WriteRefusal::Denied(e)) => Some(e.name),
+            Err(WriteRefusal::NotAllowed) => panic!("a deny list never answers NotAllowed"),
+        }
+    }
+
     #[test]
     fn overlap_rules() {
-        assert!(TEST_LIST.check_write(0x0c, 4).is_none());
-        assert_eq!(TEST_LIST.check_write(0x10, 4).unwrap().name, "A");
-        assert!(TEST_LIST.check_write(0x14, 4).is_none());
-        assert_eq!(TEST_LIST.check_write(0x0e, 4).unwrap().name, "A"); // partial overlap
-        assert_eq!(TEST_LIST.check_write(0x10c, 4).unwrap().name, "B");
-        assert!(TEST_LIST.check_write(0x110, 4).is_none());
-        assert!(TEST_LIST.check_write(u32::MAX - 3, 4).is_none()); // no overflow
+        assert_eq!(denied(&TEST_LIST, 0x0c, 4), None);
+        assert_eq!(denied(&TEST_LIST, 0x10, 4), Some("A"));
+        assert_eq!(denied(&TEST_LIST, 0x14, 4), None);
+        assert_eq!(denied(&TEST_LIST, 0x0e, 4), Some("A")); // partial overlap
+        assert_eq!(denied(&TEST_LIST, 0x10c, 4), Some("B"));
+        assert_eq!(denied(&TEST_LIST, 0x110, 4), None);
+        assert_eq!(denied(&TEST_LIST, u32::MAX - 3, 4), None); // no overflow
+    }
+
+    static ALLOW_LIST: WriteList = WriteList {
+        vendor: 0xffff,
+        device: 0xfffe,
+        model: "test allow",
+        kind: ListKind::Allow,
+        reviewed: true,
+        entries: &[
+            WriteEntry {
+                offset: 0x0,
+                len: 4,
+                name: "CTRL",
+                reason: "test",
+                source: "test",
+            },
+            WriteEntry {
+                offset: 0x100,
+                len: 0x10,
+                name: "RING",
+                reason: "test",
+                source: "test",
+            },
+        ],
+    };
+
+    #[test]
+    fn allow_list_passes_only_writes_inside_an_entry() {
+        let l = &ALLOW_LIST;
+        // Inside, including both edges of a multi-dword entry.
+        for (offset, len) in [(0x0, 4), (0x100, 4), (0x10c, 4), (0x100, 0x10)] {
+            assert!(l.check_write(offset, len).is_ok(), "0x{offset:x}+{len} allowed");
+        }
+        // Outside: unlisted gaps, just before, just after, straddling an
+        // edge, and the top of the address space.
+        for (offset, len) in [
+            (0x4, 4),
+            (0xfc, 4),
+            (0x110, 4),
+            (0xfe, 4),
+            (0x10e, 4),
+            (0x10c, 8),
+            (0x0, 8),
+            (u32::MAX - 3, 4),
+        ] {
+            assert!(
+                matches!(l.check_write(offset, len), Err(WriteRefusal::NotAllowed)),
+                "0x{offset:x}+{len} refused"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_allow_list_refuses_everything() {
+        static EMPTY: WriteList = WriteList {
+            vendor: 0xffff,
+            device: 0xfffd,
+            model: "test empty allow",
+            kind: ListKind::Allow,
+            reviewed: true,
+            entries: &[],
+        };
+        for offset in [0x0, 0x8, 0x100, 0x1fffc] {
+            assert!(matches!(EMPTY.check_write(offset, 4), Err(WriteRefusal::NotAllowed)));
+        }
+    }
+
+    /// The rules every shipped list must meet; the first broken one, if any.
+    fn well_formed(list: &WriteList) -> Result<(), String> {
+        let mut prev_end = 0u64;
+        for e in list.entries {
+            let what = format!("{} {} at 0x{:x}", list.model, e.name, e.offset);
+            if !(e.len > 0 && e.len % 4 == 0 && e.offset % 4 == 0) {
+                return Err(format!("{what}: not an aligned dword range"));
+            }
+            if u64::from(e.offset) < prev_end {
+                return Err(format!("{what}: not sorted, or overlaps the previous entry"));
+            }
+            // Rule 7: deny lists cite a datasheet section; allow lists cite
+            // a file at an exact commit, or a trace.
+            let cited = match list.kind {
+                ListKind::Deny => e.source.contains("section "),
+                ListKind::Allow => e.source.contains(" commit ") || e.source.starts_with("trace "),
+            };
+            if !cited {
+                return Err(format!(
+                    "{what}: {} list entry does not cite its source: {:?}",
+                    list.kind.as_str(),
+                    e.source
+                ));
+            }
+            if e.reason.is_empty() {
+                return Err(format!("{what}: no reason"));
+            }
+            prev_end = u64::from(e.offset) + u64::from(e.len);
+        }
+        Ok(())
     }
 
     #[test]
     fn every_list_is_well_formed() {
         for list in ALL {
-            let mut prev_end = 0u64;
-            for e in list.entries {
-                let what = format!("{} {} at 0x{:x}", list.model, e.name, e.offset);
-                assert!(
-                    e.len > 0 && e.len % 4 == 0 && e.offset % 4 == 0,
-                    "{what}: aligned dword ranges"
-                );
-                assert!(
-                    u64::from(e.offset) >= prev_end,
-                    "{what}: sorted, no overlap"
-                );
-                assert!(
-                    e.source.contains("section "),
-                    "{what}: cites a datasheet section"
-                );
-                assert!(!e.reason.is_empty(), "{what}: has a reason");
-                prev_end = u64::from(e.offset) + u64::from(e.len);
+            if let Err(e) = well_formed(list) {
+                panic!("{e}");
             }
         }
+    }
+
+    #[test]
+    fn well_formedness_checks_allow_list_citations() {
+        static FILE: [WriteEntry; 1] = [WriteEntry {
+            offset: 0x0,
+            len: 4,
+            name: "CTRL",
+            reason: "reset and link setup",
+            source: "FreeBSD sys/dev/e1000/e1000_ich8lan.c at commit 0123abcd",
+        }];
+        static TRACE: [WriteEntry; 1] = [WriteEntry {
+            offset: 0x0,
+            len: 4,
+            name: "CTRL",
+            reason: "reset and link setup",
+            source: "trace optiplex-7050-i219lm-2026-11-20.json",
+        }];
+        static SECTION: [WriteEntry; 1] = [WriteEntry {
+            offset: 0x0,
+            len: 4,
+            name: "CTRL",
+            reason: "reset and link setup",
+            source: "Some datasheet, section 10.2.2.1",
+        }];
+        let list = |entries: &'static [WriteEntry]| WriteList {
+            vendor: 0,
+            device: 0,
+            model: "cite",
+            kind: ListKind::Allow,
+            reviewed: false,
+            entries,
+        };
+        assert!(well_formed(&list(&FILE)).is_ok());
+        assert!(well_formed(&list(&TRACE)).is_ok());
+        let err = well_formed(&list(&SECTION)).unwrap_err();
+        assert!(err.contains("does not cite"), "{err}");
     }
 
     #[test]
@@ -311,34 +496,32 @@ mod tests {
             (0x1030, "FLSWCTL"),
             (0x103C, "FLOP"),
         ] {
-            assert_eq!(
-                l.check_write(offset, 4).map(|e| e.name),
-                Some(name),
-                "0x{offset:x} denied"
-            );
+            assert_eq!(denied(l, offset, 4), Some(name), "0x{offset:x} denied");
         }
         // Registers a driver needs: control, status, NVM word reads, PHY
         // access, MDIO ownership, PHY OEM bits, RAM power gating, semaphore.
         for offset in [0x0, 0x8, 0x14, 0x18, 0x20, 0xF00, 0xF10, 0x1050, 0x5B50] {
-            assert!(l.check_write(offset, 4).is_none(), "0x{offset:x} allowed");
+            assert_eq!(denied(l, offset, 4), None, "0x{offset:x} allowed");
         }
     }
 
-    static UNREVIEWED: DenyList = DenyList {
+    static UNREVIEWED: WriteList = WriteList {
         vendor: 0xfffe,
         device: 0x0001,
         model: "test unreviewed",
+        kind: ListKind::Deny,
         reviewed: false,
         entries: &[],
     };
-    static REVIEWED: DenyList = DenyList {
+    static REVIEWED: WriteList = WriteList {
         vendor: 0xfffe,
         device: 0x0002,
         model: "test reviewed",
+        kind: ListKind::Deny,
         reviewed: true,
         entries: &[],
     };
-    static GATE_LISTS: &[&DenyList] = &[&UNREVIEWED, &REVIEWED];
+    static GATE_LISTS: &[&WriteList] = &[&UNREVIEWED, &REVIEWED];
 
     const QEMU: Option<&str> = Some("QEMU");
     const DELL: Option<&str> = Some("Dell Inc.");

@@ -2,7 +2,7 @@
 
 //! The register window: checked 32-bit access to one device region.
 
-use crate::deny::{DenyEntry, DenyList};
+use crate::deny::{WriteList, WriteRefusal};
 use crate::log::{emit, Value};
 use std::fs::File;
 use std::io;
@@ -29,8 +29,9 @@ impl RegionIo for File {
 pub enum MmioError {
     OutOfRange,
     Misaligned,
-    /// The write touched a deny-list entry. Already logged and counted.
-    Denied(&'static DenyEntry),
+    /// The device's write list refused the write (rule 10). Already logged
+    /// and counted.
+    Denied(WriteRefusal),
     /// The access itself failed. Not the driver's fault; already logged.
     Io(io::Error),
 }
@@ -41,12 +42,12 @@ pub struct Window<R: RegionIo> {
     /// Offset of the region within `io` (VFIO's region offset).
     base: u64,
     size: u32,
-    deny: &'static DenyList,
+    deny: &'static WriteList,
     violations: AtomicU32,
 }
 
 impl<R: RegionIo> Window<R> {
-    pub fn new(io: R, base: u64, size: u32, deny: &'static DenyList) -> Self {
+    pub fn new(io: R, base: u64, size: u32, deny: &'static WriteList) -> Self {
         Window {
             io,
             base,
@@ -96,21 +97,30 @@ impl<R: RegionIo> Window<R> {
 
     pub fn write32(&self, offset: u32, value: u32) -> Result<(), MmioError> {
         self.check(offset)?;
-        if let Some(entry) = self.deny.check_write(offset, 4) {
+        if let Err(refusal) = self.deny.check_write(offset, 4) {
             self.violations.fetch_add(1, Ordering::SeqCst);
+            let (register, reason, source) = match refusal {
+                WriteRefusal::Denied(e) => (e.name, e.reason, e.source),
+                WriteRefusal::NotAllowed => (
+                    "unlisted",
+                    "not inside any entry of the device's allow list",
+                    "allow list",
+                ),
+            };
             emit(
                 "mmio-denied",
                 &[
                     ("attempted", Value::Str("write32")),
                     ("offset", Value::Hex(offset.into())),
                     ("value", Value::Hex(value.into())),
-                    ("register", Value::Str(entry.name)),
-                    ("reason", Value::Str(entry.reason)),
-                    ("source", Value::Str(entry.source)),
+                    ("register", Value::Str(register)),
+                    ("reason", Value::Str(reason)),
+                    ("source", Value::Str(source)),
                     ("model", Value::Str(self.deny.model)),
+                    ("list_kind", Value::Str(self.deny.kind.as_str())),
                 ],
             );
-            return Err(MmioError::Denied(entry));
+            return Err(MmioError::Denied(refusal));
         }
         self.io
             .write_all_at(&value.to_le_bytes(), self.base + u64::from(offset))
@@ -132,7 +142,7 @@ impl<R: RegionIo> Window<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deny::DenyEntry;
+    use crate::deny::{ListKind, WriteEntry};
     use std::sync::Mutex;
 
     struct Fake(Mutex<Vec<u8>>);
@@ -152,12 +162,13 @@ mod tests {
         }
     }
 
-    static LIST: DenyList = DenyList {
+    static LIST: WriteList = WriteList {
         vendor: 0xffff,
         device: 0xffff,
         model: "test",
+        kind: ListKind::Deny,
         reviewed: true,
-        entries: &[DenyEntry {
+        entries: &[WriteEntry {
             offset: 0x10,
             len: 4,
             name: "NVMCTL",
@@ -198,11 +209,42 @@ mod tests {
     fn denied_write_is_refused_counted_and_not_performed() {
         let w = window();
         let r = w.write32(0x10, 0x1234_5678);
-        assert!(matches!(r, Err(MmioError::Denied(e)) if e.name == "NVMCTL"));
+        assert!(matches!(r, Err(MmioError::Denied(WriteRefusal::Denied(e))) if e.name == "NVMCTL"));
         assert_eq!(w.violations(), 1);
         assert_eq!(&w.io.0.lock().unwrap()[0x110..0x114], &[0, 0, 0, 0]);
         // Reads of a denied register are allowed.
         assert_eq!(w.read32(0x10).unwrap(), 0);
+        assert_eq!(w.violations(), 1);
+    }
+
+    static ALLOW: WriteList = WriteList {
+        vendor: 0xffff,
+        device: 0xfffe,
+        model: "test allow",
+        kind: ListKind::Allow,
+        reviewed: true,
+        entries: &[WriteEntry {
+            offset: 0x8,
+            len: 4,
+            name: "CTRL",
+            reason: "test",
+            source: "test",
+        }],
+    };
+
+    #[test]
+    fn allow_list_window_refuses_unlisted_writes_and_permits_listed_ones() {
+        let w = Window::new(Fake(Mutex::new(vec![0; 0x200])), 0x100, 0x40, &ALLOW);
+        w.write32(0x8, 0xdead_beef).unwrap();
+        assert_eq!(w.read32(0x8).unwrap(), 0xdead_beef);
+        assert_eq!(w.violations(), 0);
+
+        let r = w.write32(0xc, 0x1234_5678);
+        assert!(matches!(r, Err(MmioError::Denied(WriteRefusal::NotAllowed))));
+        assert_eq!(w.violations(), 1);
+        assert_eq!(&w.io.0.lock().unwrap()[0x10c..0x110], &[0, 0, 0, 0]);
+        // Reads stay allowed everywhere.
+        assert_eq!(w.read32(0xc).unwrap(), 0);
         assert_eq!(w.violations(), 1);
     }
 }
