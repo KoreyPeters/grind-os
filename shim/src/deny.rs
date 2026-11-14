@@ -104,7 +104,7 @@ pub static E1000E_82574L: DenyList = DenyList {
     vendor: 0x8086,
     device: 0x10d3,
     model: "Intel 82574L",
-    reviewed: false,
+    reviewed: true,
     entries: &[
         e82574(0x0_0010, 4, "EEC",
             "bit-bangs the NVM (EE_SK/EE_CS/EE_DI); FWE enables Flash write and erase; AUPDEN enables autonomous Flash update",

@@ -31,7 +31,7 @@ devices only (`grind-host --allow-unreviewed-deny-list`).
 Writes are the only thing filtered: reads are allowed everywhere in BAR0.
 Every entry must cite the datasheet section it comes from.
 
-### Intel 82574L (QEMU e1000e): written, awaiting human review
+### Intel 82574L (QEMU e1000e): written
 
 13 BAR0 registers are denied. Each entry in `src/deny.rs` cites its
 datasheet section:
