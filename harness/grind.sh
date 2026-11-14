@@ -22,16 +22,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME="$1"
 shift
 
-# Which conformance test each driver must pass, and the VM options it needs.
-# Kept here (trusted), not in the driver's directory, so a driver cannot
-# choose its own test or device.
-VMARGS=()
-case "$NAME" in
-e1000e) CLASS=nic ;;
-nvme) CLASS=block ;;
-rtl8139) CLASS=nic VMARGS=(--nic rtl8139) ;;
-*) echo "GRIND step=driver result=fail expected=\"a driver listed in harness/grind.sh\" got=\"$NAME\""; exit 2 ;;
-esac
+# Which conformance test the driver must pass, and the VM options it needs
+# (harness/classes.sh, trusted).
+. "$ROOT/harness/classes.sh"
+driver_class "$NAME" ||
+	{ echo "GRIND step=driver result=fail expected=\"a driver listed in harness/classes.sh\" got=\"$NAME\""; exit 2; }
 
 DIR="$ROOT/drivers/$NAME"
 RUN="$ROOT/harness/runs/$NAME/$(date -u +%Y%m%dT%H%M%SZ)"
