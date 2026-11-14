@@ -21,7 +21,10 @@ impl Guest for Module {
         log::emit(
             log::Level::Info,
             "IDR",
-            &[("mac".to_string(), text.join(":")), ("window".to_string(), mmio::size().to_string())],
+            &[
+                ("mac".to_string(), text.join(":")),
+                ("window".to_string(), mmio::size().to_string()),
+            ],
         );
         Ok(())
     }

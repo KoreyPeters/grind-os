@@ -35,11 +35,16 @@ impl Guest for Module {
         if b.iova() < a.iova() + u64::from(a.size()) + 4096 {
             return Err(format!(
                 "expected a guard page between buffers; got 0x{:x}+0x{:x} then 0x{:x}",
-                a.iova(), a.size(), b.iova()
+                a.iova(),
+                a.size(),
+                b.iova()
             ));
         }
         if high.iova() < GIB4 {
-            return Err(format!("allocate: expected an IOVA from 4 GiB up, got 0x{:x}", high.iova()));
+            return Err(format!(
+                "allocate: expected an IOVA from 4 GiB up, got 0x{:x}",
+                high.iova()
+            ));
         }
         let pattern: Vec<u8> = (0..8192u32).map(|i| (i * 13 + 7) as u8).collect();
         a.write(0, &pattern).map_err(|e| format!("write: {e:?}"))?;

@@ -64,7 +64,8 @@ pub fn control(frame: &[u8]) -> Option<Control> {
             complete: frame.get(ETH_HEADER + CONTROL_MAGIC.len() + 1) == Some(&1),
         }),
         2 => {
-            let a = frame.get(ETH_HEADER + CONTROL_MAGIC.len() + 1..ETH_HEADER + CONTROL_MAGIC.len() + 8)?;
+            let a = frame
+                .get(ETH_HEADER + CONTROL_MAGIC.len() + 1..ETH_HEADER + CONTROL_MAGIC.len() + 8)?;
             Some(Control::Faults {
                 ms: u32::from_be_bytes([a[0], a[1], a[2], a[3]]),
                 kinds: a[4],
@@ -87,7 +88,10 @@ pub enum Outcome {
 }
 
 pub fn fmt_mac(m: &Mac) -> String {
-    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    m.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn be16(b: &[u8], at: usize) -> u16 {
@@ -125,7 +129,10 @@ impl Responder {
     pub fn handle(&self, frame: &[u8]) -> Outcome {
         if frame.len() < ETH_HEADER {
             return Outcome::Malformed {
-                reason: format!("{} bytes, shorter than an Ethernet header (14)", frame.len()),
+                reason: format!(
+                    "{} bytes, shorter than an Ethernet header (14)",
+                    frame.len()
+                ),
             };
         }
         let dst: Mac = frame[0..6].try_into().unwrap();
@@ -140,7 +147,10 @@ impl Responder {
         );
         if !to_us {
             return Outcome::Ignored {
-                summary: format!("{base}: not addressed to {} or broadcast", fmt_mac(&self.mac)),
+                summary: format!(
+                    "{base}: not addressed to {} or broadcast",
+                    fmt_mac(&self.mac)
+                ),
             };
         }
         match ethertype {
@@ -154,7 +164,10 @@ impl Responder {
         let a = &frame[ETH_HEADER..];
         if a.len() < ARP_LEN {
             return Outcome::Malformed {
-                reason: format!("{base}: ARP body is {} bytes, expected at least 28", a.len()),
+                reason: format!(
+                    "{base}: ARP body is {} bytes, expected at least 28",
+                    a.len()
+                ),
             };
         }
         let (htype, ptype, hlen, plen, oper) = (be16(a, 0), be16(a, 2), a[4], a[5], be16(a, 6));
@@ -217,7 +230,10 @@ impl Responder {
         let icmp = &p[ihl..total];
         if icmp.len() < 8 {
             return Outcome::Malformed {
-                reason: format!("{base}: ICMP message is {} bytes, expected at least 8", icmp.len()),
+                reason: format!(
+                    "{base}: ICMP message is {} bytes, expected at least 8",
+                    icmp.len()
+                ),
             };
         }
         if checksum(icmp) != 0 {
@@ -227,7 +243,10 @@ impl Responder {
         }
         if icmp[0] != ICMP_ECHO_REQUEST || icmp[1] != 0 {
             return Outcome::Ignored {
-                summary: format!("{base}: ICMP type {} code {} from {saddr}", icmp[0], icmp[1]),
+                summary: format!(
+                    "{base}: ICMP type {} code {} from {saddr}",
+                    icmp[0], icmp[1]
+                ),
             };
         }
         let (id, seq) = (be16(icmp, 4), be16(icmp, 6));
@@ -297,7 +316,11 @@ mod tests {
         faults.extend_from_slice(&200u16.to_be_bytes());
         assert_eq!(
             control(&faults),
-            Some(Control::Faults { ms: 1500, kinds: 3, per_mille: 200 })
+            Some(Control::Faults {
+                ms: 1500,
+                kinds: 3,
+                per_mille: 200
+            })
         );
         assert_eq!(control(&faults[..faults.len() - 1]), None, "truncated");
     }
@@ -350,7 +373,10 @@ mod tests {
     #[test]
     fn checksum_matches_rfc1071_example() {
         // RFC 1071 section 3: 00 01 f2 03 f4 f5 f6 f7 sums to 0xddf2.
-        assert_eq!(checksum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]), !0xddf2);
+        assert_eq!(
+            checksum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]),
+            !0xddf2
+        );
     }
 
     #[test]
@@ -406,7 +432,10 @@ mod tests {
     fn ignores_ip_to_other_macs_and_runts() {
         let f = echo_request([2, 0, 0, 0, 0, 9], &[]);
         assert!(matches!(responder().handle(&f), Outcome::Ignored { .. }));
-        assert!(matches!(responder().handle(&[0; 10]), Outcome::Malformed { .. }));
+        assert!(matches!(
+            responder().handle(&[0; 10]),
+            Outcome::Malformed { .. }
+        ));
     }
 
     #[test]

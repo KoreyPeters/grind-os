@@ -15,23 +15,42 @@ impl Guest for Module {
         let data = dma::allocate32(16384).map_err(|e| format!("allocate32: {e:?}"))?;
         let iova = data.iova();
         if iova + 16384 > 1 << 32 {
-            return Err(format!("allocate32: expected an IOVA below 4 GiB, got 0x{iova:x}"));
+            return Err(format!(
+                "allocate32: expected an IOVA below 4 GiB, got 0x{iova:x}"
+            ));
         }
         let mut io = Io::with_data(data)?;
         let pattern: Vec<u8> = (0..8192u32).map(|i| (i * 11 + 5) as u8).collect();
-        io.data.write(0, &pattern).map_err(|e| format!("write data: {e:?}"))?;
+        io.data
+            .write(0, &pattern)
+            .map_err(|e| format!("write data: {e:?}"))?;
         let w = io.run(rw(0x01, 64, 16, iova, iova + 0x1000))?;
         let r = io.run(rw(0x02, 64, 16, iova + 0x2000, iova + 0x3000))?;
         let f = io.run(command(0x00, 1, 0, 0, [0; 6]))?;
         if w != Ok(0) || r != Ok(0) || f != Ok(0) {
-            return Err(format!("write {w:?}, read {r:?}, flush {f:?}: expected Ok(0) each"));
+            return Err(format!(
+                "write {w:?}, read {r:?}, flush {f:?}: expected Ok(0) each"
+            ));
         }
-        let back = io.data.read(0x2000, 8192).map_err(|e| format!("read data: {e:?}"))?;
+        let back = io
+            .data
+            .read(0x2000, 8192)
+            .map_err(|e| format!("read data: {e:?}"))?;
         if back != pattern {
-            let at = back.iter().zip(&pattern).position(|(a, b)| a != b).unwrap_or(0);
+            let at = back
+                .iter()
+                .zip(&pattern)
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
             return Err(format!("read back differs at byte {at}"));
         }
-        info("nvme-dma32", &[("iova", format!("0x{iova:x}")), ("round_trip_bytes", "8192".into())]);
+        info(
+            "nvme-dma32",
+            &[
+                ("iova", format!("0x{iova:x}")),
+                ("round_trip_bytes", "8192".into()),
+            ],
+        );
         Ok(())
     }
 }

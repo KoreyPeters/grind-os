@@ -12,7 +12,9 @@ impl Guest for Module {
     fn start() -> Result<(), String> {
         match mmio::write32(0x1008, 1) {
             Err(mmio::Error::Denied) => Ok(()),
-            other => Err(format!("write32(SQ 1 tail 0x1008): expected Err(Denied), got {other:?}")),
+            other => Err(format!(
+                "write32(SQ 1 tail 0x1008): expected Err(Denied), got {other:?}"
+            )),
         }
     }
 }

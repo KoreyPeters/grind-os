@@ -45,8 +45,8 @@
 //! Written from RFC 826, 791, 792 and 1071. Std only.
 
 use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::os::unix::net::UnixStream;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -78,7 +78,10 @@ const CONTROL_DONE: u8 = 1;
 const CONTROL_FAULTS: u8 = 2;
 
 fn fmt_mac(m: &[u8]) -> String {
-    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    m.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn be16(b: &[u8], at: usize) -> u16 {
@@ -127,20 +130,27 @@ fn summarize(f: &[u8]) -> String {
     );
     let p = &f[14..];
     match ethertype {
-        0x0806 if p.len() >= 28 => s += &format!(
-            ": ARP op {} sender {} {} target {} {}",
-            be16(p, 6),
-            fmt_mac(&p[8..14]),
-            ip_at(p, 14),
-            fmt_mac(&p[18..24]),
-            ip_at(p, 24)
-        ),
+        0x0806 if p.len() >= 28 => {
+            s += &format!(
+                ": ARP op {} sender {} {} target {} {}",
+                be16(p, 6),
+                fmt_mac(&p[8..14]),
+                ip_at(p, 14),
+                fmt_mac(&p[18..24]),
+                ip_at(p, 24)
+            )
+        }
         0x0800 if p.len() >= 20 => {
             s += &format!(": IPv4 proto {} {} -> {}", p[9], ip_at(p, 12), ip_at(p, 16));
             let ihl = usize::from(p[0] & 0x0f) * 4;
             if p[9] == 1 && p.len() >= ihl + 8 {
                 let i = &p[ihl..];
-                s += &format!(" ICMP type {} id 0x{:04x} seq {}", i[0], be16(i, 4), be16(i, 6));
+                s += &format!(
+                    " ICMP type {} id 0x{:04x} seq {}",
+                    i[0],
+                    be16(i, 4),
+                    be16(i, 6)
+                );
             }
         }
         0x86dd => s += ": IPv6",
@@ -207,22 +217,49 @@ fn check_arp_reply(f: &[u8]) -> Option<Result<(), String>> {
         return None;
     }
     let mut wrong = Vec::new();
-    if &f[0..6] != PEER_MAC {
-        wrong.push(format!("Ethernet destination {} (expected {})", fmt_mac(&f[0..6]), fmt_mac(&PEER_MAC)));
+    if f[0..6] != PEER_MAC {
+        wrong.push(format!(
+            "Ethernet destination {} (expected {})",
+            fmt_mac(&f[0..6]),
+            fmt_mac(&PEER_MAC)
+        ));
     }
-    if &f[6..12] != DUT_MAC {
-        wrong.push(format!("Ethernet source {} (expected {})", fmt_mac(&f[6..12]), fmt_mac(&DUT_MAC)));
+    if f[6..12] != DUT_MAC {
+        wrong.push(format!(
+            "Ethernet source {} (expected {})",
+            fmt_mac(&f[6..12]),
+            fmt_mac(&DUT_MAC)
+        ));
     }
     if (be16(a, 0), be16(a, 2), a[4], a[5]) != (1, 0x0800, 6, 4) {
-        wrong.push(format!("htype/ptype/hlen/plen {}/0x{:04x}/{}/{} (expected 1/0x0800/6/4)", be16(a, 0), be16(a, 2), a[4], a[5]));
+        wrong.push(format!(
+            "htype/ptype/hlen/plen {}/0x{:04x}/{}/{} (expected 1/0x0800/6/4)",
+            be16(a, 0),
+            be16(a, 2),
+            a[4],
+            a[5]
+        ));
     }
-    if &a[8..14] != DUT_MAC {
-        wrong.push(format!("sender MAC {} (expected {})", fmt_mac(&a[8..14]), fmt_mac(&DUT_MAC)));
+    if a[8..14] != DUT_MAC {
+        wrong.push(format!(
+            "sender MAC {} (expected {})",
+            fmt_mac(&a[8..14]),
+            fmt_mac(&DUT_MAC)
+        ));
     }
-    if &a[18..24] != PEER_MAC || ip_at(a, 24) != PEER_IP {
-        wrong.push(format!("target {} {} (expected {} {PEER_IP})", fmt_mac(&a[18..24]), ip_at(a, 24), fmt_mac(&PEER_MAC)));
+    if a[18..24] != PEER_MAC || ip_at(a, 24) != PEER_IP {
+        wrong.push(format!(
+            "target {} {} (expected {} {PEER_IP})",
+            fmt_mac(&a[18..24]),
+            ip_at(a, 24),
+            fmt_mac(&PEER_MAC)
+        ));
     }
-    Some(if wrong.is_empty() { Ok(()) } else { Err(wrong.join("; ")) })
+    Some(if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; "))
+    })
 }
 
 fn echo_request(seq: u16, data: &[u8]) -> Vec<u8> {
@@ -278,21 +315,36 @@ fn check_echo_reply(f: &[u8], seq: u16, data: &[u8]) -> Option<Result<(), String
         return None;
     }
     let mut wrong = Vec::new();
-    if &f[0..6] != PEER_MAC {
-        wrong.push(format!("Ethernet destination {} (expected {})", fmt_mac(&f[0..6]), fmt_mac(&PEER_MAC)));
+    if f[0..6] != PEER_MAC {
+        wrong.push(format!(
+            "Ethernet destination {} (expected {})",
+            fmt_mac(&f[0..6]),
+            fmt_mac(&PEER_MAC)
+        ));
     }
-    if &f[6..12] != DUT_MAC {
-        wrong.push(format!("Ethernet source {} (expected {})", fmt_mac(&f[6..12]), fmt_mac(&DUT_MAC)));
+    if f[6..12] != DUT_MAC {
+        wrong.push(format!(
+            "Ethernet source {} (expected {})",
+            fmt_mac(&f[6..12]),
+            fmt_mac(&DUT_MAC)
+        ));
     }
     if checksum(&p[..ihl]) != 0 {
         wrong.push("IPv4 header checksum does not verify".into());
     }
     if ip_at(p, 12) != DUT_IP || ip_at(p, 16) != PEER_IP {
-        wrong.push(format!("addresses {} -> {} (expected {DUT_IP} -> {PEER_IP})", ip_at(p, 12), ip_at(p, 16)));
+        wrong.push(format!(
+            "addresses {} -> {} (expected {DUT_IP} -> {PEER_IP})",
+            ip_at(p, 12),
+            ip_at(p, 16)
+        ));
     }
     let total = usize::from(be16(p, 2));
     if total < ihl + 8 || total > p.len() {
-        wrong.push(format!("IPv4 total length {total} with {} bytes present", p.len()));
+        wrong.push(format!(
+            "IPv4 total length {total} with {} bytes present",
+            p.len()
+        ));
     } else {
         let icmp = &p[ihl..total];
         if checksum(icmp) != 0 {
@@ -308,7 +360,11 @@ fn check_echo_reply(f: &[u8], seq: u16, data: &[u8]) -> Option<Result<(), String
             ));
         }
     }
-    Some(if wrong.is_empty() { Ok(()) } else { Err(wrong.join("; ")) })
+    Some(if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(wrong.join("; "))
+    })
 }
 
 struct Args {
@@ -331,11 +387,16 @@ fn parse_args() -> Result<Args, String> {
             "--stop-file" => stop_file = Some(value("--stop-file")?),
             "--deadline-s" => {
                 let v = value("--deadline-s")?;
-                deadline = Duration::from_secs(v.parse().map_err(|_| format!("--deadline-s {v}: not a number"))?);
+                deadline = Duration::from_secs(
+                    v.parse()
+                        .map_err(|_| format!("--deadline-s {v}: not a number"))?,
+                );
             }
             "--pings" => {
                 let v = value("--pings")?;
-                pings = v.parse().map_err(|_| format!("--pings {v}: not a number"))?;
+                pings = v
+                    .parse()
+                    .map_err(|_| format!("--pings {v}: not a number"))?;
             }
             "--qmp" => qmp = Some(value("--qmp")?),
             "--bulk" => {
@@ -346,35 +407,74 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if u32::from(pings) + u32::from(bulk) > u32::from(u16::MAX) {
-        return Err(format!("--pings {pings} plus --bulk {bulk}: more than 65535 sequence numbers"));
+        return Err(format!(
+            "--pings {pings} plus --bulk {bulk}: more than 65535 sequence numbers"
+        ));
     }
-    Ok(Args { ports_file: ports_file.ok_or("--ports-file is required")?, stop_file, deadline, pings, bulk, qmp })
+    Ok(Args {
+        ports_file: ports_file.ok_or("--ports-file is required")?,
+        stop_file,
+        deadline,
+        pings,
+        bulk,
+        qmp,
+    })
 }
 
 fn run(args: &Args) -> Result<(), ()> {
     let fail = |s: &str, e: &str, g: &str| {
         step(s, false, e, g);
     };
-    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| fail("bind", "a UDP socket on 127.0.0.1", &e.to_string()))?;
-    let peer_port = sock.local_addr().map_err(|e| fail("bind", "a local address", &e.to_string()))?.port();
+    let sock = UdpSocket::bind("127.0.0.1:0")
+        .map_err(|e| fail("bind", "a UDP socket on 127.0.0.1", &e.to_string()))?;
+    let peer_port = sock
+        .local_addr()
+        .map_err(|e| fail("bind", "a local address", &e.to_string()))?
+        .port();
     // Reserve a port for QEMU: bind, read it, release it.
     let qemu_port = UdpSocket::bind("127.0.0.1:0")
         .and_then(|s| s.local_addr())
         .map_err(|e| fail("bind", "a free port for QEMU", &e.to_string()))?
         .port();
-    std::fs::write(&args.ports_file, format!("{peer_port} {qemu_port}\n"))
-        .map_err(|e| fail("ports-file", &format!("{} is writable", args.ports_file), &e.to_string()))?;
-    let mut wire = Wire { sock, qemu: format!("127.0.0.1:{qemu_port}"), printed: 0, seen: 0 };
+    std::fs::write(&args.ports_file, format!("{peer_port} {qemu_port}\n")).map_err(|e| {
+        fail(
+            "ports-file",
+            &format!("{} is writable", args.ports_file),
+            &e.to_string(),
+        )
+    })?;
+    let mut wire = Wire {
+        sock,
+        qemu: format!("127.0.0.1:{qemu_port}"),
+        printed: 0,
+        seen: 0,
+    };
     let start = Instant::now();
-    let stopped = || args.stop_file.as_ref().is_some_and(|f| std::path::Path::new(f).exists());
+    let stopped = || {
+        args.stop_file
+            .as_ref()
+            .is_some_and(|f| std::path::Path::new(f).exists())
+    };
 
     // 1. ARP, repeated until answered: the VM boots while this runs.
-    let expected = format!("an ARP reply: {DUT_IP} is-at {} to {} within {} s", fmt_mac(&DUT_MAC), fmt_mac(&PEER_MAC), args.deadline.as_secs());
+    let expected = format!(
+        "an ARP reply: {DUT_IP} is-at {} to {} within {} s",
+        fmt_mac(&DUT_MAC),
+        fmt_mac(&PEER_MAC),
+        args.deadline.as_secs()
+    );
     let mut next_arp = Instant::now();
     let mut requests = 0u32;
     loop {
         if start.elapsed() >= args.deadline {
-            fail("arp", &expected, &format!("no ARP reply after {requests} requests; {} frames received in all", wire.seen));
+            fail(
+                "arp",
+                &expected,
+                &format!(
+                    "no ARP reply after {requests} requests; {} frames received in all",
+                    wire.seen
+                ),
+            );
             return Err(());
         }
         if stopped() {
@@ -386,11 +486,21 @@ fn run(args: &Args) -> Result<(), ()> {
             requests += 1;
             next_arp = Instant::now() + ARP_INTERVAL;
         }
-        let Some(f) = wire.recv(next_arp.saturating_duration_since(Instant::now())) else { continue };
+        let Some(f) = wire.recv(next_arp.saturating_duration_since(Instant::now())) else {
+            continue;
+        };
         match check_arp_reply(&f) {
             None => {}
             Some(Ok(())) => {
-                step("arp", true, &expected, &format!("reply after {requests} requests, {:.1} s", start.elapsed().as_secs_f32()));
+                step(
+                    "arp",
+                    true,
+                    &expected,
+                    &format!(
+                        "reply after {requests} requests, {:.1} s",
+                        start.elapsed().as_secs_f32()
+                    ),
+                );
                 break;
             }
             Some(Err(why)) => {
@@ -403,7 +513,9 @@ fn run(args: &Args) -> Result<(), ()> {
     // 2. Pings, one at a time.
     let mut ok = true;
     for seq in 1..=args.pings {
-        let data: Vec<u8> = (0..PING_DATA).map(|i| (i as u8).wrapping_add(seq as u8 * 16)).collect();
+        let data: Vec<u8> = (0..PING_DATA)
+            .map(|i| (i as u8).wrapping_add(seq as u8 * 16))
+            .collect();
         let name = format!("ping-{seq}");
         let expected = format!(
             "an echo reply from {DUT_IP} id 0x{ICMP_ID:04x} seq {seq} with the same {PING_DATA} data bytes within {} ms",
@@ -422,7 +534,12 @@ fn run(args: &Args) -> Result<(), ()> {
             }
         };
         match verdict {
-            Ok(()) => step(&name, true, &expected, &format!("reply in {} us", sent.elapsed().as_micros())),
+            Ok(()) => step(
+                &name,
+                true,
+                &expected,
+                &format!("reply in {} us", sent.elapsed().as_micros()),
+            ),
             Err(why) => {
                 fail(&name, &expected, &why);
                 ok = false;
@@ -464,7 +581,11 @@ fn run(args: &Args) -> Result<(), ()> {
     if wire.seen > wire.printed {
         println!("    ({} more frames not shown)", wire.seen - wire.printed);
     }
-    if ok { Ok(()) } else { Err(()) }
+    if ok {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Link flaps: how many, how long the link stays down each time (long
@@ -492,11 +613,15 @@ struct Qmp {
 impl Qmp {
     fn connect(path: &str) -> Result<Qmp, String> {
         let stream = UnixStream::connect(path).map_err(|e| format!("connect to {path}: {e}"))?;
-        stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| e.to_string())?;
         let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
         let mut q = Qmp { stream, reader };
         let mut greeting = String::new();
-        q.reader.read_line(&mut greeting).map_err(|e| format!("QMP greeting: {e}"))?;
+        q.reader
+            .read_line(&mut greeting)
+            .map_err(|e| format!("QMP greeting: {e}"))?;
         if !greeting.contains("\"QMP\"") {
             return Err(format!("QMP greeting: got {:?}", greeting.trim()));
         }
@@ -509,19 +634,28 @@ impl Qmp {
         writeln!(self.stream, "{json}").map_err(|e| format!("QMP write: {e}"))?;
         loop {
             let mut line = String::new();
-            let n = self.reader.read_line(&mut line).map_err(|e| format!("QMP read: {e}"))?;
+            let n = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| format!("QMP read: {e}"))?;
             if n == 0 {
                 return Err("QMP: the monitor closed the connection".into());
             }
             if line.contains("\"event\"") {
                 continue;
             }
-            return if line.contains("\"return\"") { Ok(()) } else { Err(format!("QMP {json}: {}", line.trim())) };
+            return if line.contains("\"return\"") {
+                Ok(())
+            } else {
+                Err(format!("QMP {json}: {}", line.trim()))
+            };
         }
     }
 
     fn set_link(&mut self, up: bool) -> Result<(), String> {
-        self.command(&format!(r#"{{"execute":"set_link","arguments":{{"name":"net0","up":{up}}}}}"#))
+        self.command(&format!(
+            r#"{{"execute":"set_link","arguments":{{"name":"net0","up":{up}}}}}"#
+        ))
     }
 }
 
@@ -556,7 +690,15 @@ fn recovery(wire: &mut Wire, after: &str, seq: &mut u16) -> bool {
     let mut tries = 0;
     let first = loop {
         if begun.elapsed() >= RECOVER_FIRST {
-            step(&name, false, &expected, &format!("no reply within {} ms ({tries} tries)", RECOVER_FIRST.as_millis()));
+            step(
+                &name,
+                false,
+                &expected,
+                &format!(
+                    "no reply within {} ms ({tries} tries)",
+                    RECOVER_FIRST.as_millis()
+                ),
+            );
             return false;
         }
         *seq += 1;
@@ -575,10 +717,23 @@ fn recovery(wire: &mut Wire, after: &str, seq: &mut u16) -> bool {
         }
     }
     if lost.is_empty() {
-        step(&name, true, &expected, &format!("first reply after {} ms ({tries} tries), then {} more", first.as_millis(), RECOVER_PINGS - 1));
+        step(
+            &name,
+            true,
+            &expected,
+            &format!(
+                "first reply after {} ms ({tries} tries), then {} more",
+                first.as_millis(),
+                RECOVER_PINGS - 1
+            ),
+        );
         return true;
     }
-    let shown: Vec<String> = lost.iter().take(10).map(|(i, s, why)| format!("#{i} (seq {s}, {why})")).collect();
+    let shown: Vec<String> = lost
+        .iter()
+        .take(10)
+        .map(|(i, s, why)| format!("#{i} (seq {s}, {why})"))
+        .collect();
     step(
         &name,
         false,
@@ -628,16 +783,24 @@ fn bulk(wire: &mut Wire, name: &str, after: u16, count: u16) -> bool {
         }
         bytes += len;
     }
-    step(name, true, &expected, &format!("{count} replies, {bytes} data bytes each way, in {} ms", begun.elapsed().as_millis()));
+    step(
+        name,
+        true,
+        &expected,
+        &format!(
+            "{count} replies, {bytes} data bytes each way, in {} ms",
+            begun.elapsed().as_millis()
+        ),
+    );
     true
 }
 
 /// Device-fault windows (host/src/faults.rs): kinds, rate per mille, name.
 const FAULT_WINDOWS: [(u8, u16, &str); 4] = [
-    (1, 200, "registers"),     // some register reads return all-ones
-    (2, 100, "device-data"),   // some DMA reads come back with a byte changed
-    (7, 100, "all"),           // both, and some calls slowed
-    (1, 1000, "device-gone"),  // every register read returns all-ones, then the device is back
+    (1, 200, "registers"),    // some register reads return all-ones
+    (2, 100, "device-data"),  // some DMA reads come back with a byte changed
+    (7, 100, "all"),          // both, and some calls slowed
+    (1, 1000, "device-gone"), // every register read returns all-ones, then the device is back
 ];
 const FAULT_WINDOW: Duration = Duration::from_millis(1500);
 /// Pings sent during a fault window keep traffic flowing; they are not
@@ -759,7 +922,15 @@ fn hostile_frames(seq: u16) -> Vec<(&'static str, Vec<u8>)> {
     bad_arp[18] = 9; // hardware address length
     vec![
         ("1 byte", vec![0x42]),
-        ("13 bytes, shorter than a header", DUT_MAC.iter().chain(&PEER_MAC).chain(&[0x08]).copied().collect()),
+        (
+            "13 bytes, shorter than a header",
+            DUT_MAC
+                .iter()
+                .chain(&PEER_MAC)
+                .chain(&[0x08])
+                .copied()
+                .collect(),
+        ),
         ("a bare header", raw_frame(0x88B6, &[])),
         ("a 59-byte runt", raw_frame(0x88B6, &[7; 45])),
         ("1515 bytes, one over", raw_frame(0x88B6, &[8; 1501])),
@@ -829,11 +1000,24 @@ fn link_flaps(wire: &mut Wire, qmp_path: &str, seq: &mut u16) -> bool {
         }
         std::thread::sleep(LINK_DOWN_FOR.saturating_sub(down_at.elapsed()));
         if let Err(e) = qmp.set_link(true) {
-            step(&name, false, &expected, &format!("raising the link again: {e}"));
+            step(
+                &name,
+                false,
+                &expected,
+                &format!("raising the link again: {e}"),
+            );
             return false;
         }
         let up_at = Instant::now();
-        step(&name, true, &expected, &format!("down for {} ms, {DOWN_PINGS} pings unanswered", down_at.elapsed().as_millis()));
+        step(
+            &name,
+            true,
+            &expected,
+            &format!(
+                "down for {} ms, {DOWN_PINGS} pings unanswered",
+                down_at.elapsed().as_millis()
+            ),
+        );
         if !recovery(wire, &format!("link-flap-{k}"), seq) {
             return false;
         }
@@ -850,14 +1034,26 @@ fn bulk_len(seq: u16) -> usize {
 /// Data of bulk ping `seq`: differs per ping and per byte, so a reply that
 /// carries another ping's data, or bytes from the wrong offset, cannot match.
 fn bulk_data(seq: u16, len: usize) -> Vec<u8> {
-    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seq as u8).wrapping_add((i >> 8) as u8)).collect()
+    (0..len)
+        .map(|i| {
+            (i as u8)
+                .wrapping_mul(31)
+                .wrapping_add(seq as u8)
+                .wrapping_add((i >> 8) as u8)
+        })
+        .collect()
 }
 
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            step("args", false, "--ports-file FILE [--deadline-s N] [--pings N] [--bulk N]", &e);
+            step(
+                "args",
+                false,
+                "--ports-file FILE [--deadline-s N] [--pings N] [--bulk N]",
+                &e,
+            );
             return ExitCode::from(2);
         }
     };
@@ -894,7 +1090,10 @@ mod tests {
     #[test]
     fn accepts_a_correct_echo_reply() {
         let data = [7u8; 56];
-        assert_eq!(check_echo_reply(&good_echo_reply(3, &data), 3, &data), Some(Ok(())));
+        assert_eq!(
+            check_echo_reply(&good_echo_reply(3, &data), 3, &data),
+            Some(Ok(()))
+        );
     }
 
     #[test]
@@ -912,13 +1111,25 @@ mod tests {
     #[test]
     fn bulk_pings_cover_the_size_range_and_differ() {
         let lens: Vec<usize> = (4..304u16).map(bulk_len).collect();
-        assert!(lens.iter().all(|l| (BULK_MIN..BULK_MIN + BULK_SPAN).contains(l)));
-        assert_eq!(*lens.iter().max().unwrap() + 42, 1514, "the largest frame is 1514 bytes");
-        assert!(lens.windows(2).all(|w| w[0] != w[1]), "consecutive sizes differ");
+        assert!(lens
+            .iter()
+            .all(|l| (BULK_MIN..BULK_MIN + BULK_SPAN).contains(l)));
+        assert_eq!(
+            *lens.iter().max().unwrap() + 42,
+            1514,
+            "the largest frame is 1514 bytes"
+        );
+        assert!(
+            lens.windows(2).all(|w| w[0] != w[1]),
+            "consecutive sizes differ"
+        );
         assert_ne!(bulk_data(4, 1000), bulk_data(5, 1000));
         // A full-size reply checks out like a small one.
         let data = bulk_data(9, 1472);
-        assert_eq!(check_echo_reply(&good_echo_reply(9, &data), 9, &data), Some(Ok(())));
+        assert_eq!(
+            check_echo_reply(&good_echo_reply(9, &data), 9, &data),
+            Some(Ok(()))
+        );
     }
 
     #[test]
@@ -932,9 +1143,17 @@ mod tests {
         assert_eq!(len("1515 bytes, one over"), 1515);
         assert_eq!(len("a 1600-byte ping"), 1600);
         assert_eq!(len("9000 bytes, jumbo"), 9000);
-        for n in ["IPv4 with a bad header checksum", "ICMP with a bad checksum", "IPv4 truncated"] {
+        for n in [
+            "IPv4 with a bad header checksum",
+            "ICMP with a bad checksum",
+            "IPv4 truncated",
+        ] {
             let f = &set.iter().find(|(name, _)| *name == n).unwrap().1;
-            assert_eq!(check_echo_reply(f, 7, &[]).map(|r| r.is_ok()), None, "{n} is not a reply");
+            assert_eq!(
+                check_echo_reply(f, 7, &[]).map(|r| r.is_ok()),
+                None,
+                "{n} is not a reply"
+            );
         }
     }
 

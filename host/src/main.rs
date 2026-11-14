@@ -347,7 +347,7 @@ impl mmio::Host for State {
             if let Some(v) = self.faults.register_read("read32", offset, 4) {
                 r = Ok(v);
             } else if let Ok(v) = r {
-                let v = self.faults.cap_read("read32", offset, 4, v.into());
+                let v = self.faults.cap_read("read32", offset, 4, v);
                 r = Ok(v);
             }
         }
@@ -1005,9 +1005,9 @@ fn main() -> ExitCode {
     let dma_used = store.data().device.dma().used();
     // Stop DMA before the driver's buffers are unmapped (logged either way).
     let quiesced = store.data().device.quiesce();
-    // Release the driver's resources (DMA buffers are unmapped, then freed)
-    // before reporting.
-    drop(instance);
+    // Release the driver's resources before reporting: they live in the
+    // store, so dropping it unmaps the DMA buffers, then frees them. (The
+    // instance holds only handles into the store; it needs no drop.)
     drop(store);
 
     let extra = [

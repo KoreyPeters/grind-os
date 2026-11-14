@@ -21,6 +21,8 @@ conformance test, keep the evidence. Trusted.
    - no `unsafe` in driver source (rule 2);
    - no build script, and `wit-bindgen` is the only dependency, so nothing
      from the driver runs on this machine at build time.
+   - `cargo fmt --check` is clean (rustfmt's default style), so a diff
+     between grinds shows what changed, not how it was laid out.
 2. **Build** for `wasm32-unknown-unknown` with `--locked`.
 3. **Conformance**: the test for the driver's device class. The mapping
    lives in `classes.sh` (`e1000e` → `tests/nic`, `nvme` → `tests/block`,
@@ -70,3 +72,15 @@ or format: the block test has no fault injection yet), and three that
 QEMU cannot tell apart (a queue size capped anyway, a timeout moved by
 1 ns, and refusing a one-namespace device while QEMU reports several).
 
+## Lint (trusted code)
+
+```sh
+harness/lint.sh
+```
+
+Run before every trusted commit: `cargo fmt --check` over the workspace
+(`shim`, `host`, `tests/nic/peer`, `tests/block/wbdisk`) and every
+`tests/*/modules` crate, and `cargo clippy --workspace --all-targets` with
+warnings as errors. Prints `LINT step=... result=pass|fail` and a final
+`LINT result=pass|fail`; exit 0 only if everything passes. Drivers are
+checked by `grind.sh` instead.

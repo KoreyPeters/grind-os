@@ -10,7 +10,14 @@ struct Module;
 impl Guest for Module {
     fn start() -> Result<(), String> {
         let buf = dma::allocate(4096).map_err(|e| format!("allocate: {e:?}"))?;
-        let r = nvme::admin(&command(0x05, 0, buf.iova(), 0, [(15 << 16) | 1, 1, 0, 0, 0, 0])).map(|_| ());
+        let r = nvme::admin(&command(
+            0x05,
+            0,
+            buf.iova(),
+            0,
+            [(15 << 16) | 1, 1, 0, 0, 0, 0],
+        ))
+        .map(|_| ());
         expect_refused("Create I/O CQ in driver memory", r)
     }
 }

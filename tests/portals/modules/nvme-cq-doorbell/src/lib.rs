@@ -11,7 +11,9 @@ impl Guest for Module {
     fn start() -> Result<(), String> {
         match mmio::write32(0x100C, 1) {
             Err(mmio::Error::Denied) => Ok(()),
-            other => Err(format!("write32(CQ 1 head 0x100c): expected Err(Denied), got {other:?}")),
+            other => Err(format!(
+                "write32(CQ 1 head 0x100c): expected Err(Denied), got {other:?}"
+            )),
         }
     }
 }

@@ -153,7 +153,10 @@ fn handshake(s: &mut (impl Read + Write), size: u64) -> io::Result<bool> {
     eprintln!("wbdisk: client flags 0x{client:x}");
     loop {
         if read_u64(s)? != IHAVEOPT {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "option without IHAVEOPT"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "option without IHAVEOPT",
+            ));
         }
         let option = read_u32(s)?;
         let len = read_u32(s)? as usize;
@@ -202,14 +205,19 @@ fn transmission(s: &mut (impl Read + Write), disk: &mut Disk) -> io::Result<()> 
             Err(e) => return Err(e),
         };
         if magic != REQUEST_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("request magic 0x{magic:x}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("request magic 0x{magic:x}"),
+            ));
         }
         let _flags = read_u16(s)?;
         let kind = read_u16(s)?;
         let handle = read_u64(s)?;
         let offset = read_u64(s)?;
         let len = read_u32(s)? as usize;
-        let in_range = offset.checked_add(len as u64).is_some_and(|end| end <= disk.size);
+        let in_range = offset
+            .checked_add(len as u64)
+            .is_some_and(|end| end <= disk.size);
         match kind {
             CMD_READ if in_range => match disk.read(offset, len) {
                 Ok(d) => simple_reply(s, 0, handle, &d)?,
@@ -227,22 +235,23 @@ fn transmission(s: &mut (impl Read + Write), disk: &mut Disk) -> io::Result<()> 
                 };
                 simple_reply(s, err, handle, &[])?;
             }
-            CMD_FLUSH => match {
+            CMD_FLUSH => {
                 let began = std::time::Instant::now();
-                disk.flush().map(|n| (n, began.elapsed().as_millis()))
-            } {
-                Ok((n, ms)) => {
-                    eprintln!("wbdisk: flush wrote {n} blocks in {ms} ms");
-                    if ms >= SLOW_FLUSH_MS {
-                        eprintln!("wbdisk: SLOW flush: {n} blocks took {ms} ms (at least {SLOW_FLUSH_MS} ms)");
+                let flushed = disk.flush().map(|n| (n, began.elapsed().as_millis()));
+                match flushed {
+                    Ok((n, ms)) => {
+                        eprintln!("wbdisk: flush wrote {n} blocks in {ms} ms");
+                        if ms >= SLOW_FLUSH_MS {
+                            eprintln!("wbdisk: SLOW flush: {n} blocks took {ms} ms (at least {SLOW_FLUSH_MS} ms)");
+                        }
+                        simple_reply(s, 0, handle, &[])?;
                     }
-                    simple_reply(s, 0, handle, &[])?;
+                    Err(e) => {
+                        eprintln!("wbdisk: flush failed: {e}");
+                        simple_reply(s, EIO, handle, &[])?;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("wbdisk: flush failed: {e}");
-                    simple_reply(s, EIO, handle, &[])?;
-                }
-            },
+            }
             CMD_DISC => return Ok(()),
             _ => simple_reply(s, EINVAL, handle, &[])?,
         }
@@ -255,12 +264,20 @@ fn main() {
         eprintln!("usage: wbdisk IMAGE SOCKET");
         std::process::exit(2);
     }
-    let file = OpenOptions::new().read(true).write(true).open(&args[1]).unwrap_or_else(|e| {
-        eprintln!("wbdisk: open {}: {e}", args[1]);
-        std::process::exit(1)
-    });
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&args[1])
+        .unwrap_or_else(|e| {
+            eprintln!("wbdisk: open {}: {e}", args[1]);
+            std::process::exit(1)
+        });
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut disk = Disk { file, size, dirty: BTreeMap::new() };
+    let mut disk = Disk {
+        file,
+        size,
+        dirty: BTreeMap::new(),
+    };
     let _ = std::fs::remove_file(&args[2]);
     let listener = UnixListener::bind(&args[2]).unwrap_or_else(|e| {
         eprintln!("wbdisk: bind {}: {e}", args[2]);
@@ -281,7 +298,10 @@ fn main() {
                 if let Err(e) = transmission(&mut s, &mut disk) {
                     eprintln!("wbdisk: connection ended: {e}");
                 }
-                eprintln!("wbdisk: client gone; {} unflushed blocks kept in memory", disk.dirty.len());
+                eprintln!(
+                    "wbdisk: client gone; {} unflushed blocks kept in memory",
+                    disk.dirty.len()
+                );
             }
             Ok(false) => eprintln!("wbdisk: client aborted the handshake"),
             Err(e) => eprintln!("wbdisk: handshake failed: {e}"),
@@ -294,17 +314,33 @@ mod tests {
     use super::*;
 
     fn disk(blocks: u64) -> (Disk, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("wbdisk-test-{}-{blocks}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("wbdisk-test-{}-{blocks}", std::process::id()));
         std::fs::write(&path, vec![0x11u8; (blocks * BLOCK) as usize]).unwrap();
-        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
-        (Disk { file, size: blocks * BLOCK, dirty: BTreeMap::new() }, path)
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        (
+            Disk {
+                file,
+                size: blocks * BLOCK,
+                dirty: BTreeMap::new(),
+            },
+            path,
+        )
     }
 
     #[test]
     fn writes_stay_in_memory_until_a_flush() {
         let (mut d, path) = disk(8);
         d.write(BLOCK, &[0x22; 512]).unwrap();
-        assert_eq!(d.read(BLOCK, 512).unwrap(), vec![0x22; 512], "reads see the write");
+        assert_eq!(
+            d.read(BLOCK, 512).unwrap(),
+            vec![0x22; 512],
+            "reads see the write"
+        );
         let on_file = std::fs::read(&path).unwrap();
         assert_eq!(on_file[512..1024], [0x11; 512], "not on the file yet");
         assert_eq!(d.flush().unwrap(), 1);

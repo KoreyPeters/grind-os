@@ -91,6 +91,14 @@ if find "$DIR" -path "$DIR/target" -prune -o -name build.rs -print | grep -q . |
 else
 	check no-build-script pass "no build script" "none"
 fi
+# rustfmt's default style (issue #7), so a diff between grinds shows what
+# changed, not how it was laid out. rustfmt only reads the source.
+if fmt_out="$(cargo fmt --manifest-path "$DIR/Cargo.toml" --check 2>&1)"; then
+	check fmt pass "cargo fmt --check is clean" "clean"
+else
+	check fmt fail "cargo fmt --check is clean" \
+		"$(grep -c '^Diff in' <<<"$fmt_out") differences (run cargo fmt in drivers/$NAME); first: $(grep -m1 '^Diff in' <<<"$fmt_out" | sed "s|$ROOT/||")"
+fi
 if [ ! -f "$DIR/Cargo.toml" ]; then
 	check dependencies fail "only wit-bindgen" "drivers/$NAME/Cargo.toml missing"
 elif ! meta="$(cargo metadata --format-version 1 --manifest-path "$DIR/Cargo.toml" --no-deps 2>"$RUN/metadata.err")"; then

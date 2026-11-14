@@ -14,7 +14,9 @@ impl Guest for Module {
     fn start() -> Result<(), String> {
         match mmio::write32(0xD4, 1 << 17) {
             Err(mmio::Error::Denied) => Ok(()),
-            other => Err(format!("write32(FLASH 0xd4): expected Err(Denied), got {other:?}")),
+            other => Err(format!(
+                "write32(FLASH 0xd4): expected Err(Denied), got {other:?}"
+            )),
         }
     }
 }
