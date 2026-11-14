@@ -82,7 +82,11 @@ off, as `nic-peer` is for the NIC test.
        The disk is served by `wbdisk/` (a write-back disk: QEMU's NVMe
        storage comes over NBD, `vm/run.sh --nvme-nbd`, and writes stay in
        wbdisk's memory until a flush), so killing wbdisk loses exactly
-       what a real disk's volatile cache would. The image check then
+       what a real disk's volatile cache would. wbdisk logs each flush
+       with its duration; `check.sh` prints the count, the slowest, and
+       every flush of 100 ms or more (`SLOW flush`), so a driver's flush
+       timeout can be told apart from a slow disk underneath (about
+       5-60 ms normally). The image check then
        requires `PWRA` in all of 6000-6015, and in 6100-6115 each block's
        old (`SEED`) or new (`PWRB`) contents, nothing else.
        Since the run ends with the cut, the VM never reports a result:

@@ -28,6 +28,10 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixListener;
 
+/// A flush taking at least this long is logged as SLOW, so a driver's
+/// flush timeout can be told apart from a slow disk underneath it.
+const SLOW_FLUSH_MS: u128 = 100;
+
 const NBDMAGIC: u64 = 0x4e42_444d_4147_4943;
 const IHAVEOPT: u64 = 0x4948_4156_454f_5054;
 const OPT_REPLY_MAGIC: u64 = 0x0003_e889_0455_65a9;
@@ -223,9 +227,15 @@ fn transmission(s: &mut (impl Read + Write), disk: &mut Disk) -> io::Result<()> 
                 };
                 simple_reply(s, err, handle, &[])?;
             }
-            CMD_FLUSH => match disk.flush() {
-                Ok(n) => {
-                    eprintln!("wbdisk: flush wrote {n} blocks");
+            CMD_FLUSH => match {
+                let began = std::time::Instant::now();
+                disk.flush().map(|n| (n, began.elapsed().as_millis()))
+            } {
+                Ok((n, ms)) => {
+                    eprintln!("wbdisk: flush wrote {n} blocks in {ms} ms");
+                    if ms >= SLOW_FLUSH_MS {
+                        eprintln!("wbdisk: SLOW flush: {n} blocks took {ms} ms (at least {SLOW_FLUSH_MS} ms)");
+                    }
                     simple_reply(s, 0, handle, &[])?;
                 }
                 Err(e) => {

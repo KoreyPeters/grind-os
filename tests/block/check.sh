@@ -116,7 +116,9 @@ kill "$director" "$wbdisk" 2>/dev/null
 wait "$wbdisk" 2>/dev/null
 echo
 cat "$WORK/director.log"
-echo "write-back disk (log: $WORK/wbdisk.log): $(grep -c 'flush wrote' "$WORK/wbdisk.log") flushes"
+echo "write-back disk (log: $WORK/wbdisk.log): $(grep -c 'flush wrote' "$WORK/wbdisk.log") flushes, slowest $(grep -oE 'in [0-9]+ ms' "$WORK/wbdisk.log" | awk '{ if ($2 > m) m = $2 } END { print m + 0 }') ms"
+# A slow flush underneath can explain a driver's flush timeout: show each.
+grep -F 'SLOW flush' "$WORK/wbdisk.log" || true
 
 # The run ends with the power cut, so the VM never reports a result and
 # run.sh's exit status is not the verdict. Judge from the serial log:
