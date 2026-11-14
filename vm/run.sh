@@ -23,6 +23,8 @@
 #                             own PCIe root port, and make it the device
 #                             under test instead of the e1000e. IMAGE is
 #                             written to: use a scratch image (see tests/block)
+#   --seed N                  pass grind.seed=N to the guest (tests use it to
+#                             seed random choices, so a failure can be replayed)
 #   --qmp SOCKET              open a QEMU monitor (QMP) on this Unix socket, so
 #                             a test can change the VM while it runs (for
 #                             example, set_link to drop the network link)
@@ -51,9 +53,10 @@ NETDEV="user,id=net0"
 NVME=""
 NIC=e1000e
 QMP=""
+SEED=""
 
 usage() {
-	sed -n '4,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+	sed -n '4,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 	exit 2
 }
 
@@ -73,6 +76,11 @@ while [ $# -gt 0 ]; do
 	--nvme) NVME="${2:?--nvme needs a disk image}"; shift ;;
 	--nic) NIC="${2:?--nic needs a model}"; shift ;;
 	--qmp) QMP="${2:?--qmp needs a socket path}"; shift ;;
+	--seed)
+		SEED="${2:?--seed needs a number}"
+		[[ "$SEED" =~ ^[0-9]{1,19}$ ]] || { echo "run.sh: --seed takes a decimal number, got: $SEED" >&2; exit 2; }
+		shift
+		;;
 	-h | --help) usage ;;
 	*) echo "run.sh: unknown argument: $1" >&2; usage ;;
 	esac
@@ -118,6 +126,7 @@ fi
 
 APPEND="console=ttyS0 intel_iommu=on loglevel=4 panic=-1 grind.mode=$MODE"
 [ -z "$RUN" ] || APPEND="$APPEND grind.run=$RUN"
+[ -z "$SEED" ] || APPEND="$APPEND grind.seed=$SEED"
 [ -z "$NVME" ] || APPEND="$APPEND grind.device=1b36:0010"
 [ "$NIC" != rtl8139 ] || APPEND="$APPEND grind.device=10ec:8139"
 

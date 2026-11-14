@@ -28,6 +28,14 @@ if [ ! -f "$MODULE" ]; then
 	exit 1
 fi
 
+# The seed for the host's injected faults (tests/nic/check.sh passes it on
+# the kernel command line as grind.seed); 1 if none was given.
+SEED=1
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in grind.seed=*) SEED="${arg#grind.seed=}" ;; esac
+done
+echo "NIC fault-seed=$SEED"
+
 # Allocation failure (robustness contract, docs/design/robust-nic.md): the
 # driver's second DMA allocation fails. `start` must then return a readable
 # error, not trap or hang. A driver that allocates fewer than two buffers
@@ -50,7 +58,8 @@ printf 'NIC step=alloc-fail result=%s expected="%s" got="%s"\n' "$alloc" "$alloc
 # No --allow-unreviewed-deny-list: the driver must pass with the device's
 # human-reviewed list (rule 10), the same path real hardware takes.
 out="$(/bin/grind-host --device "$BDF" --module "$MODULE" \
-	--timeout-ms 15000 --serve-ping "$IP" --serve-ms "$SERVE_MS" --expect-link-flaps "$LINK_FLAPS" 2>&1)"
+	--timeout-ms 15000 --serve-ping "$IP" --serve-ms "$SERVE_MS" --expect-link-flaps "$LINK_FLAPS" \
+	--fault-seed "$SEED" 2>&1)"
 rc=$?
 printf '%s\n' "$out" | sed 's/^/    /'
 last="$(printf '%s\n' "$out" | tail -n 1)"

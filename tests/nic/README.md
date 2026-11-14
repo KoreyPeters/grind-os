@@ -69,10 +69,20 @@ harness/grind.sh e1000e                    # builds the driver and runs this
    (`--expect-link-flaps 3`, else `link-flaps-unseen`) and up at the end
    (else `link-stuck-down`).
 8. **Device faults** (robustness contract). The peer asks the host,
-   with a control frame, to open three 1.5 s fault windows in turn:
+   with a control frame, to open four 1.5 s fault windows in turn:
    register reads returning all-ones (20%), DMA reads with a byte changed
-   (10%), and both plus slowed calls (10%) (`host/src/faults.rs`, seeded,
-   every fault logged as `fault-injected`). Traffic keeps flowing during
+   (10%), both plus slowed calls (10%), and **device gone**: every
+   register read returns all-ones, as a removed or wedged device would,
+   and then the device is back (`host/src/faults.rs`, every fault logged
+   as `fault-injected`). The last window forces a driver's "device not
+   responding" and recovery paths, which reads it can retry past never
+   reach.
+
+   The faults are seeded, and the seed is random each run:
+   `check.sh` prints `NIC fault-seed=N (replay with NIC_FAULT_SEED=N)`
+   and passes it to the guest (`vm/run.sh --seed`, `grind.seed=`) and on
+   to the host (`--fault-seed`). The windows are timed, so a replay
+   injects the same kinds at the same rates, not the very same calls. Traffic keeps flowing during
    each window, unjudged; a recovery check follows each. Then the bulk
    step runs again (`final-bulk`).
 9. The peer sends the host a "done" control frame, which ends serving.
@@ -95,7 +105,9 @@ Output: the host's JSON log (indented), `NIC step=<step> result=pass|fail
 expected="..." got="..."` for `host`, `arp`, `ping-1`…`ping-3`, `bulk` and `peer`,
 and a final `NIC result=pass|fail`. The peer prints every frame it
 receives (`rx:` lines). Logs: `vm/build/serial.log`,
-`target/nic-test/peer.log`.
+`target/nic-test/peer.log`. QEMU's monitor socket is in a short
+temporary directory (`/tmp/grind-qmp.*`), removed afterwards: a Unix
+socket path must be under 108 bytes, and a worktree can be deep.
 
 ## Negative controls
 
@@ -151,6 +163,11 @@ happened:
   equalled its tail (an empty ring) and the card stopped receiving, while
   the driver waited on the next slot. One bad read deadlocked receive for
   good: no IOMMU faults, a driver-logic wedge.
-- RTL8139: its interrupt status read as all-ones (0xffff); after the
-  window it answered 13 recovery pings and then stopped.
+- RTL8139: the README first recorded its interrupt status reading
+  all-ones (0xffff), but that was a side effect. The regrind found the
+  cause: one corrupted read made an armed, still-empty receive
+  descriptor look done; the driver re-armed it and ran one slot ahead of
+  the device from then on, losing one frame per lap of its 32-slot ring
+  (the 13th recovery ping). Again a one-bad-read desynchronisation, not
+  an IOMMU fault.
 

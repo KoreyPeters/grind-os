@@ -49,12 +49,19 @@ mkdir -p "$WORK"
 PORTS="$WORK/ports"
 PEER_LOG="$WORK/peer.log"
 STOP="$WORK/vm-exited"
-# QEMU's monitor, through which the peer drops and raises the link.
-QMP="$WORK/qmp.sock"
-rm -f "$PORTS" "$STOP" "$QMP"
+# QEMU's monitor, through which the peer drops and raises the link. In a
+# short temporary directory: a Unix socket path must be under 108 bytes,
+# and the repository may be deep (a worktree, for example).
+QMP_DIR="$(mktemp -d /tmp/grind-qmp.XXXXXX)"
+QMP="$QMP_DIR/qmp.sock"
+# The seed for the host's injected faults: random each run unless
+# NIC_FAULT_SEED is set, and printed so a failure can be replayed.
+SEED="${NIC_FAULT_SEED:-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')}"
+echo "NIC fault-seed=$SEED (replay with NIC_FAULT_SEED=$SEED)"
+rm -f "$PORTS" "$STOP"
 "$PEER_BIN" --ports-file "$PORTS" --stop-file "$STOP" --deadline-s 150 --qmp "$QMP" >"$PEER_LOG" 2>&1 &
 peer=$!
-trap 'kill "$peer" 2>/dev/null || true' EXIT
+trap 'kill "$peer" 2>/dev/null || true; rm -rf "$QMP_DIR"' EXIT
 
 for _ in $(seq 50); do
 	[ -s "$PORTS" ] && break
@@ -64,7 +71,7 @@ done
 read -r peer_port qemu_port <"$PORTS"
 
 set +e
-"$ROOT/vm/run.sh" --check --run /tests/nic/guest.sh --net-udp "$peer_port:$qemu_port" --qmp "$QMP" --timeout 180 "$@"
+"$ROOT/vm/run.sh" --check --run /tests/nic/guest.sh --net-udp "$peer_port:$qemu_port" --qmp "$QMP" --seed "$SEED" --timeout 180 "$@"
 vm_status=$?
 
 # The peer normally finishes during the serve window. If it is still

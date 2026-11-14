@@ -608,10 +608,11 @@ fn bulk(wire: &mut Wire, name: &str, after: u16, count: u16) -> bool {
 }
 
 /// Device-fault windows (host/src/faults.rs): kinds, rate per mille, name.
-const FAULT_WINDOWS: [(u8, u16, &str); 3] = [
-    (1, 200, "registers"),   // some register reads return all-ones
-    (2, 100, "device-data"), // some DMA reads come back with a byte changed
-    (7, 100, "all"),         // both, and some calls slowed
+const FAULT_WINDOWS: [(u8, u16, &str); 4] = [
+    (1, 200, "registers"),     // some register reads return all-ones
+    (2, 100, "device-data"),   // some DMA reads come back with a byte changed
+    (7, 100, "all"),           // both, and some calls slowed
+    (1, 1000, "device-gone"),  // every register read returns all-ones, then the device is back
 ];
 const FAULT_WINDOW: Duration = Duration::from_millis(1500);
 /// Pings sent during a fault window keep traffic flowing; they are not
