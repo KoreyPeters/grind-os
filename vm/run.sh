@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Boot the test VM: q35 + KVM, emulated Intel IOMMU, emulated e1000e.
+# Boot the test VM: q35 + KVM, emulated Intel IOMMU, emulated e1000e, and
+# optionally an emulated NVMe controller.
 #
 #   vm/run.sh                 interactive; serial console on this terminal,
 #                             shell after the checks (Ctrl-A x quits QEMU)
@@ -11,11 +12,17 @@
 #   --timeout SECONDS         check mode: give up after this long (default 90)
 #   --log FILE                check mode: serial log (default vm/build/serial.log)
 #   --run GUEST_PATH          after the VM checks, run this initramfs program
-#                             with the e1000e's PCI address (see build-initramfs.sh --add)
+#                             with the device under test's PCI address
+#                             (see build-initramfs.sh --add)
 #   --net-udp PEER:LOCAL      connect the e1000e to a UDP socket instead of
 #                             user-mode networking: QEMU binds 127.0.0.1:LOCAL
 #                             and sends each frame as one datagram to
 #                             127.0.0.1:PEER (see tests/nic)
+#   --nvme IMAGE              add an emulated NVMe controller (1b36:0010)
+#                             backed by the raw disk image IMAGE, behind its
+#                             own PCIe root port, and make it the device
+#                             under test instead of the e1000e. IMAGE is
+#                             written to: use a scratch image (see tests/block)
 #
 # The e1000e's MAC address is always 52:54:00:12:34:56.
 #
@@ -34,9 +41,10 @@ TIMEOUT=90
 LOG="$BUILD/serial.log"
 RUN=""
 NETDEV="user,id=net0"
+NVME=""
 
 usage() {
-	sed -n '4,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+	sed -n '4,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 	exit 2
 }
 
@@ -53,6 +61,7 @@ while [ $# -gt 0 ]; do
 		NETDEV="socket,id=net0,udp=127.0.0.1:${BASH_REMATCH[1]},localaddr=127.0.0.1:${BASH_REMATCH[2]}"
 		shift
 		;;
+	--nvme) NVME="${2:?--nvme needs a disk image}"; shift ;;
 	-h | --help) usage ;;
 	*) echo "run.sh: unknown argument: $1" >&2; usage ;;
 	esac
@@ -80,8 +89,18 @@ case "$RUN" in
 *) fail args "--run takes an absolute guest path" "$RUN" ;;
 esac
 
+# The NVMe image must be a writable regular file. QEMU's -drive option
+# splits on commas, so a comma in the path is refused instead of escaped.
+if [ -n "$NVME" ]; then
+	case "$NVME" in *,*) fail args "--nvme path without commas" "$NVME" ;; esac
+	[ -f "$NVME" ] || fail nvme-image "$NVME is a regular file" "missing or not a regular file"
+	[ -r "$NVME" ] && [ -w "$NVME" ] || fail nvme-image "$NVME readable and writable by $(id -un)" "$(ls -l "$NVME")"
+	NVME="$(realpath "$NVME")"
+fi
+
 APPEND="console=ttyS0 intel_iommu=on loglevel=4 panic=-1 grind.mode=$MODE"
 [ -z "$RUN" ] || APPEND="$APPEND grind.run=$RUN"
+[ -z "$NVME" ] || APPEND="$APPEND grind.device=1b36:0010"
 
 QEMU_ARGS=(
 	-machine q35,accel=kvm,kernel-irqchip=split
@@ -95,6 +114,16 @@ QEMU_ARGS=(
 	-initrd "$BUILD/initramfs.gz"
 	-append "$APPEND"
 )
+# On the root bus QEMU's NVMe controller has no reset method, and the shim
+# refuses a device it cannot reset. Behind its own PCIe root port it gets a
+# secondary bus reset and its own IOMMU group.
+if [ -n "$NVME" ]; then
+	QEMU_ARGS+=(
+		-device pcie-root-port,id=rp1,chassis=1
+		-drive "file=$NVME,if=none,id=nvm,format=raw"
+		-device nvme,serial=grind0001,drive=nvm,bus=rp1
+	)
+fi
 
 if [ "$MODE" = shell ]; then
 	exec "$QEMU" "${QEMU_ARGS[@]}" -serial mon:stdio

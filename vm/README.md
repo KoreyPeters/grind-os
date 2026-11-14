@@ -28,6 +28,20 @@ libraries. Its exit status is reported as step `run`, and any
 `<PREFIX> step=... result=fail ...` lines it prints are shown in
 `run.sh`'s failure summary. `hello/check.sh` uses this mechanism.
 
+To make an emulated NVMe controller the device under test instead:
+
+```sh
+truncate -s 16M /path/to/scratch.img
+vm/run.sh --check --nvme /path/to/scratch.img [--run /bin/prog]
+```
+
+The guest writes to the image, so use a scratch file. QEMU's NVMe controller
+(`1b36:0010`) sits behind its own PCIe root port: on the root bus it has no
+reset method, and the shim refuses a device it cannot reset. `run.sh` passes
+`grind.device=1b36:0010` to `init`, which binds that device to `vfio-pci` and
+hands its address to `--run`. The e1000e is still present but is left to
+Linux.
+
 ## Prerequisites
 
 - `qemu-system-x86_64`, `curl`, `dpkg-deb`, `depmod`/`modprobe` (kmod), `cpio`, `gzip`.
@@ -67,7 +81,10 @@ the new package's snapshot URL and the sha256 from Debian's `Packages` index.
 **QEMU command line** (see `run.sh`): `-machine q35,accel=kvm,kernel-irqchip=split`,
 `-device intel-iommu,intremap=on` (listed before the devices it translates
 for), `-device e1000e` on a user-mode network backend, kernel command line
-`console=ttyS0 intel_iommu=on`.
+`console=ttyS0 intel_iommu=on`. With `--nvme IMAGE`, also
+`-device pcie-root-port,id=rp1,chassis=1`,
+`-drive file=IMAGE,if=none,id=nvm,format=raw` and
+`-device nvme,serial=grind0001,drive=nvm,bus=rp1`.
 
 ## Checks
 
@@ -81,13 +98,16 @@ VMCHECK result=fail failed_step=<step>
 
 | Step | Passes when |
 | --- | --- |
+| `device-select` | `grind.device` (default `8086:10d3`) is a known device: `8086:10d3` or `1b36:0010` |
 | `iommu` | `/sys/class/iommu` has a DMAR unit |
 | `irq-remap` | dmesg reports interrupt remapping enabled |
 | `modules` | `e1000e`, `vfio-pci` and `vfio_iommu_type1` load |
-| `device` | exactly one `8086:10d3` (82574L) is on the PCI bus |
+| `device` | exactly one device under test is on the PCI bus |
 | `iommu-group` | that device is alone in its IOMMU group |
-| `bound-e1000e` | Linux's `e1000e` driver claimed it |
-| `unbind` | it is unbound from `e1000e` |
+| `reset-method` | Linux can reset it (`reset_method` isn't empty), as the shim requires |
+| `bound-e1000e` | e1000e only: Linux's `e1000e` driver claimed it |
+| `unbind` | e1000e only: it is unbound from `e1000e` |
+| `unbound` | NVMe only: no Linux driver claimed it |
 | `bind-vfio` | `driver_override` plus `drivers_probe` binds it to `vfio-pci` |
 | `vfio-dev` | `/dev/vfio/vfio` and `/dev/vfio/<group>` exist |
 | `run` | only with `--run`: the program exits 0 |
