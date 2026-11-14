@@ -23,11 +23,13 @@ conformance test, keep the evidence. Trusted.
      from the driver runs on this machine at build time.
 2. **Build** for `wasm32-unknown-unknown` with `--locked`.
 3. **Conformance**: the test for the driver's device class. The mapping
-   lives in `grind.sh` (`e1000e` → `tests/nic`), not in the driver's
-   directory, so a driver cannot pick its own test.
+   lives in `grind.sh` (`e1000e` → `tests/nic`, `nvme` → `tests/block`),
+   not in the driver's directory, so a driver cannot pick its own test.
 4. **Evidence** in `harness/runs/<name>/<UTC time>/` (gitignored):
-   `output.log`, `build.log`, `driver.wasm`, `serial.log`, `peer.log`, and
-   the commit and working-tree status the run used.
+   `output.log`, `build.log`, `driver.wasm`, `serial.log`, `peer.log` (NIC
+   only), and the commit and working-tree status the run used. The block
+   test's image check is in `output.log`; the image itself stays in
+   `target/block-test/disk.img` until the next run.
 
 The final line is `GRIND driver=<name> result=pass|fail run=<dir>`. Exit 0
 only if everything passed. Extra arguments go to `vm/run.sh`.

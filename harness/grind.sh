@@ -26,6 +26,7 @@ shift
 # the driver's directory, so a driver cannot choose its own test.
 case "$NAME" in
 e1000e) CLASS=nic ;;
+nvme) CLASS=block ;;
 *) echo "GRIND step=driver result=fail expected=\"a driver listed in harness/grind.sh\" got=\"$NAME\""; exit 2 ;;
 esac
 
