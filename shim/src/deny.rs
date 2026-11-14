@@ -51,18 +51,91 @@ impl DenyList {
     }
 }
 
+/// Cite a section of the datasheet the 82574L entries were identified from.
+macro_rules! ds82574 {
+    ($section:literal) => {
+        concat!(
+            "Intel 82574 GbE Controller Family Datasheet rev 2.5 (April 2009), section ",
+            $section
+        )
+    };
+}
+
+const fn e82574(
+    offset: u32,
+    len: u32,
+    name: &'static str,
+    reason: &'static str,
+    source: &'static str,
+) -> DenyEntry {
+    DenyEntry {
+        offset,
+        len,
+        name,
+        reason,
+        source,
+    }
+}
+
 /// Intel 82574L, as emulated by QEMU's `e1000e` device.
 ///
-/// PENDING: entries must come from the Intel 82574 GbE Controller Family
-/// datasheet, which could not be read yet in this environment. Until then
-/// the list is empty and unreviewed, so the host refuses it unless
-/// unreviewed lists are explicitly allowed.
+/// From the datasheet's register summary (Table 77) and register
+/// descriptions (section 10.2.2), checked against Specification Update
+/// 320709 rev 4.1, which lists no documentation changes.
+///
+/// Checked and deliberately allowed: EERD (0x14, a write only starts a
+/// word read), CTRL_EXT (0x18, EE_RST only re-reads the NVM), MDIC (0x20),
+/// EXTCNF_CTRL (0xF00, MDIO ownership), FLOL (0x1050, RAM power gating;
+/// other bits are loaded from NVM, not written to it), SWSM (0x5B50,
+/// semaphore).
+///
+/// Not reviewed by the human yet (rule 10).
 pub static E1000E_82574L: DenyList = DenyList {
     vendor: 0x8086,
     device: 0x10d3,
     model: "Intel 82574L",
     reviewed: false,
-    entries: &[],
+    entries: &[
+        e82574(0x0_0010, 4, "EEC",
+            "bit-bangs the NVM (EE_SK/EE_CS/EE_DI); FWE enables Flash write and erase; AUPDEN enables autonomous Flash update",
+            ds82574!("10.2.2.3")),
+        e82574(0x0_001C, 4, "FLA",
+            "bit-bangs the Flash (FL_NVM_SK/FL_CE/FL_SI); FL_ER sends a Flash erase command",
+            ds82574!("10.2.2.6")),
+        e82574(0x0_1010, 4, "EEMNGCTL",
+            "starts manageability EEPROM reads and writes; read-only to software per the datasheet, denied as defence in depth",
+            ds82574!("10.2.2.18")),
+        e82574(0x0_1014, 4, "EEMNGDATA",
+            "data for manageability EEPROM writes; read-only to software per the datasheet, denied as defence in depth",
+            ds82574!("10.2.2.19")),
+        e82574(0x0_1018, 4, "FLMNGCTL",
+            "manageability Flash control; read-only to software per the datasheet, denied as defence in depth",
+            ds82574!("10.2.2.20")),
+        e82574(0x0_101C, 4, "FLMNGDATA",
+            "manageability Flash data; read-only to software per the datasheet, denied as defence in depth",
+            ds82574!("10.2.2.21")),
+        e82574(0x0_1020, 4, "FLMNGCNT",
+            "manageability Flash counter; read-only to software per the datasheet, denied as defence in depth",
+            ds82574!("10.2.2.22")),
+        e82574(0x0_1028, 4, "FLASHT",
+            "timer for autonomous Flash updates (with EEC.AUPDEN); no driver needs it",
+            ds82574!("10.2.2.23")),
+        e82574(0x0_102C, 4, "EEWR",
+            "writes a 16-bit word to the external NVM, even without a valid signature",
+            ds82574!("10.2.2.24")),
+        e82574(0x0_1030, 4, "FLSWCTL",
+            "software Flash burst control: issues DMA write commands to the Flash",
+            ds82574!("10.2.2.25")),
+        e82574(0x0_1034, 4, "FLSWDATA",
+            "software Flash burst data written to the NVM",
+            ds82574!("10.2.2.26")),
+        e82574(0x0_1038, 4, "FLSWCNT",
+            "software Flash burst size and abort",
+            ds82574!("10.2.2.27")),
+        e82574(0x0_103C, 4, "FLOP",
+            "opcodes the device uses to drive the NVM",
+            ds82574!("10.2.2.28")),
+    ],
 };
 
 static ALL: &[&DenyList] = &[&E1000E_82574L];
@@ -110,6 +183,56 @@ mod tests {
         assert_eq!(TEST_LIST.check_write(0x10c, 4).unwrap().name, "B");
         assert!(TEST_LIST.check_write(0x110, 4).is_none());
         assert!(TEST_LIST.check_write(u32::MAX - 3, 4).is_none()); // no overflow
+    }
+
+    #[test]
+    fn every_list_is_well_formed() {
+        for list in ALL {
+            let mut prev_end = 0u64;
+            for e in list.entries {
+                let what = format!("{} {} at 0x{:x}", list.model, e.name, e.offset);
+                assert!(
+                    e.len > 0 && e.len % 4 == 0 && e.offset % 4 == 0,
+                    "{what}: aligned dword ranges"
+                );
+                assert!(
+                    u64::from(e.offset) >= prev_end,
+                    "{what}: sorted, no overlap"
+                );
+                assert!(
+                    e.source.contains("section "),
+                    "{what}: cites a datasheet section"
+                );
+                assert!(!e.reason.is_empty(), "{what}: has a reason");
+                prev_end = u64::from(e.offset) + u64::from(e.len);
+            }
+        }
+    }
+
+    #[test]
+    fn e1000e_decisions() {
+        let l = &E1000E_82574L;
+        for (offset, name) in [
+            (0x10, "EEC"),
+            (0x1C, "FLA"),
+            (0x102C, "EEWR"),
+            (0x1030, "FLSWCTL"),
+            (0x103C, "FLOP"),
+        ] {
+            assert_eq!(
+                l.check_write(offset, 4).map(|e| e.name),
+                Some(name),
+                "0x{offset:x} denied"
+            );
+        }
+        // Registers a driver needs: control, status, NVM word reads, PHY access, semaphore.
+        for offset in [0x0, 0x8, 0x14, 0x18, 0x20, 0xF00, 0x1050, 0x5B50] {
+            assert!(l.check_write(offset, 4).is_none(), "0x{offset:x} allowed");
+        }
+        assert!(
+            !l.reviewed,
+            "only the human marks a list reviewed (rule 10)"
+        );
     }
 
     #[test]
