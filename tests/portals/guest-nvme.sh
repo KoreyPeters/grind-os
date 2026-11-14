@@ -56,61 +56,60 @@ run_case() {
 		"$(clean "$expected")" "$(clean "$got")"
 }
 
-# The QEMU NVMe register and command lists are not reviewed yet (rule 10),
-# so cases that open the device must allow that explicitly. This is valid
-# only for emulated devices.
-EMU=--allow-unreviewed-deny-list
+# No --allow-unreviewed-deny-list: the QEMU NVMe register and command lists
+# are human-reviewed (rule 10), so every case takes the path real hardware
+# would.
 REFUSED='"status":"fail","reason":"command-refused"'
 DENIED='"status":"fail","reason":"deny-list-violation"'
 
-# Gate: without the flag, the unreviewed lists keep the device closed.
-run_case nvme-gate 2 nvme-smoke '"step":"device-deny-list"' 'and command list for QEMU NVM Express controller' 'not reviewed yet'
+# Gate: the device opens without the flag because both lists are reviewed.
+run_case nvme-gate 0 nvme-smoke '"deny_reviewed":true' '"commands":true,"commands_reviewed":true' '"status":"pass"'
 
 # Bring-up, then every allowed path once: Identify, Set Features, queue
 # creation, Write, Read, Flush, and collecting completions.
 run_case nvme-smoke 0 nvme-smoke \
-	'"event":"nvme-ready"' '"dstrd":0' '"commands_reviewed":false' \
+	'"event":"nvme-ready"' '"dstrd":0' '"commands_reviewed":true' \
 	'"message":"nvme-smoke","field.serial":"grind0001","field.round_trip_bytes":"4096"' \
-	'"status":"pass"' -- $EMU
+	'"status":"pass"'
 
 # Flow control: the shim learns how far the device has fetched only from
 # completions it reads itself, so an SQ fills until they are collected.
 run_case nvme-queue-full 0 nvme-queue-full \
 	'"field.queue_full_after":"15","field.then":"ok"' '"got":"queue-full (tail 15, device head 0); collect completions first"' \
-	'"status":"pass"' -- $EMU
+	'"status":"pass"'
 
 # Commands the shim must refuse (rule 10). Each module handles the error;
 # the host must still fail the run.
 run_case nvme-format 1 nvme-format \
 	'"event":"command-refused","queue":"admin","sqid":0,"opcode":"0x80","command":"unlisted","check":"opcode"' \
-	"$REFUSED" -- $EMU
+	"$REFUSED"
 run_case nvme-save 1 nvme-save \
 	'"opcode":"0x9","command":"Set Features (Number of Queues)","check":"feature"' \
-	"$REFUSED" -- $EMU
+	"$REFUSED"
 run_case nvme-vendor-admin 1 nvme-vendor-admin \
-	'"opcode":"0xc0","command":"unlisted","check":"opcode"' "$REFUSED" -- $EMU
+	'"opcode":"0xc0","command":"unlisted","check":"opcode"' "$REFUSED"
 run_case nvme-unlisted-io 1 nvme-unlisted-io \
-	'"queue":"io","sqid":1,"opcode":"0x8","command":"unlisted","check":"opcode"' "$REFUSED" -- $EMU
+	'"queue":"io","sqid":1,"opcode":"0x8","command":"unlisted","check":"opcode"' "$REFUSED"
 run_case nvme-prp-shim 1 nvme-prp-shim \
-	'"command":"Read","check":"address"' 'PRP1 range 0x100000000+0x200' "$REFUSED" -- $EMU
+	'"command":"Read","check":"address"' 'PRP1 range 0x100000000+0x200' "$REFUSED"
 run_case nvme-prp-list 1 nvme-prp-list \
-	'"command":"Read","check":"prp-list"' "$REFUSED" -- $EMU
+	'"command":"Read","check":"prp-list"' "$REFUSED"
 run_case nvme-cq-in-driver 1 nvme-cq-in-driver \
-	'"command":"Create I/O Completion Queue","check":"prp"' "$REFUSED" -- $EMU
+	'"command":"Create I/O Completion Queue","check":"prp"' "$REFUSED"
 
 # Registers the shim owns: the allow list refuses them.
 run_case nvme-sq-doorbell 1 nvme-sq-doorbell \
 	'"event":"mmio-denied","attempted":"write32","offset":"0x1008","value":"0x1","register":"unlisted"' \
-	"$DENIED" -- $EMU
+	"$DENIED"
 run_case nvme-cq-doorbell 1 nvme-cq-doorbell \
 	'"event":"mmio-denied","attempted":"write32","offset":"0x100c","value":"0x1","register":"unlisted"' \
-	"$DENIED" -- $EMU
+	"$DENIED"
 run_case nvme-cc-write 1 nvme-cc-write \
 	'"event":"mmio-denied","attempted":"write32","offset":"0x14","value":"0x0","register":"unlisted"' \
-	"$DENIED" -- $EMU
+	"$DENIED"
 
 # Teardown: bus mastering off before the driver's buffers are unmapped.
-run_case nvme-quiesce 0 nvme-smoke '"event":"device-quiesce","bdf":"'"$BDF"'"' -- $EMU
+run_case nvme-quiesce 0 nvme-smoke '"event":"device-quiesce","bdf":"'"$BDF"'"'
 
 # After every case above: the IOMMU logged no DMA faults. The refused
 # commands never reached the device, so nothing faulted.

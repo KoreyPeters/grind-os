@@ -126,8 +126,9 @@ check, so it is refused (`prp-list`). For Read and Write the shim learns
 the block size by identifying the namespace itself, into its own page; a
 namespace with metadata, or a block size outside 512–4096 bytes, is refused.
 
-Not yet reviewed by the human. Until both lists are, the device opens only
-with `--allow-unreviewed-deny-list` under an emulator.
+The human reviewed both the register list and the command list against
+their sources and set `reviewed: true` in their own commit (rule 10). Any
+change to either needs a new review.
 
 **Sources.** Facts only; no code copied. The NVM Express specification is
 not a source (see `docs/design/milestone-5-nvme.md`).

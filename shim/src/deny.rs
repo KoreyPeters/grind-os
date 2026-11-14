@@ -248,13 +248,13 @@ pub const NVME_MAX_IO_QUEUES: u16 = 64;
 ///
 /// The source macro stays for when an entry is added.
 ///
-/// Not yet reviewed by the human.
+/// Reviewed by the human (rule 10), together with its command list.
 pub static QEMU_NVME: WriteList = WriteList {
     vendor: 0x1b36,
     device: 0x0010,
     model: "QEMU NVM Express controller",
     kind: ListKind::Allow,
-    reviewed: false,
+    reviewed: true,
     commands: Some(&crate::nvme::NVME_COMMANDS),
     entries: &[],
 };
@@ -628,6 +628,7 @@ mod tests {
         }
         assert!(gate(lists, 0xfffe, 0x0003, true, QEMU).is_ok());
         assert!(gate(lists, 0xfffe, 0x0003, true, DELL).is_err());
+        assert!(QEMU_NVME.fully_reviewed(), "the shipped NVMe lists");
     }
 
     #[test]

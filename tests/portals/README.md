@@ -38,7 +38,7 @@ handles the error and returns ok; the host must still fail the run.
 
 | Case | Module | Expected |
 | --- | --- | --- |
-| `nvme-gate` | `nvme-smoke` without the allow flag | exit 2 at `device-deny-list`: the register and command lists are not reviewed |
+| `nvme-gate` | `nvme-smoke` without the allow flag | exit 0: the register and command lists are human-reviewed (`deny_reviewed`, `commands_reviewed` true) |
 | `nvme-smoke` | Identify (serial `grind0001`), Set Features, create an I/O queue pair, write 8 blocks, read them back exactly, flush | exit 0, `nvme-ready` logged with `dstrd: 0` |
 | `nvme-queue-full` | 15 Flushes on a 16-entry queue without collecting, then one more | exit 0: the 16th gets `queue-full`; after collecting, submitting works |
 | `nvme-format` | Format NVM (80h) | exit 1, `command-refused` (`check: opcode`) |
@@ -62,6 +62,6 @@ them use `unsafe` on purpose: `wasi-import` declares a foreign import, and
 none of them are subject to the driver rules.
 
 **Status:** the e1000e cases pass on QEMU 4.2.1 and 6.2.0; the NVMe cases
-pass on QEMU 6.2.0. The e1000e deny list is human reviewed (see
-`shim/README.md`); the cases pass in either state. The NVMe lists are not
-reviewed yet, so the NVMe cases use `--allow-unreviewed-deny-list`.
+pass on QEMU 6.2.0. The e1000e deny list and the NVMe register and command
+lists are human reviewed (see `shim/README.md`). The NVMe cases run without
+`--allow-unreviewed-deny-list`.

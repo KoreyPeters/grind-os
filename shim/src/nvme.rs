@@ -140,10 +140,10 @@ impl CommandList {
 /// vendor-specific admin opcode from C0h (SPDK nvme_spec.h:1803), and every
 /// I/O opcode but Flush, Write and Read (FreeBSD nvme.h:1128-1147).
 ///
-/// Not yet reviewed by the human.
+/// Reviewed by the human (rule 10).
 pub static NVME_COMMANDS: CommandList = CommandList {
     model: "NVM Express (FreeBSD nvme(4) usage)",
-    reviewed: false,
+    reviewed: true,
     entries: &[
         CommandEntry {
             queue: QueueKind::Admin,
