@@ -4,4 +4,4 @@
 # separately for wasm32-unknown-unknown.
 [workspace]
 resolver = "2"
-members = ["shim", "host"]
+members = ["shim", "host", "tests/nic/peer"]

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+[package]
+name = "nic-peer"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Link partner for the NIC conformance test: ARPs and pings over QEMU's UDP socket netdev"
+publish = false
+
+# Standard library only.
+[dependencies]

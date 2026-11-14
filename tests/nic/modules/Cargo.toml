@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Trusted NIC test fixtures, built for wasm32-unknown-unknown. Negative
+# controls: tests/nic/check.sh must fail on each of them.
+[workspace]
+resolver = "2"
+members = ["silent"]
+
+[workspace.dependencies]
+wit-bindgen = "=0.63.0"
+
+[profile.release]
+opt-level = "s"
