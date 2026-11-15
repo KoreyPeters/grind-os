@@ -386,6 +386,23 @@ impl Nic {
     /// device that lost its configuration or stalled. Every wait is bounded
     /// (at most about 110 ms in all), so it fits inside one call.
     fn configure(&mut self) -> Result<(), String> {
+        Self::reset()?;
+        Self::general_and_link()?;
+        self.station_address()?;
+        self.rx_ring()?;
+        self.tx_ring()?;
+        let now = now_ns();
+        self.rx_checked_ns = now;
+        self.rx_disagree_since = None;
+        self.health_ns = now;
+        self.tx_full_since = None;
+        self.tx_disagree_since = None;
+        Ok(())
+    }
+
+    /// `configure`, steps 2-5: mask interrupts, quiesce, global reset,
+    /// mask again and clear pending causes.
+    fn reset() -> Result<(), String> {
         // 2. Mask interrupts (4.6.1).
         write(reg::IMC, "IMC", u32::MAX)?;
 
@@ -421,7 +438,12 @@ impl Nic {
             "reset complete",
             &[("waited_us", (reset_us + 1000).to_string())],
         );
+        Ok(())
+    }
 
+    /// `configure`, steps 6-7: general configuration, and link setup with
+    /// the MAC following the PHY.
+    fn general_and_link() -> Result<(), String> {
         // 6. General configuration (4.6.2).
         let gcr = read(reg::GCR, "GCR")?;
         write(reg::GCR, "GCR", gcr | bit::GCR_BIT22)?;
@@ -442,7 +464,12 @@ impl Nic {
                 | bit::CTRL_GIO_MASTER_DISABLE
                 | bit::CTRL_RST);
         write(reg::CTRL, "CTRL", ctrl)?;
+        Ok(())
+    }
 
+    /// `configure`, step 8: the station address, which must be valid and
+    /// the same as before any reset.
+    fn station_address(&mut self) -> Result<(), String> {
         // 8. Station address (10.2.5.22-23), read twice: both must agree.
         let (ral, rah) = (read(reg::RAL0, "RAL0")?, read(reg::RAH0, "RAH0")?);
         let (ral2, rah2) = (read(reg::RAL0, "RAL0")?, read(reg::RAH0, "RAH0")?);
@@ -473,7 +500,11 @@ impl Nic {
             ));
         }
         self.mac = mac;
+        Ok(())
+    }
 
+    /// `configure`, steps 9-11: multicast table, RX ring, RCTL.
+    fn rx_ring(&mut self) -> Result<(), String> {
         // 9. Multicast table (4.6.5).
         for i in 0..reg::MTA_ENTRIES {
             write(reg::MTA + 4 * i, "MTA", 0)?;
@@ -501,7 +532,11 @@ impl Nic {
 
         // 11. RCTL (10.2.5.1): legacy descriptors, 2048-byte buffers.
         write(reg::RCTL, "RCTL", RCTL_VALUE)?;
+        Ok(())
+    }
 
+    /// `configure`, steps 12-15: TX ring, TXDCTL, TCTL, TIPG.
+    fn tx_ring(&mut self) -> Result<(), String> {
         // 12. TX ring (4.6.6), all descriptors zeroed.
         self.tx_desc
             .write(0, &vec![0u8; RING_BYTES as usize])
@@ -523,13 +558,6 @@ impl Nic {
         )?;
         write(reg::TCTL, "TCTL", TCTL_VALUE)?;
         write(reg::TIPG, "TIPG", TIPG_VALUE)?;
-
-        let now = now_ns();
-        self.rx_checked_ns = now;
-        self.rx_disagree_since = None;
-        self.health_ns = now;
-        self.tx_full_since = None;
-        self.tx_disagree_since = None;
         Ok(())
     }
 
