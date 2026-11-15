@@ -96,6 +96,240 @@ fn read_command(config: &File, config_offset: u64) -> std::io::Result<u16> {
     Ok(u16::from_le_bytes(cmd))
 }
 
+/// What rule 10's gate admits: the device's write list, the DMI system
+/// vendor and the subsystem IDs (both logged by `device-open`).
+type Admitted = (&'static WriteList, Option<String>, Option<(u16, u16)>);
+
+/// `Device::open`, stage 1: rule 10's gate. No reviewed write list, no
+/// access.
+fn rule10_gate(
+    sys: &str,
+    vendor: u16,
+    device_id: u16,
+    allow_unreviewed: bool,
+) -> Result<Admitted, OpenError> {
+    let sys_vendor = deny::sys_vendor();
+    // Unreadable subsystem IDs are passed as None; the gate refuses an
+    // unreviewed list then, and a reviewed one does not need them.
+    let subsystem = sysfs_hex(&format!("{sys}/subsystem_vendor"))
+        .ok()
+        .zip(sysfs_hex(&format!("{sys}/subsystem_device")).ok());
+    let deny = deny::admit(
+        vendor,
+        device_id,
+        subsystem,
+        allow_unreviewed,
+        sys_vendor.as_deref(),
+    )
+    .map_err(|r| fail("deny-list", r.expected, r.got))?;
+    Ok((deny, sys_vendor, subsystem))
+}
+
+/// `Device::open`, stage 2: the VFIO container and the device's IOMMU
+/// group, with the Type1 v2 IOMMU set. Returns them and the group's ID.
+fn open_group(sys: &str) -> Result<(File, File, String), OpenError> {
+    let link = format!("{sys}/iommu_group");
+    let exp = format!("{link} links to an IOMMU group");
+    let target = fs::read_link(&link).map_err(fails("group", &exp))?;
+    let group_id = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let container = open_rw("/dev/vfio/vfio").map_err(fails("container", "open /dev/vfio/vfio"))?;
+    let version = ioctl_val(&container, VFIO_GET_API_VERSION, 0)
+        .map_err(fails("container", "VFIO_GET_API_VERSION succeeds"))?;
+    if version != VFIO_API_VERSION {
+        return Err(fail(
+            "container",
+            format!("VFIO API version {VFIO_API_VERSION}"),
+            version,
+        ));
+    }
+    let ext = ioctl_val(&container, VFIO_CHECK_EXTENSION, VFIO_TYPE1V2_IOMMU)
+        .map_err(fails("container", "VFIO_CHECK_EXTENSION succeeds"))?;
+    if ext != 1 {
+        return Err(fail(
+            "container",
+            "Type1 v2 IOMMU support",
+            format!("VFIO_CHECK_EXTENSION returned {ext}"),
+        ));
+    }
+
+    let group_path = format!("/dev/vfio/{group_id}");
+    let group = open_rw(&group_path).map_err(fails("group", &group_path))?;
+    let mut status = GroupStatus {
+        argsz: argsz::<GroupStatus>(),
+        ..Default::default()
+    };
+    ioctl_ptr(&group, VFIO_GROUP_GET_STATUS, &mut status)
+        .map_err(fails("group", "VFIO_GROUP_GET_STATUS succeeds"))?;
+    if status.flags & VFIO_GROUP_FLAGS_VIABLE == 0 {
+        return Err(fail(
+            "group",
+            "a viable group (all devices bound to vfio-pci or no driver)",
+            format!("flags 0x{:x}", status.flags),
+        ));
+    }
+    let mut container_fd = container.as_raw_fd();
+    ioctl_ptr(&group, VFIO_GROUP_SET_CONTAINER, &mut container_fd)
+        .map_err(fails("group", "VFIO_GROUP_SET_CONTAINER succeeds"))?;
+    ioctl_val(&container, VFIO_SET_IOMMU, VFIO_TYPE1V2_IOMMU)
+        .map_err(fails("container", "VFIO_SET_IOMMU Type1 v2 succeeds"))?;
+    Ok((container, group, group_id))
+}
+
+/// `Device::open`, stage 3: which IOVAs the IOMMU will map, as the DMA
+/// allocator's regions (logged as `dma-regions`).
+fn dma_regions(container: &File) -> Regions {
+    // Which IOVAs the IOMMU will map (reserved regions such as the MSI
+    // window excluded), for the DMA allocator's regions. If the kernel
+    // does not say, the allocator assumes the high region and offers no
+    // low one.
+    let ranges = match iommu_info(container) {
+        Ok(reply) => parse_iova_ranges(&reply),
+        Err(e) => {
+            emit(
+                "dma-ranges-error",
+                &[
+                    ("attempted", Value::Str("VFIO_IOMMU_GET_INFO")),
+                    ("error", Value::Str(&e.to_string())),
+                ],
+            );
+            None
+        }
+    };
+    let regions = Regions::from_ranges(ranges.as_deref());
+    let show =
+        |r: Option<(u64, u64)>| r.map_or("none".to_string(), |(s, e)| format!("0x{s:x}-0x{e:x}"));
+    emit(
+        "dma-regions",
+        &[
+            (
+                "iova_ranges",
+                Value::Str(&ranges.as_ref().map_or("not reported".to_string(), |rs| {
+                    rs.iter()
+                        .map(|(s, e)| format!("0x{s:x}-0x{e:x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })),
+            ),
+            ("high", Value::Str(&show(regions.high))),
+            ("low", Value::Str(&show(regions.low))),
+        ],
+    );
+    regions
+}
+
+/// `Device::open`, stages 4 and 5: the device's fd, reset; then config
+/// space: identity confirmed, memory decode and bus mastering on. Returns
+/// the fd, the config region, the PCI command value written and a second
+/// fd for config space.
+fn open_device(
+    group: &File,
+    bdf: &str,
+    vendor: u16,
+    device_id: u16,
+) -> Result<(File, RegionInfo, u16, File), OpenError> {
+    let name = CString::new(bdf).map_err(fails("device", "a PCI address without NUL bytes"))?;
+    let fd = ioctl_str(group, VFIO_GROUP_GET_DEVICE_FD, &name)
+        .map_err(fails("device", "VFIO_GROUP_GET_DEVICE_FD succeeds"))?;
+    // SAFETY: the kernel just returned `fd` as a new descriptor owned by us.
+    let dev = unsafe { File::from_raw_fd(fd) };
+    let mut info = DeviceInfo {
+        argsz: argsz::<DeviceInfo>(),
+        ..Default::default()
+    };
+    ioctl_ptr(&dev, VFIO_DEVICE_GET_INFO, &mut info)
+        .map_err(fails("device", "VFIO_DEVICE_GET_INFO succeeds"))?;
+    if info.flags & VFIO_DEVICE_FLAGS_PCI == 0 {
+        return Err(fail(
+            "device",
+            "a PCI device",
+            format!("flags 0x{:x}", info.flags),
+        ));
+    }
+
+    // Reset, so no state (rings, DMA addresses, enabled engines) carries
+    // over from whoever used the device before. A device VFIO cannot
+    // reset is refused rather than run in an unknown state.
+    if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
+        return Err(fail(
+            "reset",
+            "a device VFIO can reset (VFIO_DEVICE_FLAGS_RESET)",
+            format!("device info flags 0x{:x}", info.flags),
+        ));
+    }
+    ioctl_val(&dev, VFIO_DEVICE_RESET, 0).map_err(fails("reset", "VFIO_DEVICE_RESET succeeds"))?;
+
+    // Config space: confirm identity, then enable memory decode and bus
+    // mastering (DMA). Drivers never see config space.
+    let cfg = region_info(&dev, VFIO_PCI_CONFIG_REGION_INDEX, "config")?;
+    let mut id = [0u8; 4];
+    dev.read_exact_at(&mut id, cfg.offset)
+        .map_err(fails("config", "read config dword 0"))?;
+    let id = u32::from_le_bytes(id);
+    let want = (u32::from(device_id) << 16) | u32::from(vendor);
+    if id != want {
+        return Err(fail(
+            "config",
+            format!("config dword 0 = 0x{want:08x}"),
+            format!("0x{id:08x}"),
+        ));
+    }
+    let cmd = read_command(&dev, cfg.offset)
+        .map_err(fails("config", "read PCI command register"))?
+        | PCI_COMMAND_MEMORY
+        | PCI_COMMAND_MASTER;
+    dev.write_all_at(&cmd.to_le_bytes(), cfg.offset + PCI_COMMAND)
+        .map_err(fails("config", "write PCI command register"))?;
+    let config = dev
+        .try_clone()
+        .map_err(fails("config", "duplicate the device fd for config space"))?;
+    Ok((dev, cfg, cmd, config))
+}
+
+/// `Device::open`, stage 6: the register window, the memory BAR the write
+/// list names. Returns its index and region.
+fn register_bar(
+    dev: &File,
+    cfg: &RegionInfo,
+    deny: &WriteList,
+) -> Result<(u32, RegionInfo), OpenError> {
+    // The register window: the memory BAR the write list names. An
+    // I/O-port BAR is refused: its registers are reached indirectly and
+    // the portals never expose one. Config space says which kind a BAR
+    // is (bit 0 of the BAR register: 1 for I/O).
+    let bar_index = deny.bar;
+    if bar_index > 5 {
+        return Err(fail("bar", "a write list naming BAR 0 to 5", bar_index));
+    }
+    let mut bar_reg = [0u8; 4];
+    dev.read_exact_at(
+        &mut bar_reg,
+        cfg.offset + PCI_BASE_ADDRESS_0 + 4 * u64::from(bar_index),
+    )
+    .map_err(fails("bar", "read the BAR register in config space"))?;
+    let bar_reg = u32::from_le_bytes(bar_reg);
+    if bar_reg & 1 != 0 {
+        return Err(fail(
+            "bar",
+            format!("BAR{bar_index} is a memory BAR"),
+            format!("an I/O-port BAR (config 0x{bar_reg:08x})"),
+        ));
+    }
+    let bar = region_info(dev, VFIO_PCI_BAR0_REGION_INDEX + bar_index, "bar")?;
+    let rw = VFIO_REGION_INFO_FLAG_READ | VFIO_REGION_INFO_FLAG_WRITE;
+    if bar.flags & rw != rw || bar.size == 0 || bar.size > u64::from(u32::MAX) {
+        return Err(fail(
+            "bar",
+            format!("a readable, writable BAR{bar_index} of 1 byte to 4 GiB"),
+            format!("flags 0x{:x}, size 0x{:x}", bar.flags, bar.size),
+        ));
+    }
+    Ok((bar_index, bar))
+}
+
 impl Device {
     /// Open the device at PCI address `bdf` (e.g. `0000:00:01.0`), which must
     /// already be bound to vfio-pci.
@@ -109,201 +343,11 @@ impl Device {
         let sys = format!("/sys/bus/pci/devices/{bdf}");
         let vendor = sysfs_hex(&format!("{sys}/vendor"))?;
         let device_id = sysfs_hex(&format!("{sys}/device"))?;
-
-        // Rule 10: no reviewed write list, no access.
-        let sys_vendor = deny::sys_vendor();
-        // Unreadable subsystem IDs are passed as None; the gate refuses an
-        // unreviewed list then, and a reviewed one does not need them.
-        let subsystem = sysfs_hex(&format!("{sys}/subsystem_vendor"))
-            .ok()
-            .zip(sysfs_hex(&format!("{sys}/subsystem_device")).ok());
-        let deny = deny::admit(
-            vendor,
-            device_id,
-            subsystem,
-            allow_unreviewed,
-            sys_vendor.as_deref(),
-        )
-        .map_err(|r| fail("deny-list", r.expected, r.got))?;
-
-        // Container and group.
-        let link = format!("{sys}/iommu_group");
-        let exp = format!("{link} links to an IOMMU group");
-        let target = fs::read_link(&link).map_err(fails("group", &exp))?;
-        let group_id = target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        let container =
-            open_rw("/dev/vfio/vfio").map_err(fails("container", "open /dev/vfio/vfio"))?;
-        let version = ioctl_val(&container, VFIO_GET_API_VERSION, 0)
-            .map_err(fails("container", "VFIO_GET_API_VERSION succeeds"))?;
-        if version != VFIO_API_VERSION {
-            return Err(fail(
-                "container",
-                format!("VFIO API version {VFIO_API_VERSION}"),
-                version,
-            ));
-        }
-        let ext = ioctl_val(&container, VFIO_CHECK_EXTENSION, VFIO_TYPE1V2_IOMMU)
-            .map_err(fails("container", "VFIO_CHECK_EXTENSION succeeds"))?;
-        if ext != 1 {
-            return Err(fail(
-                "container",
-                "Type1 v2 IOMMU support",
-                format!("VFIO_CHECK_EXTENSION returned {ext}"),
-            ));
-        }
-
-        let group_path = format!("/dev/vfio/{group_id}");
-        let group = open_rw(&group_path).map_err(fails("group", &group_path))?;
-        let mut status = GroupStatus {
-            argsz: argsz::<GroupStatus>(),
-            ..Default::default()
-        };
-        ioctl_ptr(&group, VFIO_GROUP_GET_STATUS, &mut status)
-            .map_err(fails("group", "VFIO_GROUP_GET_STATUS succeeds"))?;
-        if status.flags & VFIO_GROUP_FLAGS_VIABLE == 0 {
-            return Err(fail(
-                "group",
-                "a viable group (all devices bound to vfio-pci or no driver)",
-                format!("flags 0x{:x}", status.flags),
-            ));
-        }
-        let mut container_fd = container.as_raw_fd();
-        ioctl_ptr(&group, VFIO_GROUP_SET_CONTAINER, &mut container_fd)
-            .map_err(fails("group", "VFIO_GROUP_SET_CONTAINER succeeds"))?;
-        ioctl_val(&container, VFIO_SET_IOMMU, VFIO_TYPE1V2_IOMMU)
-            .map_err(fails("container", "VFIO_SET_IOMMU Type1 v2 succeeds"))?;
-
-        // Which IOVAs the IOMMU will map (reserved regions such as the MSI
-        // window excluded), for the DMA allocator's regions. If the kernel
-        // does not say, the allocator assumes the high region and offers no
-        // low one.
-        let ranges = match iommu_info(&container) {
-            Ok(reply) => parse_iova_ranges(&reply),
-            Err(e) => {
-                emit(
-                    "dma-ranges-error",
-                    &[
-                        ("attempted", Value::Str("VFIO_IOMMU_GET_INFO")),
-                        ("error", Value::Str(&e.to_string())),
-                    ],
-                );
-                None
-            }
-        };
-        let regions = Regions::from_ranges(ranges.as_deref());
-        let show = |r: Option<(u64, u64)>| {
-            r.map_or("none".to_string(), |(s, e)| format!("0x{s:x}-0x{e:x}"))
-        };
-        emit(
-            "dma-regions",
-            &[
-                (
-                    "iova_ranges",
-                    Value::Str(&ranges.as_ref().map_or("not reported".to_string(), |rs| {
-                        rs.iter()
-                            .map(|(s, e)| format!("0x{s:x}-0x{e:x}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })),
-                ),
-                ("high", Value::Str(&show(regions.high))),
-                ("low", Value::Str(&show(regions.low))),
-            ],
-        );
-
-        // Device.
-        let name = CString::new(bdf).map_err(fails("device", "a PCI address without NUL bytes"))?;
-        let fd = ioctl_str(&group, VFIO_GROUP_GET_DEVICE_FD, &name)
-            .map_err(fails("device", "VFIO_GROUP_GET_DEVICE_FD succeeds"))?;
-        // SAFETY: the kernel just returned `fd` as a new descriptor owned by us.
-        let dev = unsafe { File::from_raw_fd(fd) };
-        let mut info = DeviceInfo {
-            argsz: argsz::<DeviceInfo>(),
-            ..Default::default()
-        };
-        ioctl_ptr(&dev, VFIO_DEVICE_GET_INFO, &mut info)
-            .map_err(fails("device", "VFIO_DEVICE_GET_INFO succeeds"))?;
-        if info.flags & VFIO_DEVICE_FLAGS_PCI == 0 {
-            return Err(fail(
-                "device",
-                "a PCI device",
-                format!("flags 0x{:x}", info.flags),
-            ));
-        }
-
-        // Reset, so no state (rings, DMA addresses, enabled engines) carries
-        // over from whoever used the device before. A device VFIO cannot
-        // reset is refused rather than run in an unknown state.
-        if info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
-            return Err(fail(
-                "reset",
-                "a device VFIO can reset (VFIO_DEVICE_FLAGS_RESET)",
-                format!("device info flags 0x{:x}", info.flags),
-            ));
-        }
-        ioctl_val(&dev, VFIO_DEVICE_RESET, 0)
-            .map_err(fails("reset", "VFIO_DEVICE_RESET succeeds"))?;
-
-        // Config space: confirm identity, then enable memory decode and bus
-        // mastering (DMA). Drivers never see config space.
-        let cfg = region_info(&dev, VFIO_PCI_CONFIG_REGION_INDEX, "config")?;
-        let mut id = [0u8; 4];
-        dev.read_exact_at(&mut id, cfg.offset)
-            .map_err(fails("config", "read config dword 0"))?;
-        let id = u32::from_le_bytes(id);
-        let want = (u32::from(device_id) << 16) | u32::from(vendor);
-        if id != want {
-            return Err(fail(
-                "config",
-                format!("config dword 0 = 0x{want:08x}"),
-                format!("0x{id:08x}"),
-            ));
-        }
-        let cmd = read_command(&dev, cfg.offset)
-            .map_err(fails("config", "read PCI command register"))?
-            | PCI_COMMAND_MEMORY
-            | PCI_COMMAND_MASTER;
-        dev.write_all_at(&cmd.to_le_bytes(), cfg.offset + PCI_COMMAND)
-            .map_err(fails("config", "write PCI command register"))?;
-        let config = dev
-            .try_clone()
-            .map_err(fails("config", "duplicate the device fd for config space"))?;
-
-        // The register window: the memory BAR the write list names. An
-        // I/O-port BAR is refused: its registers are reached indirectly and
-        // the portals never expose one. Config space says which kind a BAR
-        // is (bit 0 of the BAR register: 1 for I/O).
-        let bar_index = deny.bar;
-        if bar_index > 5 {
-            return Err(fail("bar", "a write list naming BAR 0 to 5", bar_index));
-        }
-        let mut bar_reg = [0u8; 4];
-        dev.read_exact_at(
-            &mut bar_reg,
-            cfg.offset + PCI_BASE_ADDRESS_0 + 4 * u64::from(bar_index),
-        )
-        .map_err(fails("bar", "read the BAR register in config space"))?;
-        let bar_reg = u32::from_le_bytes(bar_reg);
-        if bar_reg & 1 != 0 {
-            return Err(fail(
-                "bar",
-                format!("BAR{bar_index} is a memory BAR"),
-                format!("an I/O-port BAR (config 0x{bar_reg:08x})"),
-            ));
-        }
-        let bar = region_info(&dev, VFIO_PCI_BAR0_REGION_INDEX + bar_index, "bar")?;
-        let rw = VFIO_REGION_INFO_FLAG_READ | VFIO_REGION_INFO_FLAG_WRITE;
-        if bar.flags & rw != rw || bar.size == 0 || bar.size > u64::from(u32::MAX) {
-            return Err(fail(
-                "bar",
-                format!("a readable, writable BAR{bar_index} of 1 byte to 4 GiB"),
-                format!("flags 0x{:x}, size 0x{:x}", bar.flags, bar.size),
-            ));
-        }
+        let (deny, sys_vendor, subsystem) = rule10_gate(&sys, vendor, device_id, allow_unreviewed)?;
+        let (container, group, group_id) = open_group(&sys)?;
+        let regions = dma_regions(&container);
+        let (dev, cfg, cmd, config) = open_device(&group, bdf, vendor, device_id)?;
+        let (bar_index, bar) = register_bar(&dev, &cfg, deny)?;
 
         emit(
             "device-open",

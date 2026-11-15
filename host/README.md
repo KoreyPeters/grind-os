@@ -4,12 +4,20 @@
 
 Runs one Wasm driver against one device, through portals only. Trusted.
 
+Source layout: `src/main.rs` runs one driver in six steps (load the
+module, open the device, choose the world, instantiate, run, report);
+`src/args.rs` parses the command line; `src/portals.rs` implements the
+portals for the driver (`mmio`, `dma`, `clock`, `log`, `nvme`);
+`src/serve.rs` serves a network driver and `src/net.rs` builds and checks
+its frames; `src/block.rs` exercises a block driver; `src/faults.rs`
+injects device faults.
+
 ```text
 grind-host --device <pci-address> --module <driver.wasm>
            [--timeout-ms N]           default 10000
            [--dma-limit-mib N]        default 64
            [--trace]                  log every register access and DMA allocation
-           [--allow-unreviewed-deny-list]   emulators only: refused unless DMI sys_vendor is QEMU (rule 10)
+           [--allow-unreviewed-deny-list]   emulated devices only: refused unless DMI sys_vendor is QEMU and the device's IDs and subsystem IDs are QEMU's (rule 10)
            [--serve-ping <ipv4>]      NIC drivers: answer ARP and ping (world nic)
            [--serve-ms N]             how long to serve, default 10000
            [--exercise-block --expect-block-size N --expect-blocks N]
